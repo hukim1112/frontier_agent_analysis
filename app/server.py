@@ -216,6 +216,7 @@ async def invoke_agent(agent_name: str, input_data: UserInput, request: Request)
         })
         
         context_obj = AgentContext(
+            session_id=input_data.thread_id or "unknown",
             logging_enabled=logging_cfg.get("logging_enabled", True),
             log_path=logging_cfg.get("log_path", "./artifacts/agent_audit_trail.json"),
             response_mode="chat",
@@ -270,6 +271,7 @@ async def stream_agent(agent_name: str, input_data: StreamInput, request: Reques
             })
             
             context_obj = AgentContext(
+                session_id=input_data.thread_id or "unknown",
                 logging_enabled=logging_cfg.get("logging_enabled", True),
                 log_path=logging_cfg.get("log_path", "./artifacts/agent_audit_trail.json"),
                 response_mode="chat",

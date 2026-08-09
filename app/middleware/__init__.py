@@ -6,7 +6,13 @@ from .logging_middleware import LoggingMiddleware
 from .memory_middleware import MemoryMiddleware
 from .amnesia_guard import AmnesiaGuardMiddleware, create_amnesia_guard_middleware
 from .compactor import AutoCompactor, create_compactor_middleware
-from .self_correction import SelfCorrectionMiddleware, PostCompactionGuard
+from .self_correction import (
+    StopHooksMiddleware,
+    ModelErrorHandlerMiddleware,
+    ModelFallbackMiddleware,
+    AbortStreamingMiddleware,
+    AbortToolsMiddleware,
+)
 
 __all__ = [
     "LoggingMiddleware",
@@ -15,6 +21,9 @@ __all__ = [
     "create_amnesia_guard_middleware",
     "AutoCompactor",
     "create_compactor_middleware",
-    "SelfCorrectionMiddleware",
-    "PostCompactionGuard",
+    "StopHooksMiddleware",
+    "ModelErrorHandlerMiddleware",
+    "ModelFallbackMiddleware",
+    "AbortStreamingMiddleware",
+    "AbortToolsMiddleware",
 ]

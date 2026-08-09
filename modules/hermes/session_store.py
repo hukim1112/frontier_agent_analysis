@@ -72,13 +72,15 @@ Respond in this exact JSON format:
 
 
 def _serialize_message(msg) -> Dict[str, str]:
-    """LangChain 메시지 또는 dict를 직렬화."""
+    """LangChain 메시지 또는 dict를 직렬화 (content 문자열화 100% 보장)."""
     if isinstance(msg, BaseMessage):
-        return {"role": msg.type, "content": msg.content or ""}
+        content = normalize_content(msg.content or "")
+        return {"role": msg.type, "content": content}
     if isinstance(msg, dict):
+        content = normalize_content(msg.get("content", ""))
         return {
             "role": msg.get("role", msg.get("type", "unknown")),
-            "content": msg.get("content", ""),
+            "content": content,
         }
     return {"role": "unknown", "content": str(msg)}
 

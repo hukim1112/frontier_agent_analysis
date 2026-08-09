@@ -241,10 +241,19 @@ def create_prompt_middleware(assembler: PromptAssembler):
         static_msg = SystemMessage(content=assembler.build_static_content())
         dynamic_msg = SystemMessage(content=assembler.build_dynamic_content(session_context))
 
-        # 기존 SystemMessage 제거 (중복 방지)
-        filtered_msgs = [m for m in request.messages if not isinstance(m, SystemMessage)]
-        new_messages = [static_msg, dynamic_msg] + filtered_msgs
+        # 기존 SystemMessage 제거 및 빈 메시지 정제
+        filtered_msgs = []
+        for m in request.messages:
+            if isinstance(m, SystemMessage):
+                continue
+            # Gemini Vertex AI 400 Error (empty parts) 방지: content나 tool_calls가 없는 비어있는 메시지 제거
+            content = getattr(m, "content", "")
+            tool_calls = getattr(m, "tool_calls", None)
+            if not content and not tool_calls:
+                continue
+            filtered_msgs.append(m)
 
+        new_messages = [static_msg, dynamic_msg] + filtered_msgs
         new_request = request.override(messages=new_messages)
         return await handler(new_request)
 

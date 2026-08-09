@@ -100,11 +100,14 @@ class MemoryMiddleware(AgentMiddleware):
         if not ctx:
             return None
 
+        session_id = self._get_session_id(runtime)
+        if session_id != "unknown":
+            ctx.session_id = session_id
+
         recalled_parts = []
 
         # L3: Semantic Memory 프리페치 (세션 감지 기반 Frozen Snapshot)
         if getattr(ctx, "semantic_memory_enabled", False):
-            session_id = self._get_session_id(runtime)
             # 🌟 세션이 전환된 순간에만 디스크에서 최신 마크다운 로드 (세션 내 KV-Cache 보존)
             if self._last_loaded_session_id != session_id:
                 self.semantic_store.load_from_disk()
@@ -326,23 +329,52 @@ class MemoryMiddleware(AgentMiddleware):
         return ""
 
     @staticmethod
-    def _get_session_id(runtime: Any) -> str:
-        """runtime에서 session_id(thread_id) 추출."""
-        # 1. context에서 탐색
+    def _get_session_id(runtime: Any, request: Any = None) -> str:
+        """runtime 및 request에서 session_id(thread_id)를 지능적으로 추출."""
+        # 1. langchain_core의 get_config_from_context() 시도
+        try:
+            from langchain_core.runnables.config import get_config_from_context
+            cfg = get_config_from_context()
+            if cfg and isinstance(cfg, dict):
+                tid = cfg.get("configurable", {}).get("thread_id")
+                if tid:
+                    return str(tid)
+        except Exception:
+            pass
+
         ctx = getattr(runtime, "context", None)
+        if not ctx and request:
+            ctx = getattr(getattr(request, "runtime", None), "context", None)
+
         if ctx:
             sid = getattr(ctx, "session_id", None)
-            if sid:
-                return sid
+            if sid and sid != "unknown":
+                return str(sid)
 
-        # 2. config에서 탐색
+        if request:
+            configurable = getattr(request, "configurable", None)
+            if isinstance(configurable, dict) and configurable.get("thread_id"):
+                return str(configurable["thread_id"])
+
         config = getattr(runtime, "config", None)
-        if config:
-            tid = config.get("configurable", {}).get("thread_id")
-            if tid:
-                return tid
+        if not config and request:
+            config = getattr(getattr(request, "runtime", None), "config", None)
 
-        return f"session-{int(time.time())}"
+        if config:
+            if isinstance(config, dict):
+                tid = config.get("configurable", {}).get("thread_id")
+                if tid:
+                    return str(tid)
+            elif hasattr(config, "get"):
+                configurable = config.get("configurable", {})
+                if isinstance(configurable, dict) and configurable.get("thread_id"):
+                    return str(configurable["thread_id"])
+            elif hasattr(config, "configurable"):
+                configurable = getattr(config, "configurable", {})
+                if isinstance(configurable, dict) and configurable.get("thread_id"):
+                    return str(configurable["thread_id"])
+
+        return "unknown"
 
     @staticmethod
     def _format_episodic(sessions: List[Dict[str, Any]]) -> str:

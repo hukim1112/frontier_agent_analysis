@@ -5,8 +5,17 @@ modules/claude_code/self_correction.py에서 이식.
 """
 
 from modules.claude_code.self_correction import (
-    SelfCorrectionMiddleware,
-    PostCompactionGuard,
+    StopHooksMiddleware,
+    ModelErrorHandlerMiddleware,
+    ModelFallbackMiddleware,
+    AbortStreamingMiddleware,
+    AbortToolsMiddleware,
 )
 
-__all__ = ["SelfCorrectionMiddleware", "PostCompactionGuard"]
+__all__ = [
+    "StopHooksMiddleware",
+    "ModelErrorHandlerMiddleware",
+    "ModelFallbackMiddleware",
+    "AbortStreamingMiddleware",
+    "AbortToolsMiddleware",
+]

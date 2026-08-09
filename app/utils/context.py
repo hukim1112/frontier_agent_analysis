@@ -9,6 +9,7 @@ class AgentContext:
     debug_mode: bool = False
     
     # 🌟 메모리 연동 및 프롬프트 캐싱 가드레일용 환경 변수 선언
+    session_id: str = "unknown"
     user_permission: str = "GUEST"
     active_project: str = "UNKNOWN"
     
