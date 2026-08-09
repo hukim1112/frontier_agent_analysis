@@ -1,0 +1,86 @@
+{
+  "session_id": "scenario_06",
+  "title": "ECommerce Redis Cart Session",
+  "messages": [
+    {
+      "role": "user",
+      "content": "안녕! 이커머스 개발팀 파트장이야. 장바구니 및 주문 세션 Redis 캐싱 아키텍처를 조율하려고 해."
+    },
+    {
+      "role": "assistant",
+      "content": "안녕하세요 파트장님! 이커머스 Redis 장바구니 세션 설정을 지원하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "장바구니 세션은 Redis Cluster 노드인 cart-redis.internal 6379 대역에 분산 저장해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "cart-redis.internal Redis Cluster 엔드포인트를 지정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "비로그인 유저의 장바구니 유효 기간(TTL)은 7일(604800초)로 설정해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "비로그인 장바구니 TTL 7일 만료 정책을 적용했습니다."
+    },
+    {
+      "role": "user",
+      "content": "유저가 로그인하면 비로그인 장바구니 아이템과 기존 회원 장바구니를 자동으로 수렴(Merge)해줘야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "로그인 시 장바구니 자동 병합(Merge) 핸들러를 구성하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "재고 타임아웃 예약을 위해 주문 진행 시 10분 동안 상품 재고를 선점하는 Redis Mutex Lock을 걸어줘."
+    },
+    {
+      "role": "assistant",
+      "content": "주문 선점 10분 Redis Mutex Lock 가드레일을 설정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "Redis 메모리 초과 시 volatile-lru 방식을 사용해서 만료 예정 키부터 안전하게 정리해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "Redis maxmemory-policy volatile-lru 방식을 지정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "장바구니 수량 변경 시 동시성 이슈를 막기 위해 Redis Lua 스크립트로 원자적(Atomic)으로 처리해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "Atomic 수량 업데이트 전용 Redis Lua 스크립트를 작성하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "장바구니 상품 변경 이벤트는 Kafka 주제 cart-event-topic 으로 발행해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "Kafka cart-event-topic 이벤트 프로듀서를 연동했습니다."
+    },
+    {
+      "role": "user",
+      "content": "Redis Master 노드 장애 시 Sentinel이 5초 이내에 Replica를 Master로 승격시키도록 해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "Redis Sentinel 자동 장애복구(Failover) 타임아웃 5초를 등록했습니다."
+    },
+    {
+      "role": "user",
+      "content": "고마워! Redis 장바구니 세션 동기화 설계서를 완성해 줘."
+    },
+    {
+      "role": "assistant",
+      "content": "네! cart-redis, TTL 7일, Mutex Lock이 적용된 설계서를 작성해 드립니다."
+    }
+  ]
+}

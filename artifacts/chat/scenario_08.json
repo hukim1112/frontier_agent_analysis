@@ -1,0 +1,86 @@
+{
+  "session_id": "scenario_08",
+  "title": "Game Server Realtime Matchmaking",
+  "messages": [
+    {
+      "role": "user",
+      "content": "안녕! 실시간 멀티플레이어 게임 서버 프로그래머야. 매치메이킹 및 소켓 아키텍처를 설계하려 해."
+    },
+    {
+      "role": "assistant",
+      "content": "안녕하세요! 게임 서버 실시간 매치메이킹 및 WebSocket/UDP 파이프라인을 지원합니다."
+    },
+    {
+      "role": "user",
+      "content": "유저의 레이팅(MMR)에 기반한 Elo 랭킹 시스템 매칭 노드인 match.game-cluster.internal 을 운영해."
+    },
+    {
+      "role": "assistant",
+      "content": "match.game-cluster.internal MMR 매치메이킹 노드를 지정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "실시간 게임 인게임 패킷 전송은 레이턴시 최우선을 위해 UDP (KCP 프로토콜) 9000~9050 포트를 사용해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "저레이턴시 UDP/KCP 게임 서버 포트 범위를 등록했습니다."
+    },
+    {
+      "role": "user",
+      "content": "매칭 큐 탐색 범위는 5초마다 MMR 오차 범위를 ±50점씩 넓히는 확장 매칭(Expanding Window)을 적용해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "5초 간격 Expanding MMR Window 매칭 알고리즘을 설정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "게임 세션 방(Room) 생성 시 룸 서버 당 최대 플레이어 인원은 10명(5v5 팀전)으로 제한해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "5v5 10인 대전 룸 할당 로직을 지정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "클라이언트 핑(Ping)이 150ms를 넘는 플레이어는 핑 불량으로 매칭 대상에서 제외해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "Ping 150ms 초과 유저 매칭 제외 가드레일을 반영했습니다."
+    },
+    {
+      "role": "user",
+      "content": "인게임 동기화 주기는 60 FPS (Tick Rate 60Hz)로 브로드캐스팅해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "60Hz 틱레이트 상태 동기화 루프를 구성했습니다."
+    },
+    {
+      "role": "user",
+      "content": "탈주 플레이어 발생 시 15분간 매치메이킹 큐 진입을 금지하는 패널티 시스템을 적용해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "15분 큐 진입 금지 패널티 시스템을 연결했습니다."
+    },
+    {
+      "role": "user",
+      "content": "게임 리플레이 파일은 .grec 바이트 파일로 압축하여 S3 replay-vault 버킷에 올려줘."
+    },
+    {
+      "role": "assistant",
+      "content": "리플레이 파일 S3 replay-vault 업로드 로직을 추가했습니다."
+    },
+    {
+      "role": "user",
+      "content": "고마워! 게임 매치메이킹 서버 설계 초안을 완성해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "네! MMR 매칭, UDP/KCP 60Hz, 패널티 로직이 포함된 게임 서버 설계서를 작성합니다."
+    }
+  ]
+}

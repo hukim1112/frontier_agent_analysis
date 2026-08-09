@@ -1,0 +1,86 @@
+{
+  "session_id": "scenario_03",
+  "title": "DevOps K8s Vault Deployment",
+  "messages": [
+    {
+      "role": "user",
+      "content": "안녕, 인프라본부 DevOps 엔지니어야. 백엔드 컨테이너 클러스터 배포 가이드를 수립하려 해."
+    },
+    {
+      "role": "assistant",
+      "content": "안녕하세요! K8s 백엔드 클러스터 배포 협업을 지원합니다."
+    },
+    {
+      "role": "user",
+      "content": "이번 서비스는 K8s 네임스페이스 prod-cluster-01 에 배포될 예정이야."
+    },
+    {
+      "role": "assistant",
+      "content": "K8s 네임스페이스 prod-cluster-01 을 지정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "비상 장애 전파 알림은 PagerDuty 서비스 API 키를 연동해 둬야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "PagerDuty 장애 전파 연동을 등록했습니다."
+    },
+    {
+      "role": "user",
+      "content": "비밀번호나 API 키는 Git이나 환경변수에 노출 금지이고 무조건 HashiCorp Vault로 마운트해야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "HashiCorp Vault 사이드카 비밀키 마운트 필수 규정을 적용했습니다."
+    },
+    {
+      "role": "user",
+      "content": "백업 데이터 보존 기간은 최대 90일로 제한하며 기한 초과 파일은 자동 파기되어야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "90일 데이터 보존 파기 스케줄을 적용했습니다."
+    },
+    {
+      "role": "user",
+      "content": "컨테이너의 CPU 리소스 제한은 2 Core, Memory는 4GB로 제한해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "K8s resource limits CPU 2, Memory 4Gi 설정을 추가했습니다."
+    },
+    {
+      "role": "user",
+      "content": "헬스체크 probe는 /healthz 엔드포인트로 10초 주기로 지정해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "livenessProbe /healthz interval 10s를 지정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "롤링 업데이트 시 maxSurge는 25%, maxUnavailable은 0으로 세팅해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "무중단 롤링 배포 가드레일 수치를 반영했습니다."
+    },
+    {
+      "role": "user",
+      "content": "클러스터 서비스 메시는 Istio mTLS 엄격 모드를 전면 적용해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "Istio STRICT mTLS 인증 설정을 적용했습니다."
+    },
+    {
+      "role": "user",
+      "content": "고마워! K8s deployment.yaml 통합 설정 가이드를 준비해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "네! Vault 사이드카와 mTLS가 포함된 K8s 명세서를 제공합니다."
+    }
+  ]
+}

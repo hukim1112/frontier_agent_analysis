@@ -1,0 +1,86 @@
+{
+  "session_id": "scenario_07",
+  "title": "Embedded IoT Firmware OTA",
+  "messages": [
+    {
+      "role": "user",
+      "content": "안녕, 임베디드 디바이스 팀 연구원이야. 스마트홈 IoT 기기의 OTA 펌웨어 업데이트 파이프라인을 다루고 있어."
+    },
+    {
+      "role": "assistant",
+      "content": "안녕하세요! IoT 디바이스 OTA 펌웨어 업데이트 가이드를 지원합니다."
+    },
+    {
+      "role": "user",
+      "content": "통신 프로토콜은 MQTT 규격을 사용하고Broker 주소는 mqtt.iot-fleet.internal 8883 포트(MQTTS)야."
+    },
+    {
+      "role": "assistant",
+      "content": "MQTTS 포트 8883 및 Broker 주소 mqtt.iot-fleet.internal 환경을 매핑했습니다."
+    },
+    {
+      "role": "user",
+      "content": "펌웨어 바이너리 파일은 ECDSA 서명이 포함되어야 하며 디바이스 내부 Secure Element 칩에서 서명을 검증해야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "ECDSA 서명 무결성 검증 및 Secure Element 칩 연동 규격을 지정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "업데이트 중 정전 등으로 인한 벽돌 방지를 위해 A/B 듀얼 파티션 뱅크(Dual Bank) 구조를 취해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "A/B Dual Bank 롤백 안전장치 파티션을 설정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "디바이스의 하트비트(Heartbeat) 인터벌은 60초로 잡고, 3회 무응답 시 오프라인 상태로 간주해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "MQTT KeepAlive 60초 및 오프라인 상태 감지 로직을 추가했습니다."
+    },
+    {
+      "role": "user",
+      "content": "디바이스 수집 센서 데이터(온습도)는 JSON 패킷으로 주제 iot/telemetry/device_id 로 발행해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "텔레메트리 MQTT 토픽 발행 가이드를 작성했습니다."
+    },
+    {
+      "role": "user",
+      "content": "네트워크 대역폭 절약을 위해 펌웨어 바이너리는 zstd 알고리즘으로 압축해서 전송해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "zstd 바이너리 압축 디컴프레서 모듈을 반영했습니다."
+    },
+    {
+      "role": "user",
+      "content": "OTA 진행률 모니터링 토픽은 iot/ota/status 로 실시간 전파해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "OTA 상태 모니터링 토픽을 등록했습니다."
+    },
+    {
+      "role": "user",
+      "content": "디바이스 내부 배터리 잔량이 20% 미만일 때는 OTA 다운로드를 강제로 차단해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "배터리 20% 미만 OTA 차단 가드레일을 설정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "고마워! IoT 펌웨어 OTA 연동 명세서를 정리해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "네! MQTTS, ECDSA, Dual Bank 구조가 반영된 IoT OTA 명세서를 완성합니다."
+    }
+  ]
+}

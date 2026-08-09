@@ -1,0 +1,86 @@
+{
+  "session_id": "scenario_02",
+  "title": "Data Analytics Oracle Query",
+  "messages": [
+    {
+      "role": "user",
+      "content": "안녕! 데이터 분석 팀 대리야. 마케팅 통계 산출을 위해 오라클 DB 쿼리를 다루고 있어."
+    },
+    {
+      "role": "assistant",
+      "content": "안녕하세요! 오라클 데이터베이스 쿼리 최적화를 지원하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "대시보드는 내부 서버인 bi.mycompany.internal 을 통해 시각화하고 있어."
+    },
+    {
+      "role": "assistant",
+      "content": "BI 대시보드 주소 bi.mycompany.internal 환경을 확인했습니다."
+    },
+    {
+      "role": "user",
+      "content": "고객 개인식별정보가 담긴 customer_pii 테이블은 SELECT * 직접 조회가 엄격히 금지되어 있어."
+    },
+    {
+      "role": "assistant",
+      "content": "customer_pii 테이블 직접 조회 금지 규정을 확인했습니다."
+    },
+    {
+      "role": "user",
+      "content": "반드시 SHA-256 해시 함수로 마스킹된 뷰(view) 테이블을 통해서만 통계치를 추출해야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "SHA-256 마스킹 뷰 전용 쿼리 규정을 적용하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "분석 쿼리의 최대 실행 타임아웃은 30초로 제한되어 있으니 실행 계획을 잘 세워야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "쿼리 30초 타임아웃 제한 및 인덱스 활용 실행계획을 가이드하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "쿼리 결과 캐싱을 위해 Redis 노드인 cache-db.internal 6379 포트를 연결해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "Redis 쿼리 캐시 노드 연결을 설정하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "매일 새벽 2시에 일간 마케팅 집계 바이트가 자동으로 배치 처리되게 해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "새벽 2시 배치 크론 스케줄링을 설정하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "추가로 집계 테이블의 데이터 보존 기한은 1년으로 한정해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "1년 보존 기한 파티션 삭제 정책을 적용하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "조인 대상 테이블인 orders_fact 테이블의 결합 인덱스를 점검해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "orders_fact 테이블 인덱스 조율을 진행하겠습니다."
+    },
+    {
+      "role": "user",
+      "content": "고마워! 마케팅 분석 쿼리 최적화 템플릿을 최종 정리해 줘."
+    },
+    {
+      "role": "assistant",
+      "content": "네! PII 마스킹 뷰와 30초 타임아웃 조건에 맞춘 분석 쿼리 가이드를 제공합니다."
+    }
+  ]
+}

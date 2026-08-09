@@ -1,0 +1,86 @@
+{
+  "session_id": "scenario_09",
+  "title": "Healthcare DICOM Medical Imaging",
+  "messages": [
+    {
+      "role": "user",
+      "content": "안녕, 헬스케어 솔루션 팀 연구원이야. 병원 의료 영상(DICOM) 저장 및 HIPAA 보안 준수 파이프라인을 구축하고 있어."
+    },
+    {
+      "role": "assistant",
+      "content": "안녕하세요! 의료 영상 DICOM 파이프라인 및 HIPAA 보안 협업을 지원합니다."
+    },
+    {
+      "role": "user",
+      "content": "PACS 서버 연결 엔드포인트는 pacs.hospital-core.internal 104 포트(DICOM C-STORE)야."
+    },
+    {
+      "role": "assistant",
+      "content": "pacs.hospital-core.internal 포트 104 DICOM C-STORE 엔드포인트를 확인했습니다."
+    },
+    {
+      "role": "user",
+      "content": "환자 인적사항이 담긴 DICOM 메타데이터 태그는 연구 목적으로 외부 유출 시 반드시 익명화(De-identification)되어야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "DICOM 환자 정보 익명화 마스킹 필터를 등록했습니다."
+    },
+    {
+      "role": "user",
+      "content": "미국 HIPAA 의료 정보 보호 법안에 따라 모든 저장 영상은 AES-256으로 암호화되어 보관되어야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "HIPAA 컴플라이언스 AES-256 암호화 저장소 정책을 적용했습니다."
+    },
+    {
+      "role": "user",
+      "content": "CT/MRI 대용량 영상의 전송 속도를 높이기 위해 JPEG 2000 무손실 압축(Lossless)을 적용해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "JPEG 2000 Lossless 압축 코덱을 세팅했습니다."
+    },
+    {
+      "role": "user",
+      "content": "의료진 의사 판독 로그는 수정 불가능한 블록체인 타임스탬프 또는 WORM 스토리지에 보관해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "판독 기록 WORM(Write Once Read Many) 무단 수정 방지 스토리지 저장을 지정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "AI 응급 뇌출혈 진단 보조 모듈이 DICOM 수신 시 5초 이내에 자동 추론되도록 연결해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "AI 진단 보조 추론 파이프라인 트리거 5s cap을 추가했습니다."
+    },
+    {
+      "role": "user",
+      "content": "영상 보관 기한은 법정 의무 보존 기간인 10년 동안 보관되어야 해."
+    },
+    {
+      "role": "assistant",
+      "content": "10년 보존 장기 아카이빙 정책을 설정했습니다."
+    },
+    {
+      "role": "user",
+      "content": "의료진 열람 권한은 의사 면허 번호 기반 2차 인증(2FA)을 통과해야만 허용해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "의료진 2FA 열람 권한 가드레일을 적용했습니다."
+    },
+    {
+      "role": "user",
+      "content": "고마워! DICOM 의료 영상 처리 명세서 초안을 정리해줘."
+    },
+    {
+      "role": "assistant",
+      "content": "네! PACS 104, HIPAA AES-256, 익명화 필터가 적용된 파이프라인 명세서를 작성합니다."
+    }
+  ]
+}
