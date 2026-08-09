@@ -1,7 +1,0 @@
-[AIThought] Searching...
-
-[ToolResult:grep_search] Match 1
-
-[AIThought] Searching 2...
-
-[ToolResult:glob_search] Match 2

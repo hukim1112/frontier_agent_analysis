@@ -12,8 +12,12 @@ env/
 
 # Databases & Caching
 *.db
+*.db-shm
+*.db-wal
 *.db-journal
 *.sqlite3
+app/database/
+.claude/
 
 # Task tracking & State
 task.md
