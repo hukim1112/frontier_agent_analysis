@@ -92,6 +92,7 @@ class MemoryMiddleware(AgentMiddleware):
         self.semantic_store = semantic_store
         self.episodic_store = episodic_store
         self.review_llm = review_llm
+        self._last_loaded_session_id: Optional[str] = None
 
     def before_agent(self, state: Dict[str, Any], runtime: Any) -> Optional[Dict[str, Any]]:
         """L2+L3 메모리 인출 → AgentContext.recalled_memory에 주입."""
@@ -101,10 +102,15 @@ class MemoryMiddleware(AgentMiddleware):
 
         recalled_parts = []
 
-        # L3: Semantic Memory 프리페치 (frozen snapshot)
+        # L3: Semantic Memory 프리페치 (세션 감지 기반 Frozen Snapshot)
         if getattr(ctx, "semantic_memory_enabled", False):
-            # 🌟 새 에이전트 execution/세션 시 최신 MEMORY.md, USER.md 동기화
-            self.semantic_store.load_from_disk()
+            session_id = self._get_session_id(runtime)
+            # 🌟 세션이 전환된 순간에만 디스크에서 최신 마크다운 로드 (세션 내 KV-Cache 보존)
+            if self._last_loaded_session_id != session_id:
+                self.semantic_store.load_from_disk()
+                self._last_loaded_session_id = session_id
+                logger.info("[MemoryMiddleware] New session detected (%s): reloaded semantic memory snapshot.", session_id)
+
             memory_block = self.semantic_store.format_for_prompt("memory")
             user_block = self.semantic_store.format_for_prompt("user")
             if memory_block:
