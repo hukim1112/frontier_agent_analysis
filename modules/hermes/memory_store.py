@@ -87,6 +87,8 @@ class SemanticMemoryStore:
         """엔트리를 디스크에 즉시 저장. 매 변경 후 호출."""
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
+        # 🌟 디스크 저장 시 system_prompt_snapshot도 즉시 최신화
+        self._system_prompt_snapshot[target] = self._render_block(target, self._entries_for(target))
 
     # ── CRUD 액션 ──
 

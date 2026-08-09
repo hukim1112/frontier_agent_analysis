@@ -103,6 +103,8 @@ class MemoryMiddleware(AgentMiddleware):
 
         # L3: Semantic Memory 프리페치 (frozen snapshot)
         if getattr(ctx, "semantic_memory_enabled", False):
+            # 🌟 새 에이전트 execution/세션 시 최신 MEMORY.md, USER.md 동기화
+            self.semantic_store.load_from_disk()
             memory_block = self.semantic_store.format_for_prompt("memory")
             user_block = self.semantic_store.format_for_prompt("user")
             if memory_block:
