@@ -34,7 +34,7 @@
 ```bash
 # 1. install 폴더로 이동하여 패키지 설치
 cd install
-pip install -r requirements.txt
+bash install_all.sh
 ```
 
 ### 환경 변수 설정
