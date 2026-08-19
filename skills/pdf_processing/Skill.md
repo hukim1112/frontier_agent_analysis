@@ -1,3 +1,8 @@
+---
+name: pdf_processing
+description: Extract text, metadata, and convert PDF pages to images using specialized python scripts.
+---
+
 # PDF Processing Skill
 
 This skill provides tools to extract text, metadata, and convert PDF pages to images.

@@ -2,6 +2,8 @@ import os
 import json
 from typing import List, Dict, Any
 
+from app.prompts.skill_builder import SkillPromptBuilder
+
 class PromptManager:
     """Manager for loading and assembling prompt layers from prompt_dir templates."""
     def __init__(self, prompt_dir=None):
@@ -19,8 +21,13 @@ class PromptManager:
         # Tools Specifications (L2 Alphabetical)
         self.l2_tools = "No registered tools."
         
-        # Skills context (Loaded from SKILL.md)
-        self.skills_context = self._load_file("SKILL.md", "No public skills registered.")
+        # Skills context (Dynamically scanned and assembled via SkillPromptBuilder)
+        skill_guidelines_file = os.path.join(self.prompt_dir, "SKILL.md")
+        self.skill_builder = SkillPromptBuilder(
+            skills_dirs=["./skills", "./.agents/skills", "skills"],
+            guidelines_path=skill_guidelines_file
+        )
+        self.skills_context = self.skill_builder.assemble()
         
         # Static Reference Context (Stored above boundary to enable caching)
         self.static_reference = ""
@@ -79,19 +86,20 @@ class PromptManager:
         cwd_string = f"CWD: {dynamic_state.get('cwd', '/workspace')}"
         l4_env = f"- {permission_string}\n- {project_string}\n- {cwd_string}"
         
+        self.skills_context = self.skill_builder.assemble()
+        
         static_part = (
-            f"=== ROLE (L1) ===\n{self.l1_role}\n\n"
-            f"=== OPERATING GUIDELINES ===\n{self.l2_guidelines}\n\n"
-            f"=== PUBLIC SKILLS CATALOG ===\n{self.skills_context}\n\n"
-            f"=== TOOLS SPECS (L2) ===\n{self.l2_tools}\n\n"
-            f"=== STATIC REFERENCE CONTEXT ===\n{self.static_reference}\n\n"
+            f"=== Layer 1: System Identity & Core Role ===\n{self.l1_role}\n\n"
+            f"=== Layer 2: Tool Capabilities & Available Skills ===\n{self.l2_tools}\n\n"
+            f"=== Available Skills Catalog ===\n{self.skills_context}\n\n"
+            f"=== Static Reference Context ===\n{self.static_reference}\n\n"
             f"{self.boundary_marker}"
         )
         
         dynamic_part = (
-            f"=== DYNAMIC RULES/ENV (L4) ===\n{l4_env}\n\n"
-            f"=== USER & PROJECT CONTEXT / AGENT.md (L5) ===\n{self.l5_agent_rules}\n\n"
-            f"=== DYNAMIC CONTEXT ===\n{self.l5_dynamic_context}"
+            f"=== Layer 3: Dynamic Session Environment ===\n{l4_env}\n\n"
+            f"=== Layer 4: Recalled Memory & Dynamic Context ===\n{self.l5_dynamic_context}\n\n"
+            f"=== Layer 5: User & Project Rules (AGENT.md) ===\n{self.l5_agent_rules}"
         )
         
         return f"{static_part}\n\n{dynamic_part}"

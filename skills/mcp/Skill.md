@@ -1,3 +1,8 @@
+---
+name: mcp_client
+description: Dynamically inspect and interact with active Server-Sent Events (SSE) Model Context Protocol servers.
+---
+
 # Model Context Protocol (MCP) Interface Skill
 
 This skill allows the agent to dynamically inspect and interact with any active Server-Sent Events (SSE) Model Context Protocol servers.

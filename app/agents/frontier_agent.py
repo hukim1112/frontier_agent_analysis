@@ -27,6 +27,7 @@ from modules.hermes.session_search_tool import (
     create_session_recall_tool,
 )
 from modules.hermes.prompt_assembler import PromptAssembler, create_prompt_middleware
+from app.prompts.skill_builder import SkillPromptBuilder
 
 AGENT_METADATA = {
     "name": "frontier_agent",
@@ -87,9 +88,17 @@ async def create_agent_executor():
         with open(prompt_file, "r", encoding="utf-8") as f:
             system_rules = f.read().strip()
 
+    # Layer 2: Available Skills Catalog Builder (동적 스킬 스캔 및 가이드라인 결합)
+    skill_file = os.path.join(prompts_dir, "SKILL.md")
+    skill_builder = SkillPromptBuilder(
+        skills_dirs=["./skills", "./.agents/skills", "skills"],
+        guidelines_path=skill_file,
+    )
+
     assembler = PromptAssembler(
         system_rules=system_rules,
         tool_schemas=tools,
+        skill_catalog=skill_builder.assemble,  # 👈 Layer 2 (Static Cache HIT 영역) 바인딩
     )
 
     # Layer 4: Dynamic Session Documents (MCP.md)
@@ -97,14 +106,10 @@ async def create_agent_executor():
     if os.path.exists(mcp_file):
         assembler.add_l4_doc("MCP.md", mcp_file)
 
-    # Layer 5: User & Project Rules (AGENT.md, SKILL.md)
+    # Layer 5: User & Project Rules (AGENT.md)
     agent_file = os.path.join(prompts_dir, "AGENT.md")
     if os.path.exists(agent_file):
         assembler.add_l5_doc("AGENT.md", agent_file)
-
-    skill_file = os.path.join(prompts_dir, "SKILL.md")
-    if os.path.exists(skill_file):
-        assembler.add_l5_doc("SKILL.md", skill_file)
 
     prompt_middleware = create_prompt_middleware(assembler)
 

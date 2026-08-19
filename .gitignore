@@ -42,6 +42,7 @@ sandbox/
 
 # Runtime Log & Audit Artifacts
 artifacts/logs/
+artifacts/memory/
 artifacts/agent_audit_trail.json
 logs/
 

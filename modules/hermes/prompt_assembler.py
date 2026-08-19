@@ -1,12 +1,13 @@
 """
-범용 4-Layer PromptAssembler — Claude Code 색깔을 제거한 범용 프롬프트 조립기.
+범용 5-Layer PromptAssembler — Claude Code 규격을 준수하는 범용 프롬프트 조립기.
 
 Hermes 메모리 구조와 통합:
-- Layer 1: Static Identity & Rules (PROMPT.md)                ← 캐싱 대상
-- Layer 2: Tool Specs + Skill Index (알파벳 정렬)              ← 캐싱 대상
+- Layer 1: Static Identity & Rules (PROMPT.md)                ← 캐싱 대상 (Static Prefix)
+- Layer 2: Tool Specs + Skill Index (알파벳 정렬)              ← 캐싱 대상 (Static Prefix)
   ────── __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ ──────
-- Layer 3: Dynamic Context (env, recalled_memory from L2+L3)   ← 매 턴 변경
-- Layer 4: User/Project Rules (AGENT.md) + Semantic Memory
+- Layer 3: Dynamic Session Environment (CWD, Session ID, OS)  ← 매 턴 변경 (Uncached Suffix)
+- Layer 4: Dynamic Session Documents (MCP.md) + Recalled Memory
+- Layer 5: User & Project Rules (AGENT.md)
 
 recalled_memory 필드를 통해 MemoryMiddleware가 인출한 L2(에피소드)/L3(시멘틱)
 메모리를 시스템 프롬프트에 자연스럽게 주입합니다.
@@ -21,7 +22,7 @@ from langchain.agents.middleware import wrap_model_call, ModelRequest
 
 
 class PromptAssembler:
-    """범용 4-Layer 프롬프트 조립기.
+    """범용 5-Layer 프롬프트 조립기.
 
     Claude Code의 PromptAssembler에서 공급자 특화 로직을 제거하고,
     Hermes 메모리 주입을 위한 recalled_memory 레이어를 추가.
@@ -31,23 +32,29 @@ class PromptAssembler:
         self,
         system_rules: str,
         tool_schemas: Optional[list] = None,
+        skill_catalog: Optional[Union[str, Callable]] = None,
         l4_docs: Optional[Dict[str, Union[str, Callable]]] = None,
     ):
         self.system_rules = system_rules
         self.tool_schemas = tool_schemas or []
+        self.skill_catalog = skill_catalog
         self.boundary_marker = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
         # Layer 4: Dynamic Session/MCP documents (e.g. 'MCP.md')
         self.l4_docs: Dict[str, Union[str, Callable]] = dict(l4_docs or {})
-        # Layer 5: User/Project context rules (e.g. 'AGENT.md', 'SKILL.md')
+        # Layer 5: User/Project context rules (e.g. 'AGENT.md')
         self.l5_docs: Dict[str, Union[str, Callable]] = {}
+
+    def set_skill_catalog(self, source: Union[str, Callable]) -> None:
+        """Layer 2에 스킬 카탈로그/가이드라인을 설정 (e.g., SkillPromptBuilder.assemble)."""
+        self.skill_catalog = source
 
     def add_l4_doc(self, name: str, source: Union[str, Callable]) -> None:
         """Layer 4에 동적 문서를 추가 (e.g., 'MCP.md', 'SCRATCHPAD.md')."""
         self.l4_docs[name] = source
 
     def add_l5_doc(self, name: str, source: Union[str, Callable]) -> None:
-        """Layer 5에 프로젝트 컨텍스트 규칙 문서를 추가 (e.g., 'AGENT.md', 'SKILL.md')."""
+        """Layer 5에 프로젝트 컨텍스트 규칙 문서를 추가 (e.g., 'AGENT.md')."""
         self.l5_docs[name] = source
 
     # ── Layer Builders ──
@@ -55,9 +62,17 @@ class PromptAssembler:
     def build_static_content(self) -> str:
         """Layer 1~2 + Boundary Marker 조립 (캐싱 대상)."""
         tool_str = self._format_tool_capabilities()
+        skill_str = ""
+        if self.skill_catalog:
+            raw_skill = self._read_and_truncate_doc(
+                self.skill_catalog, max_lines=300, max_bytes=35000
+            )
+            skill_str = f"\n\n=== Layer 2.1: Available Skills Catalog ===\n{raw_skill}"
+
         return (
             f"=== Layer 1: System Identity & Rules ===\n{self.system_rules}\n\n"
-            f"=== Layer 2: Tool Capabilities (Alphabetical) ===\n{tool_str}\n\n"
+            f"=== Layer 2: Tool Capabilities (Alphabetical) ===\n{tool_str}"
+            f"{skill_str}\n\n"
             f"{self.boundary_marker}"
         )
 
