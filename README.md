@@ -116,26 +116,19 @@ cp .env.example .env
 # .env 파일을 열어 API 키 입력
 ```
 
----
-
-## 🧪 테스트 실행 검증
-
-하네스의 16대 프롬프트 모듈, 5대 컨텍스트 압축기, Amnesia Guard, 에러 복구 미들웨어가 정상 작동하는지 전체 테스트를 수행할 수 있습니다:
-
-```bash
-pytest -v
-# 총 62개 테스트 케이스 100% 통과 확인 (tests/test_*.py)
-```
 
 ---
 
-## 🖥️ UI 및 서버 구동
+## ️ UI 및 서버 구동
 
 ### 1. Chainlit 채팅 UI 구동 (권장)
 ```bash
 chainlit run app/chainlit_ui.py -w --port 8080
 ```
 - 브라우저에서 `http://localhost:8080` 접속
+- **기본 로그인 계정**:
+  - **ID**: `user`
+  - **Password**: `1234`
 - 19종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
 
 ### 2. 백엔드 FastAPI 서버 구동
