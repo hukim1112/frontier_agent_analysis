@@ -1,31 +1,32 @@
 # ===============================================================================
 # agent-harness-lab: Production Agent Harness Engineering Dependencies
+# LangChain & LangGraph Verified Compatible Latest Stable Stack (2026-08)
 # ===============================================================================
 
-# User updated versions (2026-01)
+# Core LangChain & LangGraph Stack (Tested & Verified Compatible)
 google-ai-generativelanguage
-google-cloud-language==2.18.0
-langchain==1.2.3
-langchain-core==1.2.6
-langchain-openai==1.1.7
-langgraph==1.0.5
-langgraph-checkpoint==3.0.1
-langgraph-prebuilt==1.0.5
-langgraph-sdk==0.3.1
-langsmith==0.6.1
+google-cloud-language
+langchain==1.3.15
+langchain-core==1.5.4
+langchain-openai==1.4.3
+langgraph==1.2.11
+langgraph-checkpoint==4.2.0
+langgraph-prebuilt==1.1.0
+langgraph-sdk==0.4.2
+langsmith==0.10.18
 
-# Existing dependencies (kept from previous env)
-langchain-classic==1.0.0
-langchain-community==0.4.1
-langchain-google-genai==4.1.2
-langchain-tavily==0.2.13
-langchain-text-splitters==1.0.0
-langgraph-checkpoint-sqlite==3.0.0
-aiosqlite<0.22.0
-langgraph-checkpoint-postgres==3.0.2
-langchain-postgres==0.0.16
-notebook==7.5.1
-ipykernel==7.1.0
+# Extended LangChain Ecosystem Dependencies
+langchain-classic==1.0.8
+langchain-community==0.4.2
+langchain-google-genai==4.3.3
+langchain-tavily==0.2.18
+langchain-text-splitters==1.1.2
+langchain-postgres==0.0.17
+langchain-chroma==1.1.0
+langgraph-checkpoint-sqlite==3.1.1
+langgraph-checkpoint-postgres==3.1.2
+
+# Document & Vector Processing
 pdfplumber==0.11.8
 pypdf==6.5.0
 pymupdf4llm==0.2.7
@@ -35,23 +36,46 @@ Pillow==12.0.0
 tqdm==4.67.1
 imagehash==4.3.2
 protobuf
-gradio
 psycopg2-binary==2.9.11
-fastapi
-uvicorn
-pydantic
-httpx
-sse-starlette
-browser-use[video]
-imageio[ffmpeg]
-agentql
-playwright
-streamlit
-crawl4ai
-duckduckgo_search>=8.1.1
-fastmcp
-langchain-chroma
 pysqlite3-binary
+
+# Web & Agent Framework Utilities
+chainlit
+gradio==6.23.1
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+httpx==0.28.1
+httpx-sse
+sse-starlette==3.4.8
+imageio[ffmpeg]==2.37.4
+streamlit==1.61.1
+ddgs>=9.14.4
+duckduckgo_search>=8.1.1
+fastmcp==3.4.7
 datasets
 matplotlib
 pandas
+openpyxl>=3.1.5
+pyarrow>=22.0.0
+yfinance
+FinanceDataReader
+
+# HTTP, Parsing & Runtime Utilities
+aiohttp
+aiosqlite
+beautifulsoup4
+requests
+python-dotenv
+jsonschema
+pyyaml
+
+# Browser Automation (Agent-specific)
+browser-use[video]
+playwright
+crawl4ai
+agentql
+
+# Notebook & Kernel
+notebook==7.5.1
+ipykernel==7.1.0

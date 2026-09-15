@@ -1,11 +1,32 @@
+"""
+===============================================================================
+[H-02] Amnesia Guard Middleware (Advanced Edition)
+===============================================================================
+Source: frontier_agent_analysis/modules/claude_code/amnesia_guard.py
+
+컨텍스트 컴팩션 후 최근 작업 컨텍스트(파일, 계획) 소실을 방지하는 복원 미들웨어.
+- 최근 접근한 파일 경로 추적 (LRU, max_restore_files 제한)
+- 활성 계획(Active Plan) 텍스트 보존 (str 및 list[str] 타입 모두 지원)
+- 컴팩션 시 create_recovery_attachments()로 SystemMessage 복원 블록 생성
+- 파일당 max_file_chars 제한 + Head/Tail 트리밍으로 복원 블록 크기 폭발 방지
+
+H-01 (Compactor)의 AutoCompactor/ReactiveCompactor와 쌍으로 동작합니다.
+도구 호출 인터셉터(create_amnesia_guard_middleware)를 통해 자동 추적합니다.
+===============================================================================
+"""
+
 import os
 from langchain_core.messages import SystemMessage
 from langchain.agents.middleware import wrap_tool_call, AgentMiddleware
 
+
 class AmnesiaGuardMiddleware(AgentMiddleware):
-    """Tracks recently accessed files and active plans to restore them after context compaction."""
-    def __init__(self, max_restore_files: int = 5):
+    """Tracks recently accessed files and active plans to restore them after context compaction.
+    Limits per-file content to max_file_chars with Head/Tail trimming to prevent token explosion."""
+
+    def __init__(self, max_restore_files: int = 5, max_file_chars: int = 3000):
         self.max_restore_files = max_restore_files
+        self.max_file_chars = max_file_chars
         self.recent_files = []  # List of file paths
         self.active_plan = None  # Active plan text
 
@@ -26,8 +47,44 @@ class AmnesiaGuardMiddleware(AgentMiddleware):
         if len(self.recent_files) > self.max_restore_files:
             self.recent_files.pop(0)
 
-    def set_active_plan(self, plan: str):
-        self.active_plan = plan
+    def set_active_plan(self, plan):
+        """Set active plan. Accepts both str and list[str] types."""
+        if isinstance(plan, list):
+            self.active_plan = "\n".join(str(item) for item in plan)
+        elif isinstance(plan, str):
+            self.active_plan = plan
+
+    def _trim_file_content(self, content: str, file_path: str = "") -> str:
+        """Trim large file content to max_file_chars using Head(40 lines)/Tail(10 lines) strategy.
+        Includes Actionable Hint for full content retrieval."""
+        if len(content) <= self.max_file_chars:
+            return content
+
+        lines = content.split("\n")
+        head_lines = 40
+        tail_lines = 10
+
+        if len(lines) <= head_lines + tail_lines:
+            # File has few lines but large content per line — truncate by chars
+            truncated = content[:self.max_file_chars]
+            hint = f"\n... [{len(content) - self.max_file_chars} chars omitted. Use `file_read(path='{file_path}')` for full content]"
+            return truncated + hint
+
+        head = "\n".join(lines[:head_lines])
+        tail = "\n".join(lines[-tail_lines:])
+        omitted_count = len(lines) - head_lines - tail_lines
+
+        trimmed = (
+            f"{head}\n"
+            f"\n... [{omitted_count} lines omitted. Use `file_read(path='{file_path}')` for full content] ...\n\n"
+            f"{tail}"
+        )
+
+        # Final safety check against max_file_chars
+        if len(trimmed) > self.max_file_chars:
+            trimmed = trimmed[:self.max_file_chars] + f"\n... [Trimmed to {self.max_file_chars} chars]"
+
+        return trimmed
 
     def create_recovery_attachments(self) -> list:
         recovery_sections = []
@@ -42,7 +99,8 @@ class AmnesiaGuardMiddleware(AgentMiddleware):
                     try:
                         with open(f, "r", encoding="utf-8") as file:
                             content = file.read()
-                        file_snapshots.append(f"File: {f}\nContent:\n{content}")
+                        trimmed_content = self._trim_file_content(content, f)
+                        file_snapshots.append(f"File: {f}\nContent:\n{trimmed_content}")
                     except Exception as e:
                         file_snapshots.append(f"File: {f}\nContent: (Error reading: {e})")
                 else:
@@ -74,10 +132,9 @@ def create_amnesia_guard_middleware(amnesia_guard: AmnesiaGuardMiddleware):
 
         if tool_name in ["update_plan", "create_plan", "set_plan"]:
             for key in ["plan", "content", "text"]:
-                if key in args and isinstance(args[key], str):
+                if key in args:
                     amnesia_guard.set_active_plan(args[key])
 
         return handler(request)
 
     return amnesia_tool_interceptor
-

@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+ENV
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+artifacts/runs/
+artifacts/data/
+.vscode/
+.env
