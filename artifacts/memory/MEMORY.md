@@ -1,1 +1,0 @@
-The AI is designed to assist with various programming tasks, including code writing, debugging, system analysis, and web development.
