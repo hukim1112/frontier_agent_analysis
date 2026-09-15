@@ -1,189 +1,145 @@
 # 🧠 Frontier Agent Lab (글로벌 에이전트 아키텍처 실습)
 
-본 프로젝트는 Hermes Agent 및 Claude Code의 핵심 아키텍처인 **4계층 메모리 시스템(4-Layer Memory)**, **자율 학습 루프(Closed Learning Loop)**, **멀티 모델 라우팅(Multi-Model Routing)**, **컨텍스트 압축(Compactor & Amnesia Guard)**이 구현된 프론티어 에이전트 코드베이스 실습 환경입니다.
+본 프로젝트는 글로벌 탑티어 에이전트인 **Claude Code**의 핵심 하네스 설계와 **Hermes Agent**의 계층형 메모리 설계를 역공학하여, LangChain 및 LangGraph 환경에서 직접 구현하고 검증하는 **실습 교안 및 레퍼런스 코드베이스**입니다.
 
 ---
 
-## 🌟 핵심 아키텍처 및 구현 특징
+## 🌟 핵심 설계 철학 및 아키텍처 구성
 
-### 1. 🧠 Hermes 4-Layer Memory System
-- **L1 Working Memory (`checkpoints.db`)**: `AsyncSqliteSaver` 기반으로 대화 세션 단기 상태 및 스레드 체크포인팅.
-- **L2 Episodic Memory (`episodic.db`)**: SQLite FTS5 전문 검색 엔진 기반으로 10개 이상 대형 과거 세션 데이터 탐색 및 Anchor 키워드 기반 메시지 맥락 인출.
-- **L3 Semantic Memory (`MEMORY.md` / `USER.md`)**: 에이전트 팩트 및 유저 프로필 선호도 보관. LLM 백그라운드 리뷰를 통한 스마트 병합(`add`, `replace`, `remove`).
-- **L4 Procedural Memory & Dynamic Prompting**: `PROMPT.md`, `MCP.md`, `AGENT.md`, `SKILL.md`를 5개 계층으로 조립하는 `PromptAssembler` 미들웨어.
+### 1. 🛡️ Claude Code 핵심 하네스 아키텍처
 
-### 2. ⚡ 멀티 모델 라우팅 (Multi-Model Routing)
-- **메인 추론 에이전트 (`gemini-3.5-flash`)**: 대용량 문맥 처리, 복잡한 파이썬 코딩 및 다중 도구 제어 전담.
-- **백그라운드 학습 데몬 (`openai:gpt-4o-mini`)**: 대화 완료 후 비동기 데몬 스레드에서 **1.35초 초고속**으로 팩트 수집 및 메모리 마크다운 업데이트.
+#### ① 5-Layer 16대 모듈 프롬프트 어셈블러 (`app/middleware/prompt/`)
+- **Layer 1: Global Constitution (Modules 0~3, 5~6)**: 정체성, 보안 가이드, 린 엔지니어링, 비가역적 파괴 작업 승인 규칙, 간결한 톤&스타일, 효율적 출력 정책.
+- **Layer 2: Capabilities & Tool Guide (Module 4)**: Anti-Raw Bash 가드레일, 알파벳순 정렬된 도구 스키마, 온디맨드 스킬 카탈로그.
+- **🔻 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`**: 정적 영역(L1~L2)과 동적 영역(L3~L5)을 분리하여 **KV Cache Hit Rate(97%+) 극대화**.
+- **Layer 3: Session Interaction (Module 8)**: 대화형 CLI 명령 안내(`! <cmd>`), 슬래시 커맨드 인식.
+- **Layer 4: Environment & Memory Index (Modules 9~12)**: CWD, Session ID, Date 등 환경 메타데이터, 언어 정책, 출력 스타일, 인출된 시맨틱 메모리.
+- **Layer 5: Resource Control & Project Rules (Modules 13~16)**: MCP 지침, 권한 면제 Scratchpad 샌드박스, FRC(False Response Claim) 방지 수칙, 도구 결과 요약 정책 및 `AGENT.md` 로컬 규칙.
+- **User Context Bypass Injection**: `CLAUDE.md`와 Git 스냅샷 동결(`@lru_cache`, 2000자 절단)을 시스템 프롬프트 외부(`messages[0]`의 `<system-reminder>`)로 1회 우회 주입.
 
+#### ② 5대 컨텍스트 압축 파이프라인 & Amnesia Guard (`app/middleware/compaction/`)
+- **Snip Compact**: 2턴 이상 경과한 오래된 대용량 툴 결과를 1줄 스텁(`[Output snipped]`)으로 변환 (토큰 90%+ 절감).
+- **Microcompact**: 5,000자 초과 대용량 툴 로그를 디스크 스왑 파일(`.claude/swaps/`)로 덤프 후 포인터만 잔류.
+- **Context Collapse**: 3회 이상 연속 탐색 툴 실행 내역을 단일 접힌 블록으로 병합.
+- **Auto-Compact**: 토큰 임계치 초과 시 4대 영역 구조화 요약 생성.
+- **Amnesia Guard**: 압축으로 인해 활성 계획(Plan)과 수정 중인 최근 5개 파일 스냅샷이 소실(기억상실)되는 것을 방지하기 위해 복구 어태치먼트를 시스템 프롬프트로 재주입.
+- **Reactive Compact**: API 413 `prompt_too_long` 에러 발생 시 에러를 은폐(Silent Withholding)하고 오래된 대화 20% 절단 후 자동 재시도.
 
-### 3. 🛡️ Claude Code 하네스 아키텍처 (Context Compaction & Memory Safety)
-- **AutoCompactor (`compactor.py`)**: 컨텍스트 토큰 임계치 초과 시 대화 내역 요약 및 이전 대화 압축.
-- **Amnesia Guard (`amnesia_guard.py`)**: 컨텍스트 압축 시 작업 중이던 파일 스냅샷과 작업 계획(Plan Text)이 상실되어 에이전트가 단기 기억상실(Amnesia)에 빠지는 것을 막기 위해 가공 파일 스냅샷을 SystemMessage로 자동 복구 주입하는 미들웨어.
-- **Stop Hooks & Self-Correction (`stop_hooks.py`, `self_correction.py`)**: 압축 직후 에이전트가 루프나 멍때림(Stuck State)에 빠졌을 때 자가 치유(Self-Healing) 조치를 격발하는 가드레일.
-
-### 4. 📊 정밀 트레이싱 및 감사 관측성 (AgentTracer)
-- LLM 토큰 수치(Prompt/Completion Token), 지연시간(Latency), 도구 격발 내역 추적 및 주피터 노트북 시각화(`display_trace()`) 지원.
+#### ③ Self-Recovery & Self-Correction 에러 컨트롤 (`app/middleware/error_control/`)
+- **ModelFallbackMiddleware**: 메인 LLM API 장애 시 백업 모델로 자동 failover.
+- **ToolErrorHandlerMiddleware**: 도구 실행 예외를 크래시 대신 `ToolMessage`로 변환하여 에이전트의 자가 회복 유도.
+- **ModelCallLimitMiddleware**: 무한 루프 방지 (호출 횟수 상한 제어).
+- **StopHooksMiddleware**: 에이전트가 생성한 파이썬 코드의 문법/들여쓰기 오류를 사전 인터셉트하여 blockingError를 주입, 스스로 코드를 자가 수정(Self-Correction)하도록 강제.
 
 ---
 
-## 🚀 시작하기 (환경 세팅)
+### 2. 🧠 Hermes 4-Layer Memory System (`app/middleware/memory/`)
+- **L1 Working Memory (`checkpoints.db`)**: `AsyncSqliteSaver` 기반 세션별 런타임 단기 상태 체크포인팅.
+- **L2 Episodic Memory (`episodic.db`)**: SQLite FTS5 전문 검색 엔진 기반 대형 과거 세션 데이터 탐색 및 JIT 인출.
+- **L3 Semantic Memory (`MEMORY.md` / `USER.md`)**: 에이전트 팩트 및 사용자 프로필 관리. 백그라운드 리뷰를 통한 스마트 마크다운 병합(`add`, `replace`, `remove`).
+- **L4 Procedural Memory**: 프롬프트 어셈블러 및 스킬 카탈로그(`SKILL.md`)와 연동된 절차 기억.
 
-로컬 WSL2(우분투) 환경에서 다음 명령어를 실행하여 의존성 패키지를 설치하고 환경을 설정하세요.
-
-```bash
-# 1. install 폴더로 이동하여 패키지 설치
-cd install
-bash install_all.sh
-```
-
-### 환경 변수 설정
-프로젝트 루트에 `.env` 파일을 생성하고 사용할 API 키를 설정하세요.
-
-```env
-OPENAI_API_KEY="your-openai-api-key"
-GOOGLE_API_KEY="your-gemini-api-key"
-```
 ---
 
 ## 📂 프로젝트 구조
 
 ```text
-frontier-agent-lab/
-├── app/                    # 🧠 핵심 애플리케이션 및 API 서버
-│   ├── agents/             #   └── frontier_agent.py (Hermes 메모리 결합), chatbot.py
-│   ├── prompts/            #   └── PROMPT.md, MCP.md, AGENT.md, SKILL.md
-│   ├── tools/              #   └── common_tools, memory_tools
-│   ├── utils/              #   └── get_llm, AgentContext
-│   ├── server.py           #   └── FastAPI 서버 (동적 에이전트 로더 & config 반영)
-│   └── ui.py               #   └── Streamlit 대화형 웹 UI
+frontier_agent_analysis/
+├── app/                              # 🧠 메인 애플리케이션 및 하네스 모듈
+│   ├── agents/                       #   ├── main_agent.py (19종 도구 + 9단계 미들웨어 오케스트레이터)
+│   │                                 #   └── chatbot.py, analyst.py, scraper.py
+│   ├── middleware/                   #   📁 체계화된 하네스 미들웨어 패키지
+│   │   ├── prompt/                   #   │   └── prompt_assembler.py (16-Module 5-Layer 조립기)
+│   │   ├── compaction/               #   │   └── compactor.py, amnesia_guard.py
+│   │   ├── error_control/            #   │   └── self_recovery.py, self_correction.py
+│   │   ├── memory/                   #   │   └── semantic_store.py, episodic_store.py, memory_middleware.py
+│   │   └── observability/            #   │   └── agent_log_tracer.py, visualizer.py
+│   ├── prompts/                      #   └── SUPERVISOR.py, CHATBOT.py, ANALYST.py, SCRAPER.py
+│   ├── tools/                        #   └── supervisor_tools.py, custom_tools.py, navigator.py, analyst.py
+│   ├── utils/                        #   └── context.py, database/, log_analyzer.py
+│   ├── server.py                     #   └── FastAPI 백엔드 서버
+│   ├── chainlit_ui.py                #   └── Chainlit 대화형 채팅 UI (포트 8080)
+│   └── streamlit_ui.py               #   └── Streamlit 보조 UI
 │
-├── modules/                # 🛠️ 글로벌 에이전트 핵심 아키텍처 모듈
-│   ├── hermes/             #   └── memory_store, session_store, memory_middleware, prompt_assembler
-│   ├── claude_code/        #   └── compactor, amnesia_guard, stop_hooks
-│   └── common/             #   └── agent_tracer (토큰 & 지연시간 정밀 트레이서)
+├── modules/                          # 🛠️ 실습 교안 전용 독립 모듈
+│   ├── claude_code/                  #   └── prompt_assembler, compactor, amnesia_guard, self_correction
+│   └── common/                       #   └── agent_tracer.py (토큰/지연시간 정밀 감사 트레이서)
 │
-├── notebooks/              # 📗 수강생 실습용 주피터 노트북 (3종)
-│   ├── 01_react_vs_frontier_agents.ipynb
-│   ├── 02_claude_code_harness.ipynb
-│   └── 03_hermes_memory_architecture.ipynb
+├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (3종)
+│   ├── 01_react_vs_frontier_agents.ipynb    # Step 1: ReAct vs 프론티어 에이전트 루프 & 관측성
+│   ├── 02_claude_code_harness.ipynb         # Step 2: 5계층 프롬프트, 5대 압축 파이프라인, Amnesia Guard
+│   └── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리 및 에피소딕 FTS5 인출
 │
-├── tests/                  # 🧪 정식 pytest 수트 (FTS5 10개 시나리오 포함)
-│   ├── test_02_claude_code.py
-│   ├── test_03_hermes.py
-│   └── test_04_episodic_search.py
+├── configs/                          # ⚙️ 런타임 제어 설정 파일
+│   ├── compaction.config             #   └── 압축 임계치 및 스왑 디렉터리 설정
+│   ├── guardrail.config              #   └── 입력 보안 및 주제 정렬 임계치
+│   ├── hitl.config                   #   └── 도구 실행 사용자 승인(HITL) 규칙
+│   ├── logging.config                #   └── 감사 로그 수집 설정
+│   ├── memory.config                 #   └── 시맨틱/에피소딕 메모리 활성화 설정
+│   └── model.config                  #   └── 기본 및 폴백 LLM 모델 지정
 │
-├── artifacts/              # 📂 메모리 및 대화 데이터셋 보관함
-│   ├── memory/             #   └── MEMORY.md, USER.md
-│   ├── chat/               #   └── scenario_01.json ~ scenario_10.json
-│   └── logs/               #   └── {session_id}.jsonl 감사 로그
+├── tests/                            # 🧪 62개 검증 테스트 수트
+│   ├── test_02_claude_code.py        #   └── Claude Code 기본 하네스 테스트
+│   ├── test_prompt_assembler_advanced.py # └── 16대 모듈, 바이패스 주입, MCP 델타 고급 테스트
+│   └── test_compactor.py             #   └── 5대 압축 파이프라인 정밀 테스트
 │
-├── configs/                # ⚙️ memory.config, logging.config, hitl.config
-└── README.md               # 📖 본 프로젝트 통합 설명서
+├── .devcontainer/                    # 🐳 GitHub Codespaces 원클릭 실행 환경
+│   └── devcontainer.json             #   └── Python 3.12, Playwright, noVNC, Chainlit 자동 바인딩
+│
+├── install/                          # 📦 설치 스크립트 및 의존성 목록
+│   ├── requirements.txt
+│   └── install_all.sh
+│
+└── .env.example                      # 🔑 환경 변수 템플릿 (Codespaces 자동 생성 대응)
 ```
 
+---
+
+## 🚀 빠른 시작 (Quick Start)
+
+### 방법 A: GitHub Codespaces (권장: 설치 없이 1초 시작)
+1. GitHub 저장소 상단의 **`Code` -> `Codespaces` -> `Create codespace on main`** 클릭
+2. 사전 빌드된 Docker 이미지(`hukimartia/agent-lab:latest`) 기반으로 Python, Playwright, noVNC, Chainlit 환경이 자동 구성됩니다.
+3. 생성된 `.env` 파일에 발급받으신 LLM API Key(`OPENAI_API_KEY` 또는 `GOOGLE_API_KEY`)를 입력하면 즉시 준비 완료!
+
+### 방법 B: 로컬 WSL2 (Ubuntu) 환경
+```bash
+# 1. 저장소 클론 및 이동
+git clone https://github.com/hukim1112/frontier_agent_analysis.git
+cd frontier_agent_analysis
+
+# 2. 의존성 패키지 설치
+pip install -r install/requirements.txt
+
+# 3. 환경 변수 설정
+cp .env.example .env
+# .env 파일을 열어 API 키 입력
+```
 
 ---
 
-## ⚙️ 설정 파일 제어 (`configs/`)
+## 🧪 테스트 실행 검증
 
-모든 메모리 및 로깅 미들웨어 옵션은 설정 파일(`load_config`)을 통해 유연하게 제어됩니다:
+하네스의 16대 프롬프트 모듈, 5대 컨텍스트 압축기, Amnesia Guard, 에러 복구 미들웨어가 정상 작동하는지 전체 테스트를 수행할 수 있습니다:
 
-- **`configs/memory.config`**:
-  ```json
-  {
-    "episodic_memory_enabled": true,
-    "semantic_memory_enabled": true,
-    "memory_learning_enabled": true,
-    "memory_dir": "./artifacts/memory",
-    "episodic_db_path": "./app/database/episodic.db"
-  }
-  ```
-- **`configs/logging.config`**:
-  ```json
-  {
-    "logging_enabled": true,
-    "log_path": "./artifacts/agent_audit_trail.json"
-  }
-  ```
+```bash
+pytest -v
+# 총 62개 테스트 케이스 100% 통과 확인 (tests/test_*.py)
+```
 
 ---
 
-## 🖥️ 서버 및 웹 UI 실행 방법
+## 🖥️ UI 및 서버 구동
 
-### 1. 백엔드 FastAPI 서버 가동
+### 1. Chainlit 채팅 UI 구동 (권장)
+```bash
+chainlit run app/chainlit_ui.py -w --port 8080
+```
+- 브라우저에서 `http://localhost:8080` 접속
+- 19종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
+
+### 2. 백엔드 FastAPI 서버 구동
 ```bash
 python app/server.py --port 8000
 ```
-* `http://localhost:8000/agents` 경로에서 동적으로 마운트된 `frontier_agent` 목록 확인 가능.
-
-### 2. Streamlit 웹 채팅 UI 가동
-```bash
-streamlit run app/ui.py
-```
-* 브라우저에서 `http://localhost:8501` 접속 후 **`frontier_agent`**를 선택하여 대화 및 세션 간 장기 기억 이관 테스트 진행.
-
----
-
-### 💬 내가 만든 에이전트를 웹 화면에 바로 추가하여 대화하기
-
-이 프로젝트는 **서버를 껐다 켤 필요 없이, 에이전트 파일만 `app/agents/` 폴더에 넣으면 웹 화면이 실시간으로 알아채고 에이전트를 추가**해 줍니다. 
-
-실습 도중 나만의 에이전트를 완성했거나 새로 만들고 싶다면, 아래의 3단계만 따라 해 보세요.
-
-#### 1단계. 에이전트 파일 만들기
-`app/agents/` 폴더 안에 원하는 이름으로 파이썬 파일(예: `my_agent.py`)을 새로 만듭니다.
-
-#### 2단계. 에이전트 코드 작성하기 (그대로 복사해서 붙여넣기)
-새로 만든 파일(`my_agent.py`) 안에 아래의 코드를 그대로 복사해서 붙여넣고 저장합니다. 
-
-```python
-# app/agents/my_agent.py
-
-from langchain.agents import create_agent
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.tools import tool
-from app.utils import get_llm
-from app.utils.context import AgentContext
-
-# 1) UI에 표시될 에이전트의 소개 정보 (필수)
-AGENT_METADATA = {
-    "name": "my_agent", 
-    "description": "더하기 도구가 탑재된 나만의 실습용 ReAct 에이전트"
-}
-
-# 2) 에이전트가 사용할 실제 도구 정의 (생략 없이 작동 가능한 도구 예시)
-@tool
-def add_numbers(a: int, b: int) -> int:
-    """두 정수 a와 b를 더한 결과를 반환합니다. 더하기 연산이 필요할 때 사용하세요."""
-    return a + b
-
-# 3) 에이전트를 생성하는 함수 (서버가 이 함수를 찾아 실행합니다)
-async def create_agent_executor():
-    # 1. LLM 모델 생성 (Gemini 3.5 Flash 모델 활용)
-    llm = get_llm(model_name="gemini-3.5-flash", temperature=0.0)
-    
-    # 2. 대화 기억 보존을 위한 체크포인터 셋업
-    memory = MemorySaver()
-    
-    # 3. 도구 목록 정의
-    tools = [add_numbers]
-    
-    # 4. 에이전트 최종 구축
-    agent = create_agent(
-        model=llm,
-        tools=tools,
-        checkpointer=memory,
-        context_schema=AgentContext
-    )
-    return agent
-```
-
-#### 3단계. 웹 브라우저 새로고침하고 대화하기
-1. 띄워져 있는 웹 채팅 화면([http://localhost:8501](http://localhost:8501))으로 이동하여 **새로고침(F5)**을 누릅니다.
-2. 왼쪽 메뉴의 **"Select Agent" 드롭다운 상자**를 누르면, 방금 만든 `my_agent`가 실시간으로 감지되어 목록에 추가되어 있습니다.
-3. 해당 에이전트를 선택하고 대화를 시작해 보세요!
-   *(예: "37 더하기 84는 뭐야?" 라고 물어보면 에이전트가 탑재된 `add_numbers` 도구를 호출하여 정상적으로 덧셈 결과를 답변합니다.)*
-
----
-
+- `http://localhost:8000/docs`에서 Swagger 인터페이스로 에이전트 엔드포인트 테스트 가능.
