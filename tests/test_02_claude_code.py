@@ -75,8 +75,8 @@ def test_prompt_assembler_with_history():
 
 def test_prompt_assembler_truncation():
     with tempfile.NamedTemporaryFile(mode="w+", delete=False, encoding="utf-8") as tmp:
-        # Write more than 200 lines to trigger truncation
-        tmp.write("line\n" * 250)
+        # Write more than 300 lines to trigger truncation (new version uses max_lines=300)
+        tmp.write("line\n" * 350)
         tmp_name = tmp.name
 
     try:

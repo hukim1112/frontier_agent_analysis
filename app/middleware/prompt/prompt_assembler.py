@@ -794,7 +794,7 @@ class PromptAssembler:
             else:
                 parts.append(f"[Recalled Memory (injected by MemoryMiddleware)]:\n{recalled.strip()}")
 
-        # 비메모리 동적 문서 (MCP.md 등)
+        # 비메모리 동적 문서
         if self.l4_docs:
             for doc_name, source in self.l4_docs.items():
                 doc_content = self.read_and_truncate_doc(source, max_lines=300, max_bytes=35000)
