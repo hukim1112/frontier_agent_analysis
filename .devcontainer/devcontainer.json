@@ -1,0 +1,53 @@
+{
+  "name": "Agent Lab (Codespaces)",
+  "image": "hukimartia/agent-lab:latest",
+
+  // 1. 포트 자동 포워딩 설정
+  "forwardPorts": [6080, 8080, 8000, 8888],
+
+  "portsAttributes": {
+    "6080": {
+      "label": "noVNC Desktop (Browser View)",
+      "onAutoForward": "notify",
+      "elevateIfNeeded": true
+    },
+    "8080": {
+      "label": "Chainlit Chat UI",
+      "onAutoForward": "openBrowser",
+      "elevateIfNeeded": true
+    },
+    "8000": {
+      "label": "FastAPI Backend API",
+      "onAutoForward": "notify",
+      "elevateIfNeeded": true
+    },
+    "8888": {
+      "label": "Jupyter Notebook",
+      "onAutoForward": "notify",
+      "elevateIfNeeded": true
+    }
+  },
+
+  // 2. 컨테이너 런타임 환경 변수
+  "containerEnv": {
+    "DISPLAY": ":1",
+    "PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright"
+  },
+
+  // 3. VS Code 필수 확장 도구 및 설정
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  },
+
+  // 4. 컨테이너 생성 직후 초기화 (실행 권한 부여 및 .env 자동 세팅)
+  "postCreateCommand": "chmod +x start_vnc.sh && if [ ! -f .env ] && [ -f .env.example ]; then cp .env.example .env && python -c 'import secrets; f=open(\".env\"); c=f.read().replace(\"your_chainlit_secret_here\", secrets.token_hex(32)); open(\".env\", \"w\").write(c)'; fi && echo '🚀 Agent Lab Environment is Ready!'"
+}
