@@ -1,13 +1,13 @@
 """
 ===============================================================================
-[Harness Tool Module] Claude Code Planning & Task Management Tool Engine
+[AAWS Tool Module] Planning & Task Management Tool Engine (plan.py)
 ===============================================================================
-This module provides Planning Mode and Task Board state management tools for Claude Code:
-1. enter_plan: Enters planning mode and registers step-by-step plan.
-2. exit_plan: Exits planning mode with status.
-3. task_create: Creates tracked sub-task item.
-4. task_list: Lists all active and completed tasks on task board.
-5. task_update: Updates task status (PENDING, IN_PROGRESS, COMPLETED, BLOCKED).
+Supervisor 및 오케스트레이션 에이전트를 위한 5대 Planning & Task Board 도구 엔진:
+1. enter_plan: 거시적 실행 계획 수립 및 Planning 모드 진입
+2. exit_plan: Planning 모드 종료 및 상태 완료 처리
+3. task_create: Task Board에 세부 하위 과제 등록 (ID 자동 발급)
+4. task_list: 현재 Task Board의 전체 작업 목록 및 상태 조회
+5. task_update: 특정 과제 상태 갱신 (PENDING, IN_PROGRESS, COMPLETED, BLOCKED)
 ===============================================================================
 """
 
@@ -40,6 +40,14 @@ def enter_plan(plan_name: str, steps: List[str]) -> str:
     """
     global plan_session_state
     plan_session_state = {"active": True, "plan_name": plan_name, "steps": steps}
+    
+    # plan_state.json 파일로 저장하여 디스크 칠판 동기화
+    try:
+        with open("plan_state.json", "w", encoding="utf-8") as f:
+            json.dump(plan_session_state, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+        
     return f"[PLANNING MODE ENTERED] Registered '{plan_name}' with {len(steps)} sequential steps."
 
 
@@ -60,6 +68,14 @@ def exit_plan(plan_name: str, status: str = "COMPLETED") -> str:
     """
     global plan_session_state
     plan_session_state["active"] = False
+    plan_session_state["status"] = status
+    
+    try:
+        with open("plan_state.json", "w", encoding="utf-8") as f:
+            json.dump(plan_session_state, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+        
     return f"[PLANNING MODE EXITED] Plan '{plan_name}' terminated with status '{status}'."
 
 
@@ -70,6 +86,7 @@ class TaskBoardState:
     """Manages persistent task items on the agent task board."""
     def __init__(self, filename="task_state.json"):
         self.filename = filename
+        self.tasks = []
         self._load()
 
     def _load(self):
@@ -83,8 +100,11 @@ class TaskBoardState:
             self.tasks = []
 
     def _save(self):
-        with open(self.filename, "w", encoding="utf-8") as f:
-            json.dump(self.tasks, f, indent=2, ensure_ascii=False)
+        try:
+            with open(self.filename, "w", encoding="utf-8") as f:
+                json.dump(self.tasks, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
     def create_task(self, description: str) -> Dict[str, Any]:
         t_id = len(self.tasks) + 1
@@ -94,9 +114,11 @@ class TaskBoardState:
         return t_item
 
     def list_tasks(self) -> List[Dict[str, Any]]:
+        self._load()
         return self.tasks
 
     def update_task(self, task_id: int, status: str) -> Optional[Dict[str, Any]]:
+        self._load()
         for t in self.tasks:
             if t["id"] == task_id:
                 t["status"] = status
@@ -156,4 +178,6 @@ def task_update(task_id: int, status: str) -> str:
         return f"Task #{task_id} not found."
     return f"[TASK UPDATED] Task #{task_id} status changed to '{status}'."
 
-PLANNING_AND_TASK_TOOLS = [enter_plan, exit_plan, task_create, task_list, task_update]
+# 📋 5대 Planning & Task 도구 묶음
+tools_planning = [enter_plan, exit_plan, task_create, task_list, task_update]
+PLANNING_AND_TASK_TOOLS = tools_planning

@@ -1,6 +1,18 @@
+"""
+===============================================================================
+Skill Prompt Builder — Frontmatter Scanner & Dynamic Catalog Builder
+===============================================================================
+Source: frontier-agent-lab/app/prompts/skill_builder.py
+
+스킬 행동 수칙(가이드라인) + 설치된 스킬 디렉토리(SKILL.md)의 YAML Frontmatter를
+스캔하여 <skills> 카탈로그를 동적으로 생성합니다.
+===============================================================================
+"""
+
 import os
 import re
 from typing import List, Optional, Dict, Any
+
 
 class SkillPromptBuilder:
     """스킬 행동 수칙(가이드라인) + 설치된 스킬 카탈로그(프론트매터) 통합 조립기"""
@@ -15,7 +27,7 @@ class SkillPromptBuilder:
         skills_dirs: Optional[List[str]] = None,
         guidelines_path: Optional[str] = "app/prompts/SKILL.md",
     ):
-        self.skills_dirs = skills_dirs or ["./skills", "./.agents/skills", "skills"]
+        self.skills_dirs = skills_dirs or ["./skills", "./.agents/skills", "skills", "../skills"]
         self.guidelines_path = guidelines_path
 
     def _extract_frontmatter(self, skill_md_path: str) -> Dict[str, str]:
@@ -96,7 +108,7 @@ class SkillPromptBuilder:
         return "<skills>\n" + "\n".join(catalog_entries) + "\n</skills>"
 
     def assemble(self) -> str:
-        """가이드라인 + 카탈로그를 하나로 조립하여 Layer 2/3 주입용 문자열 반환"""
+        """가이드라인 + 카탈로그를 하나로 조립하여 Layer 2 주입용 문자열 반환"""
         guidelines = self.DEFAULT_GUIDELINES
         if self.guidelines_path and os.path.exists(self.guidelines_path):
             try:

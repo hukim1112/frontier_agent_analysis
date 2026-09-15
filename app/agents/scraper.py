@@ -1,3 +1,11 @@
+"""
+===============================================================================
+[Phase 3] Scraper Agent — 사이트 분석 + 크롤링 코드 생성/실행 + 데이터 수집
+===============================================================================
+Navigator(사이트 분석) + Coder(코드 생성/실행) 기능을 통합한 단일 에이전트.
+동일 컨텍스트에서 사이트 분석 → 셀렉터 결정 → 스크립트 작성 → 실행 → 검증까지 수행.
+"""
+
 import os
 import json
 import aiosqlite
@@ -5,14 +13,15 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from app.utils import init_chat_model
-from app.prompts import CHATBOT_SYSTEM_PROMPT
-from app.tools import tools_chatbot
+from app.prompts import SCRAPER_SYSTEM_PROMPT
+from app.tools import tools_scraper
 from app.utils.context import AgentContext
 
 AGENT_METADATA = {
-    "name": "chatbot",
-    "description": "도구 및 모니터링이 활성화된 기준완성형 챗봇 (서버/UI 테스트용)"
+    "name": "scraper",
+    "description": "사이트 분석 + 크롤링 코드 생성/실행 + 데이터 수집을 수행하는 Scraper 에이전트"
 }
+
 
 def _load_config(path: str, default: dict) -> dict:
     """설정 파일을 로드합니다. 실패 시 기본값을 반환합니다."""
@@ -24,16 +33,10 @@ def _load_config(path: str, default: dict) -> dict:
         pass
     return default
 
+
 async def create_agent_executor():
-    # 1. model.config 기반 모델 초기화
-    model_cfg = _load_config("./configs/model.config", {
-        "model_name": "gemini-3.7-flash",
-        "temperature": 0.0,
-    })
-    llm = init_chat_model(
-        model=model_cfg.get("model_name", "gemini-3.7-flash"),
-        temperature=model_cfg.get("temperature", 0.0)
-    )
+    # 1. LLM 설정 — Universal Chat Model Factory 기반 gemini-3.7-flash 사용
+    llm = init_chat_model(model="gemini-3.7-flash", temperature=0.0)
     
     # 2. AsyncSqliteSaver 기반 체크포인터 (SQLite 영구 메모리)
     db_dir = "app/database"
@@ -57,13 +60,13 @@ async def create_agent_executor():
                 )
             )
     
-    # 4. 범용 8대 도구가 탑재된 스마트 챗봇 에이전트 구축
-    chatbot_agent = create_agent(
+    # 4. Scraper 에이전트 구축: 네비게이팅(5종) + 코딩(6종) = 11개 도구
+    scraper_agent = create_agent(
         model=llm,
-        tools=tools_chatbot,
-        system_prompt=CHATBOT_SYSTEM_PROMPT,
+        tools=tools_scraper,
+        system_prompt=SCRAPER_SYSTEM_PROMPT,
         middleware=middleware,
         checkpointer=checkpointer,
         context_schema=AgentContext
     )
-    return chatbot_agent
+    return scraper_agent

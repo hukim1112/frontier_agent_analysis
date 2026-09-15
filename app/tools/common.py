@@ -384,11 +384,13 @@ def tool_search(query: str) -> str:
         "file_read": "Reads file contents with line offset and limit.",
         "file_edit": "Performs exact string matching replacement in local files.",
         "file_writer": "Creates or overwrites files on local disk.",
+        "notebook_edit": "Edits cells inside Jupyter notebooks (.ipynb).",
         "bash_command": "Executes shell commands with timeout and exit codes.",
         "grep_search": "Searches file contents using regex.",
         "glob_search": "Finds files matching glob patterns.",
+        "tool_search": "Searches registered agent tools catalog.",
         "web_fetch": "Fetches and parses text/markdown from web URLs.",
-        "web_search": "Performs DuckDuckGo web queries for snippets.",
+        "web_search": "Performs web search prioritizing Tavily API with DuckDuckGo fallback.",
     }
     
     query_lower = query.lower()
@@ -456,14 +458,54 @@ class WebSearchInput(BaseModel):
 
 @tool(args_schema=WebSearchInput)
 def web_search(query: str) -> str:
-    """Performs web search queries to retrieve documentation links and text snippets.
+    """Performs web search prioritizing Tavily Search API with automatic fallback to DuckDuckGo if Tavily fails or is unavailable.
 
     Args:
         query: Search query string to look up on the web.
 
     Returns:
-        Formatted list of top web search result titles and text snippets.
+        Formatted list of top web search result titles, URLs, and text snippets.
     """
+    # 1. Attempt Tavily Search first
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    if tavily_key:
+        try:
+            from langchain_tavily import TavilySearch
+            tavily = TavilySearch(max_results=5)
+            raw_res = tavily.invoke(query)
+            
+            if isinstance(raw_res, dict) and "results" in raw_res:
+                results = raw_res["results"]
+                if results:
+                    formatted = []
+                    for idx, item in enumerate(results, start=1):
+                        title = item.get("title", "Result").strip()
+                        url = item.get("url", "")
+                        content = item.get("content", item.get("snippet", "")).strip()
+                        if url:
+                            formatted.append(f"{idx}. [{title}]({url}): {content}")
+                        else:
+                            formatted.append(f"{idx}. [{title}]: {content}")
+                    return f"[Tavily Search Results for '{query}']\n" + "\n".join(formatted)
+            elif isinstance(raw_res, list) and raw_res:
+                formatted = []
+                for idx, item in enumerate(raw_res, start=1):
+                    if isinstance(item, dict):
+                        title = item.get("title", "Result").strip()
+                        url = item.get("url", "")
+                        content = item.get("content", item.get("snippet", "")).strip()
+                        if url:
+                            formatted.append(f"{idx}. [{title}]({url}): {content}")
+                        else:
+                            formatted.append(f"{idx}. [{title}]: {content}")
+                    else:
+                        formatted.append(f"{idx}. {str(item)}")
+                return f"[Tavily Search Results for '{query}']\n" + "\n".join(formatted)
+        except Exception:
+            # Fallback to DuckDuckGo if Tavily call fails or rate limits
+            pass
+
+    # 2. Fallback to DuckDuckGo Search (DDGS)
     import warnings
     warnings.filterwarnings("ignore")
     try:
@@ -475,16 +517,20 @@ def web_search(query: str) -> str:
         results = []
         with DDGS() as ddgs:
             search_results = list(ddgs.text(query, max_results=5))
+
         for idx, r in enumerate(search_results):
             clean_title = r.get("title", "Result").strip()
+            clean_url = r.get("href", r.get("url", ""))
             clean_snippet = r.get("body", "").strip()
-            results.append(f"{idx+1}. [{clean_title}]: {clean_snippet}")
+            if clean_url:
+                results.append(f"{idx+1}. [{clean_title}]({clean_url}): {clean_snippet}")
+            else:
+                results.append(f"{idx+1}. [{clean_title}]: {clean_snippet}")
 
         if not results:
             return f"WebSearch Result for '{query}': No snippets extracted."
 
-        return f"[Web Search Results for '{query}']\n" + "\n".join(results)
+        return f"[DuckDuckGo Search Results (Fallback) for '{query}']\n" + "\n".join(results)
 
     except Exception as e:
-        return f"WebSearch Error: Search failed for query '{query}': {str(e)}"
-
+        return f"WebSearch Error: Both Tavily and DuckDuckGo searches failed for query '{query}': {str(e)}"
