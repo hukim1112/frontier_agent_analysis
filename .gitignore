@@ -16,7 +16,6 @@ env/
 *.db-wal
 *.db-journal
 *.sqlite3
-app/database/
 .claude/
 
 # Task tracking & State
