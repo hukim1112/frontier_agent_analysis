@@ -149,6 +149,32 @@ async def on_chat_resume(thread: ThreadDict):
         author="Agent Assistant"
     ).send()
 
+def _create_agent_context(session_id: Optional[str] = None) -> AgentContext:
+    def _load(path, default):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return default
+
+    logging_cfg = _load("./configs/logging.config", {"logging_enabled": False})
+    hitl_cfg = _load("./configs/hitl.config", {"hitl_enabled": False})
+    memory_cfg = _load("./configs/memory.config", {})
+    sem_cfg = memory_cfg.get("semantic_memory", {})
+    epi_cfg = memory_cfg.get("episodic_memory", {})
+
+    return AgentContext(
+        session_id=session_id or "unknown",
+        logging_enabled=logging_cfg.get("logging_enabled", False),
+        hitl_enabled=hitl_cfg.get("hitl_enabled", False),
+        semantic_memory_enabled=sem_cfg.get("enabled", True),
+        episodic_memory_enabled=epi_cfg.get("enabled", True),
+        memory_learning_enabled=sem_cfg.get("auto_review", False) or epi_cfg.get("auto_finalize", False),
+    )
+
+
 @cl.on_message
 async def on_message(message: cl.Message):
     """사용자 메시지 수신 및 LangGraph 에이전트 실시간 스트리밍 실행"""
@@ -167,11 +193,7 @@ async def on_message(message: cl.Message):
         "recursion_limit": 100
     }
     
-    context_obj = AgentContext(
-        session_id=thread_id,
-        logging_enabled=False,
-        hitl_enabled=False,
-    )
+    context_obj = _create_agent_context(session_id=thread_id)
     
     final_message = cl.Message(content="")
     active_steps: Dict[str, cl.Step] = {}
