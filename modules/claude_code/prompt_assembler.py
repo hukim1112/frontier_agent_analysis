@@ -38,6 +38,8 @@ from typing import List, Dict, Any, Optional, Union, Callable
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
 from langchain.agents.middleware import AgentMiddleware
 
+from .message_markers import last_user_turn_start
+
 
 # =============================================================================
 # Constants
@@ -405,6 +407,7 @@ def prepend_user_context(
     new_first_msg = HumanMessage(
         content=reminder_header + str(first_msg.content),
         id=getattr(first_msg, "id", None),
+        additional_kwargs=dict(getattr(first_msg, "additional_kwargs", None) or {}),
     )
 
     return messages[:first_human_idx] + [new_first_msg] + messages[first_human_idx + 1:]
@@ -426,12 +429,8 @@ def attach_mcp_delta_if_needed(
     if not new_mcp_instructions or not messages:
         return messages
 
-    # 마지막 HumanMessage 를 찾기
-    last_human_idx = None
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], HumanMessage):
-            last_human_idx = i
-            break
+    # 현재 사용자 턴의 메시지를 찾기 (압축 요약·StopHooks 피드백 HumanMessage는 제외)
+    last_human_idx = last_user_turn_start(messages)
 
     if last_human_idx is None:
         return messages
@@ -446,6 +445,7 @@ def attach_mcp_delta_if_needed(
     new_last_msg = HumanMessage(
         content=str(last_msg.content) + attachment_block,
         id=getattr(last_msg, "id", None),
+        additional_kwargs=dict(getattr(last_msg, "additional_kwargs", None) or {}),
     )
 
     return messages[:last_human_idx] + [new_last_msg] + messages[last_human_idx + 1:]
@@ -928,11 +928,21 @@ class PromptAssemblerMiddleware(AgentMiddleware):
             )
             system_messages = [static_msg, dynamic_msg]
 
-        # Filter out existing SystemMessages to avoid duplication, and clean empty messages
+        # Filter out existing L1-L5 SystemMessages to avoid duplication, while preserving
+        # Compaction/AmnesiaGuard pipeline SystemMessages stored in state["messages"]
+        _preserved_prefixes = (
+            "[Context Collapsed:",
+            "[Compaction Amnesia Guard:",
+            "[Reactive Compact",
+            "Previous Conversation Summary:",
+        )
         filtered_msgs = []
         for m in request.messages:
             if isinstance(m, SystemMessage):
-                continue
+                ak = getattr(m, "additional_kwargs", None) or {}
+                m_text = str(getattr(m, "content", "") or "")
+                if not (ak.get("compaction_artifact") or m_text.startswith(_preserved_prefixes)):
+                    continue
             # Prevent empty parts / Gemini 400 error
             content = getattr(m, "content", "")
             tool_calls = getattr(m, "tool_calls", None)

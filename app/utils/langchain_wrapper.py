@@ -13,6 +13,7 @@ OpenAI, Anthropic, Google Gemini(Vertex AI / AI Studio), Ollama 등 다양한 LL
 """
 
 import os
+import re
 from typing import Optional, Any
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model as _native_init_chat_model
@@ -20,9 +21,12 @@ from langchain.chat_models import init_chat_model as _native_init_chat_model
 # .env 환경변수 자동 로드
 load_dotenv()
 
+# OpenAI 추론 모델 패턴 (GPT-5 이후 세대 + o-시리즈): Responses API 필수, temperature 미지원
+_OPENAI_REASONING_MODEL_RE = re.compile(r"^(gpt-([5-9]|\d{2,})|o\d)")
+
 
 def init_chat_model(
-    model: str = "gemini-3.7-flash",
+    model: str = "gemini-3.8-flash",
     model_provider: Optional[str] = None,
     temperature: float = 0.0,
     **kwargs: Any
@@ -33,15 +37,15 @@ def init_chat_model(
     google_genai(2순위)를 자동으로 라우팅합니다.
 
     Args:
-        model: 모델 식별자 (예: 'gpt-4o', 'claude-3-5-sonnet', 'gemini-2.5-flash', 'gemini-3.7-flash')
+        model: 모델 식별자 (예: 'gemini-3.8-flash', 'gpt-6.1-sol', 'claude-3-5-sonnet')
         model_provider: 명시적 공급자 ('openai', 'anthropic', 'google_vertexai', 'google_genai' 등). 생략 시 자동 감지.
-        temperature: 샘플링 온도 (기본값: 0.0)
+        temperature: 샘플링 온도 (기본값: 0.0). OpenAI 추론 모델(GPT-5 이후/o-시리즈)에는 전달되지 않습니다.
         **kwargs: 공급자별 추가 파라미터 (max_tokens, streaming, project, location 등)
 
     Returns:
         BaseChatModel 인스턴스 (ChatOpenAI, ChatAnthropic, ChatVertexAI, ChatGoogleGenerativeAI 등)
     """
-    # 1. 'provider:model' 접두사 파싱 지원 (예: 'openai:gpt-4o', 'google_vertexai:gemini-2.5-pro')
+    # 1. 'provider:model' 접두사 파싱 지원 (예: 'openai:gpt-4o', 'google_vertexai:gemini-3.8-flash')
     clean_model_name = model
     parsed_provider = None
     if ":" in model:
@@ -91,7 +95,19 @@ def init_chat_model(
         if location and "location" not in kwargs:
             kwargs["location"] = location
 
-    # 4. LangChain 네이티브 init_chat_model 호출
+    # 4. OpenAI 추론 모델(GPT-5 이후 세대 / o-시리즈, 예: gpt-6.1-sol) 호환 처리
+    #    - Chat Completions에서는 추론 모델 + function tools 조합이 거부됨 → Responses API 사용
+    #    - temperature 파라미터를 지원하지 않음 → 전달하지 않음
+    is_openai = target_provider in (None, "openai") and not is_gemini
+    if is_openai and _OPENAI_REASONING_MODEL_RE.match(clean_model_name.lower()):
+        kwargs.setdefault("use_responses_api", True)
+        return _native_init_chat_model(
+            model=clean_model_name,
+            model_provider="openai",
+            **kwargs
+        )
+
+    # 5. LangChain 네이티브 init_chat_model 호출
     return _native_init_chat_model(
         model=clean_model_name,
         model_provider=target_provider,

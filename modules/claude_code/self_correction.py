@@ -13,53 +13,94 @@ import re
 import time
 from typing import Callable, Any, Optional
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
-from langchain.agents.middleware import AgentMiddleware, ModelResponse
+from langchain.agents.middleware import AgentMiddleware, ModelResponse, hook_config
+
+
+# 주입되는 blockingError 메시지 식별 태그 (연속 재시도 횟수 계산 및 로그 표기에 사용)
+from .message_markers import (
+    ORIGIN_STOP_HOOK,
+    STOP_HOOK_TAG,  # 주입되는 blockingError 메시지 식별 태그 (로그 표기 및 구버전 메시지 판별)
+    is_stop_hook_feedback,
+    is_user_turn_start,
+    origin_kwargs,
+)
+
+# 언어 태그가 python / python3 / py 인 펜스 코드 블록만 검증 대상으로 삼습니다.
+# (mermaid / sql / html / bash 및 태그 없는 블록(ASCII 다이어그램 등)은 오탐 방지를 위해 제외)
+_PYTHON_FENCE_RE = re.compile(r"```[ \t]*(?:python3?|py)[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
 def extract_code_blocks(text: str) -> list[str]:
-    """Helper to extract all python code blocks from text."""
-    pattern = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.DOTALL)
-    return pattern.findall(text)
+    """Helper to extract python-tagged (python/python3/py) code blocks from text."""
+    return [block.strip("\n") for block in _PYTHON_FENCE_RE.findall(text or "")]
+
+
+def _strip_interactive_syntax(code_str: str) -> str:
+    """REPL 프롬프트(>>> / ...)와 IPython 매직(!pip, %timeit)을 제거하여 순수 Python 코드만 남깁니다."""
+    lines = code_str.splitlines()
+    if any(line.lstrip().startswith(">>>") for line in lines):
+        repl_lines = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith((">>> ", "... ")):
+                repl_lines.append(stripped[4:])
+            elif stripped in (">>>", "..."):
+                repl_lines.append("")
+        lines = repl_lines
+    return "\n".join("" if line.lstrip().startswith(("!", "%")) else line for line in lines)
+
+
+def check_python_syntax(code_str: str) -> Optional[str]:
+    """Default built-in python syntax & indentation validator."""
+    try:
+        compile(_strip_interactive_syntax(code_str), "<string>", "exec")
+        return None
+    except SyntaxError as e:
+        return f"SyntaxError at line {e.lineno}: {e.msg} -> '{e.text.strip() if e.text else ''}'"
+    except Exception as e:
+        return f"Code validation error: {e}"
+
+
+def is_stop_hook_message(message: Any) -> bool:
+    """StopHooksMiddleware가 주입한 blockingError HumanMessage인지 판별합니다."""
+    return is_stop_hook_feedback(message)
 
 
 # =============================================================================
 # 1. stop_hook_blocking (Self-Correction on Code Compilation / Syntax Error)
 # =============================================================================
 class StopHooksMiddleware(AgentMiddleware):
-    """Intercepts agent response, validates python code blocks, and injects blockingError for self-repair."""
-    def __init__(self, validators: Optional[list[dict[str, Any]]] = None):
-        if validators is None:
-            # Default built-in python syntax & indentation validator
-            def check_python_syntax(code_str: str) -> Optional[str]:
-                try:
-                    compile(code_str, "<string>", "exec")
-                    return None
-                except SyntaxError as e:
-                    return f"SyntaxError at line {e.lineno}: {e.msg} -> '{e.text.strip() if e.text else ''}'"
-                except Exception as e:
-                    return f"Code validation error: {e}"
+    """Intercepts agent response, validates python code blocks, and injects blockingError for self-repair.
 
+    Claude Code의 `transition: stop_hook_blocking`은 LangChain에서
+    @hook_config(can_jump_to=["model"]) + {"jump_to": "model"} 반환으로 구현됩니다.
+    (데코레이터가 없으면 after_agent → END 엣지가 무조건 연결되어 루프가 돌지 않습니다.)
+
+    Returns (after_agent):
+        - 검증 실패: {"messages": [blockingError HumanMessage], "jump_to": "model"}
+        - 검증 통과 / 코드 없음 / 재시도 한도(max_retries) 도달: None
+    """
+    def __init__(self, validators: Optional[list[dict[str, Any]]] = None, max_retries: int = 2):
+        if validators is None:
             self.validators = [{"name": "python_syntax", "fn": check_python_syntax}]
         else:
             self.validators = validators
+        self.max_retries = max_retries
 
-    def after_agent(self, state: dict, runtime=None) -> dict | None:
-        messages = state.get("messages", [])
-        if not messages:
-            return None
+    @staticmethod
+    def _count_consecutive_blocks(messages: list) -> int:
+        """현재 사용자 턴에서 이미 주입된 blockingError 개수 (실제 사용자 메시지를 만나면 중단)."""
+        count = 0
+        for msg in reversed(messages):
+            if is_user_turn_start(msg):
+                break
+            if is_stop_hook_message(msg):
+                count += 1
+        return count
 
-        last_msg = messages[-1]
-        if not isinstance(last_msg, AIMessage) or not last_msg.content:
-            return None
-
-        from app.utils.message_utils import normalize_content
-        content_str = normalize_content(last_msg.content)
-        code_blocks = extract_code_blocks(content_str)
-        if not code_blocks:
-            return None
-
+    def _validate(self, content_str: str) -> list[str]:
         validation_errors = []
-        for code in code_blocks:
+        for code in extract_code_blocks(content_str):
             for val in self.validators:
                 val_name = val.get("name", "unknown")
                 val_fn = val.get("fn")
@@ -70,20 +111,40 @@ class StopHooksMiddleware(AgentMiddleware):
                             validation_errors.append(f"[{val_name}]: {error}")
                     except Exception as e:
                         validation_errors.append(f"[{val_name}] execution error: {e}")
+        return validation_errors
 
-        if validation_errors:
-            error_details = "\n".join(validation_errors)
-            correction_prompt = (
-                f"🛑 [Stop Hook Blocking - Code Validation Failed]\n"
-                f"The code you generated failed quality validation tests:\n"
-                f"{error_details}\n\n"
-                f"Please analyze the error details above, fix the bug in your code, and output the corrected version."
-            )
-            print(f"\n🔴 [stop_hook_blocking] Validation Failed -> Injecting blockingError for Self-Repair!")
-            updated_messages = list(messages) + [HumanMessage(content=correction_prompt)]
-            return {"messages": updated_messages, "transition": "stop_hook_blocking"}
+    @hook_config(can_jump_to=["model"])
+    def after_agent(self, state: dict, runtime=None) -> dict | None:
+        messages = state.get("messages", [])
+        if not messages:
+            return None
 
-        return {"transition": "completed"}
+        last_msg = messages[-1]
+        if not isinstance(last_msg, AIMessage) or not last_msg.content:
+            return None
+
+        from app.utils.message_utils import normalize_content
+        validation_errors = self._validate(normalize_content(last_msg.content))
+        if not validation_errors:
+            return None
+
+        retries = self._count_consecutive_blocks(messages)
+        if retries >= self.max_retries:
+            print(f"\n⚠️ {STOP_HOOK_TAG} Retry limit reached ({retries}/{self.max_retries}) -> Ending turn without further self-repair.")
+            return None
+
+        error_details = "\n".join(validation_errors)
+        correction_prompt = (
+            f"🛑 {STOP_HOOK_TAG} Code Validation Failed (self-repair {retries + 1}/{self.max_retries})\n"
+            f"The code you generated failed quality validation tests:\n"
+            f"{error_details}\n\n"
+            f"Please analyze the error details above, fix the bug in your code, and output the corrected version."
+        )
+        print(f"\n🔴 {STOP_HOOK_TAG} Validation Failed -> Injecting blockingError & jumping back to model ({retries + 1}/{self.max_retries})")
+        # messages 채널은 add_messages 리듀서이므로 새 메시지만 반환하면 기존 이력 뒤에 추가됩니다.
+        # harness_origin 표식: 사용자 턴 경계로 세지 않도록 (message_markers 규칙)
+        feedback = HumanMessage(content=correction_prompt, additional_kwargs=origin_kwargs(ORIGIN_STOP_HOOK))
+        return {"messages": [feedback], "jump_to": "model"}
 
 
 # =============================================================================

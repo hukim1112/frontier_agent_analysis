@@ -9,7 +9,7 @@ file_converter  : 데이터 포맷 변환 (CSV/JSON/Excel/Parquet)
 excel_writer    : 수식/서식 기반 전문 Excel 보고서 생성
 html_report     : 인터랙티브 HTML 대시보드 생성
 
-📌 상세 노하우 참조: skills/analyst/ 디렉토리
+📌 상세 노하우 참조: app/agents/analyst/skills/ 디렉토리
    - xlsx_guide.md, chart_patterns.md, design_tokens.md, data_analysis.md
 ===============================================================================
 """
@@ -95,7 +95,7 @@ def data_profiler(file_path: str, sample_rows: int = 10) -> str:
     스키마(컬럼명·타입), 행 수, 기술 통계, 결측값 비율, 범주형 최빈값, 샘플 데이터를 한 번에 반환합니다.
     지원 형식: JSON, CSV, TSV, Excel (.xlsx/.xls), Parquet, JSONL
 
-    ⚠️ 상세 분석 패턴이 필요하면: file_read('skills/analyst/data_analysis.md')
+    ⚠️ 상세 분석 패턴이 필요하면: file_read('app/agents/analyst/skills/data_analysis.md')
 
     Args:
         file_path: 분석할 데이터 파일 경로.
@@ -193,7 +193,7 @@ def data_query(file_path: str, query_code: str, output_format: str = "table") ->
       "result = df.groupby('connection_type')['price'].agg(['mean', 'min', 'max', 'count'])"
       "result = df[df['price'] > 100000].sort_values('price', ascending=False)"
 
-    ⚠️ 분석 패턴 참조: file_read('skills/analyst/data_analysis.md')
+    ⚠️ 분석 패턴 참조: file_read('app/agents/analyst/skills/data_analysis.md')
 
     Args:
         file_path: 데이터 파일 경로.
@@ -284,7 +284,7 @@ def chart_generator(file_path: str, chart_code: str, output_path: str) -> str:
       import plotly.express as px
       fig = px.bar(df, x='category', y='value', title='비교')
 
-    ⚠️ 차트 패턴 참조: file_read('skills/analyst/chart_patterns.md')
+    ⚠️ 차트 패턴 참조: file_read('app/agents/analyst/skills/chart_patterns.md')
 
     Args:
         file_path: 데이터 파일 경로.
@@ -484,7 +484,7 @@ def excel_writer(data_source: str, output_path: str, excel_code: str) -> str:
     ⚠️ 핵심 규칙:
     - 수식 사용 필수, 하드코딩 금지 (=SUM(B2:B9), not Python 계산값)
     - XLOOKUP/XMATCH 사용 금지 → INDEX/MATCH 사용
-    - 상세 가이드: file_read('skills/analyst/xlsx_guide.md')
+    - 상세 가이드: file_read('app/agents/analyst/skills/xlsx_guide.md')
 
     Args:
         data_source: 원본 데이터 파일 경로.
@@ -565,7 +565,7 @@ def html_report(report_code: str, output_path: str, title: str = "분석 보고�
     코드에서 'html_content' 변수에 최종 HTML 문자열을 저장하세요.
     'title' 변수로 보고서 제목에 접근 가능합니다.
 
-    ⚠️ 디자인 가이드: file_read('skills/analyst/design_tokens.md')
+    ⚠️ 디자인 가이드: file_read('app/agents/analyst/skills/design_tokens.md')
 
     Args:
         report_code: HTML 생성 Python 코드.

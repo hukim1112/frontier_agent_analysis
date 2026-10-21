@@ -1,48 +1,86 @@
-# Byte-compiled / optimized / DLL files
+# ===============================================================================
+# agent-harness-lab .gitignore
+# ===============================================================================
+
+# ── Byte-compiled / optimized / DLL files ──
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Environments
+# ── Environments & Secrets ──
 .env
 .venv
 venv/
 ENV/
 env/
 
-# Databases & Caching
+# ── Databases & Caching ──
 *.db
-*.db-shm
-*.db-wal
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite3
-app/database/
-.claude/
 
-# Task tracking & State
-task.md
-task_state.json
-TASK.md
+# ── Logs ──
 *.log
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints
+# ── Task tracking & State ──
+task.md
+task_state.json
+plan_state.json
+TASK.md
+
+# ── Jupyter Notebook ──
+.ipynb_checkpoints/
 */.ipynb_checkpoints/*
 
-# IDEs
+# ── IDEs ──
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# Test generation residues
+# ── Test / Experiment residues ──
 samples/
-
-# Local experiment directories
 scratch/
 sandbox/
+output/
 
-# Runtime Log & Audit Artifacts
+# ── Chainlit runtime files ──
+.files/
+
+# ── Agent artifacts (에이전트가 생성하는 런타임 산출물) ──
+artifacts/runs/
+artifacts/data/
+artifacts/screenshots/
+artifacts/temporary/
+artifacts/reports/
+artifacts/charts/
+artifacts/analyst_test/
 artifacts/logs/
 artifacts/memory/
-artifacts/agent_audit_trail.json
-logs/
+artifacts/swaps/
+artifacts/visualizations/
+artifacts/visuals/
+artifacts/*.png
+artifacts/*.html
+artifacts/*.csv
+artifacts/*.xlsx
+artifacts/*.md
+artifacts/users/*/sessions/
 
+# ── Preserved Seed Assets (교육생 실습용 스킬 풀 및 기본 유저 시드 메모리는 Git 추적 유지) ──
+!artifacts/skills_pool/
+!artifacts/skills_pool/**
+!artifacts/users/default/memory/
+!artifacts/users/default/memory/USER.md
+!artifacts/users/default/memory/MEMORY.md
+
+# ── Browser automation temp files ──
+bu_cdp_*/
+
+# ── OS generated files ──
+.DS_Store
+Thumbs.db
+desktop.ini

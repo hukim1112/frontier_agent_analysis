@@ -18,15 +18,16 @@
 - **User Context Bypass Injection**: `CLAUDE.md`와 Git 스냅샷 동결(`@lru_cache`, 2000자 절단)을 시스템 프롬프트 외부(`messages[0]`의 `<system-reminder>`)로 1회 우회 주입.
 
 #### ② 5대 컨텍스트 압축 파이프라인 & Amnesia Guard (`app/middleware/compaction/`)
-- **Snip Compact**: 2턴 이상 경과한 오래된 대용량 툴 결과를 1줄 스텁(`[Output snipped]`)으로 변환 (토큰 90%+ 절감).
-- **Microcompact**: 5,000자 초과 대용량 툴 로그를 디스크 스왑 파일(`.claude/swaps/`)로 덤프 후 포인터만 잔류.
-- **Context Collapse**: 3회 이상 연속 탐색 툴 실행 내역을 단일 접힌 블록으로 병합.
-- **Auto-Compact**: 토큰 임계치 초과 시 4대 영역 구조화 요약 생성.
-- **Amnesia Guard**: 압축으로 인해 활성 계획(Plan)과 수정 중인 최근 5개 파일 스냅샷이 소실(기억상실)되는 것을 방지하기 위해 복구 어태치먼트를 시스템 프롬프트로 재주입.
-- **Reactive Compact**: API 413 `prompt_too_long` 에러 발생 시 에러를 은폐(Silent Withholding)하고 오래된 대화 20% 절단 후 자동 재시도.
+- **Snip Compact**: 2턴 이상 경과한 오래된 대용량 툴 결과를 1줄 스텁(`[Output snipped]`)으로 변환 (토큰 90%+ 절감, `wrap_model_call` 사본 변환).
+- **Microcompact**: 5,000자 초과 대용량 툴 로그를 결정적 해시 기반 디스크 스왑 파일(`.claude/swaps/`)로 1회 덤프 후 포인터만 잔류 (`wrap_model_call` 사본 변환).
+- **Context Collapse**: 3회 이상 연속 탐색 툴 실행 내역을 단일 접힌 블록으로 병합 (`wrap_model_call` 사본 변환).
+- **Auto-Compact (`before_model`)**: 토큰 임계치 초과 시 `before_model` 훅에서 **이전 턴까지만** 4대 영역 구조화 요약으로 압축하고 현재 진행 중인 턴(도구 호출·결과 쌍 포함)은 보존하여 checkpointer state에 영구 반영(`RemoveMessage(REMOVE_ALL_MESSAGES)`). 원문은 `transcript.db`에 보존되며 압축 이벤트(`kind=compaction`)가 기록됩니다.
+- **Amnesia Guard**: 압축으로 인해 활성 계획(Plan)과 수정 중인 최근 5개 파일 스냅샷이 소실(기억상실)되는 것을 방지하기 위해 복구 어태치먼트를 재주입.
+- **Reactive Compact**: API 413 `prompt_too_long` 에러 발생 시(`ModelFallbackMiddleware`가 413을 가로채지 않고 재전파) 에러를 은폐(Silent Withholding)하고 오래된 대화 20% 절단 후 자동 재시도.
 
-#### ③ Self-Recovery & Self-Correction 에러 컨트롤 (`app/middleware/error_control/`)
-- **ModelFallbackMiddleware**: 메인 LLM API 장애 시 백업 모델로 자동 failover.
+#### ③ Self-Recovery & Self-Correction 에러 컨트롤 및 가드레일 (`app/middleware/`)
+- **Guardrails (`before_agent`)**: `InputSafetyGuardrail` 및 `TopicAlignmentGuardrail`이 `before_agent` 훅(`can_jump_to=["end"]`)에서 턴당 1회만 검사를 수행하며, 차단 시 메모리 인출을 건너뛰고 `transcript.db`에는 `kind=blocked`로 기록(검색·회상·학습 제외).
+- **ModelFallbackMiddleware**: 메인 LLM API 장애 시 백업 모델로 자동 failover (`request.override(model=...)` 사용, 413 컨텍스트 초과 에러는 Compactor로 재전파).
 - **ToolErrorHandlerMiddleware**: 도구 실행 예외를 크래시 대신 `ToolMessage`로 변환하여 에이전트의 자가 회복 유도.
 - **ModelCallLimitMiddleware**: 무한 루프 방지 (호출 횟수 상한 제어).
 - **StopHooksMiddleware**: 에이전트가 생성한 파이썬 코드의 문법/들여쓰기 오류를 사전 인터셉트하여 blockingError를 주입, 스스로 코드를 자가 수정(Self-Correction)하도록 강제.
@@ -34,9 +35,10 @@
 ---
 
 ### 2. 🧠 Hermes 4-Layer Memory System (`app/middleware/memory/`)
-- **L1 Working Memory (`checkpoints.db`)**: `AsyncSqliteSaver` 기반 세션별 런타임 단기 상태 체크포인팅.
-- **L2 Episodic Memory (`episodic.db`)**: SQLite FTS5 전문 검색 엔진 기반 대형 과거 세션 데이터 탐색 및 JIT 인출.
-- **L3 Semantic Memory (`MEMORY.md` / `USER.md`)**: 에이전트 팩트 및 사용자 프로필 관리. 백그라운드 리뷰를 통한 스마트 마크다운 병합(`add`, `replace`, `remove`).
+- **L1 Working Memory (`checkpoints.db`)**: `AsyncSqliteSaver` 기반 세션별 런타임 단기 상태 체크포인팅 (**압축본**).
+- **L2 Episodic — 원문 저장소 (`transcript.db`, `TranscriptStore`)**: 모든 사용자·AI·도구 결과 원문 및 압축 이벤트를 실시간 Append-only로 기록하는 **전체본**. `episodic_memory_enabled` / `episodic_learning_enabled`와 독립된 `transcript.enabled` 스위치로 동작.
+- **L2 Episodic — 요약 색인 (`episodic.db`, `EpisodicStore` + `IdleReviewQueue`)**: 마지막 턴 후 15초 유휴 대기(최대 30분) 뒤 `transcript.db` 원문을 읽어 **다중 주제(Multi-Topic) 구조화 요약(`topics_json`, `tool_names`)** 및 SQLite FTS5 색인을 생성. `session_search`(색인 검색 + 원문 FTS 폴백) ➔ `session_recall`(`transcript.db` Anchor ±window 원문 인출) 2단계 인출 지원.
+- **L3 Semantic Memory (`MEMORY.md` / `USER.md`)**: 에이전트 팩트 및 사용자 프로필 관리. 유휴 큐 백그라운드 리뷰를 통한 스마트 마크다운 병합(`add`, `replace`, `remove`).
 - **L4 Procedural Memory**: 프롬프트 어셈블러 및 스킬 카탈로그(`SKILL.md`)와 연동된 절차 기억.
 
 ---
@@ -50,9 +52,10 @@ frontier_agent_analysis/
 │   │                                 #   └── chatbot.py, analyst.py, scraper.py
 │   ├── middleware/                   #   📁 체계화된 하네스 미들웨어 패키지
 │   │   ├── prompt/                   #   │   └── prompt_assembler.py (16-Module 5-Layer 조립기)
-│   │   ├── compaction/               #   │   └── compactor.py, amnesia_guard.py
+│   │   ├── compaction/               #   │   └── compactor.py (before_model Auto-Compact + wrap_model_call), amnesia_guard.py
 │   │   ├── error_control/            #   │   └── self_recovery.py, self_correction.py
-│   │   ├── memory/                   #   │   └── semantic_store.py, episodic_store.py, memory_middleware.py
+│   │   ├── guardrails.py             #   │   └── InputSafety & TopicAlignment (before_agent + jump_to end)
+│   │   ├── memory/                   #   │   └── transcript_store.py, episodic_store.py, review_queue.py, semantic_store.py, memory_middleware.py
 │   │   └── observability/            #   │   └── agent_log_tracer.py, visualizer.py
 │   ├── prompts/                      #   └── SUPERVISOR.py, CHATBOT.py, ANALYST.py, SCRAPER.py
 │   ├── tools/                        #   └── supervisor_tools.py, custom_tools.py, navigator.py, analyst.py
@@ -68,20 +71,24 @@ frontier_agent_analysis/
 ├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (3종)
 │   ├── 01_react_vs_frontier_agents.ipynb    # Step 1: ReAct vs 프론티어 에이전트 루프 & 관측성
 │   ├── 02_claude_code_harness.ipynb         # Step 2: 5계층 프롬프트, 5대 압축 파이프라인, Amnesia Guard
-│   └── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리 및 에피소딕 FTS5 인출
+│   └── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리(transcript.db + episodic.db) 및 FTS5 인출
 │
 ├── configs/                          # ⚙️ 런타임 제어 설정 파일
 │   ├── compaction.config             #   └── 압축 임계치 및 스왑 디렉터리 설정
 │   ├── guardrail.config              #   └── 입력 보안 및 주제 정렬 임계치
 │   ├── hitl.config                   #   └── 도구 실행 사용자 승인(HITL) 규칙
 │   ├── logging.config                #   └── 감사 로그 수집 설정
-│   ├── memory.config                 #   └── 시맨틱/에피소딕 메모리 활성화 설정
+│   ├── memory.config                 #   └── 시맨틱/에피소딕/원문(transcript) 메모리 활성화 설정
 │   └── model.config                  #   └── 기본 및 폴백 LLM 모델 지정
 │
-├── tests/                            # 🧪 62개 검증 테스트 수트
+├── scripts/                          # 🔄 데이터 마이그레이션 스크립트
+│   └── migrate_episodic_to_transcript.py # └── 구 episodic.db messages ➔ transcript.db 이관 스크립트
+│
+├── tests/                            # 🧪 132개 검증 테스트 수트
 │   ├── test_02_claude_code.py        #   └── Claude Code 기본 하네스 테스트
 │   ├── test_prompt_assembler_advanced.py # └── 16대 모듈, 바이패스 주입, MCP 델타 고급 테스트
-│   └── test_compactor.py             #   └── 5대 압축 파이프라인 정밀 테스트
+│   ├── test_compactor.py             #   └── 5대 압축 파이프라인 정밀 테스트
+│   └── test_harness_regressions.py   #   └── 원문/색인 분리, 유휴 큐, 가드레일 before_agent, Auto-Compact before_model E2E 회귀 테스트
 │
 ├── .devcontainer/                    # 🐳 GitHub Codespaces 원클릭 실행 환경
 │   └── devcontainer.json             #   └── Python 3.12, Playwright, noVNC, Chainlit 자동 바인딩

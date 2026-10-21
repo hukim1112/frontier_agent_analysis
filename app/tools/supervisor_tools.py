@@ -10,7 +10,8 @@ Supervisor 에이전트의 멀티에이전트 오케스트레이션 핵심 도�
 
   invoke_sub_agent: 전문 sub-agent에게 작업을 위임하는 도구.
     - ToolRuntime으로 supervisor thread_id 자동 추출
-    - sub_thread_id = supervisor_tid + "_" + role 로 세션 연속성 보장
+    - 기본 호출(sub_thread_id=None): 호출마다 고유 sub_thread_id 자동 발급으로 동시 호출 시 단기 메모리 완벽 격리
+    - 연속 호출(sub_thread_id 지정): 이전 반환값의 sub_thread_id를 전달하여 해당 자식의 Checkpointer 세션 연속성 보장
     - AsyncAgentClient.get_agents()로 Agent Registry 동적 조회
     - run_in_background=True 지원: 비동기 백그라운드 위임 & Reactive Wakeup
     - 첫 호출: Full Protocol Header 주입 (역할 수립)
@@ -22,12 +23,27 @@ Supervisor 에이전트의 멀티에이전트 오케스트레이션 핵심 도�
 ===============================================================================
 """
 
-from typing import List
+import os
+import uuid
+from typing import List, Optional
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
 from app.client import AsyncAgentClient
+
+# FastAPI 백엔드 기본 URL 및 공유 비동기 클라이언트 (커넥션 풀 재사용)
+FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "http://localhost:8000")
+_shared_client = AsyncAgentClient(base_url=FASTAPI_BASE_URL, timeout=600.0)
+
+
+def get_subagent_client() -> AsyncAgentClient:
+    """서브에이전트 통신에 사용되는 공유 AsyncAgentClient 인스턴스를 반환합니다."""
+    return _shared_client
+
+
+# 기본 호출자 에이전트 이름 (컨텍스트 미제공 시 폴백)
+_CALLER_AGENT_NAME = "main_agent"
 
 # =============================================================================
 # Sub-Agent Protocol 오버레이 메시지 빌더
@@ -37,16 +53,18 @@ _FULL_PROTOCOL_HEADER = """\
 [SUB-AGENT MODE - STRICT PROTOCOL]
 You are operating as a sub-agent under a Supervisor. You MUST follow these rules:
 1. NO greetings or conversational responses. Execute the task immediately.
-2. On ANY blocker (corrupted file / site blocked / selector failure / access denied):
+2. Context & Plan: If a plan is shared, refer to it to understand the broader context and prior outputs.
+   Do NOT modify the plan yourself. If adjustments are needed, propose them in your report.
+3. On ANY blocker (corrupted file / site blocked / selector failure / access denied):
    STOP immediately and return EXACTLY:
    [BLOCKER: <concise reason>]
-3. On success: write all results to disk first, then return EXACTLY:
+4. On success: write all results to disk first, then return EXACTLY:
    [TASK REPORT]
    - Status: SUCCESS
    - Target Files: <comma-separated file paths>
    - Artifacts Created: <created file paths>
    - Summary: <1-2 sentence core finding>
-   - Issues: None
+   - Issues: None (or proposed plan adjustments)
 ══════════════════════════════════════════════════════════"""
 
 _PROTOCOL_REMINDER = """\
@@ -61,13 +79,16 @@ def _build_subagent_message(
     task_instruction: str,
     target_file_list: List[str],
     is_first_call: bool,
+    workspace_info: Optional[str] = None,
 ) -> str:
-    """첫 호출 여부에 따라 적절한 프로토콜 헤더를 포함한 메시지를 구성합니다."""
+    """첫 호출 여부에 따라 적절한 프로토콜 헤더 및 전용 워크스페이스 경로를 포함한 메시지를 구성합니다."""
     header = _FULL_PROTOCOL_HEADER if is_first_call else _PROTOCOL_REMINDER
-    file_list_str = ", ".join(target_file_list) if target_file_list else "없음 (필요 시 직접 생성)"
+    file_list_str = ", ".join(target_file_list) if target_file_list else "없음 (Sub-Agent Workspace 하위에 직접 생성)"
+    ws_section = f"{workspace_info}\n" if workspace_info else ""
 
     return (
         f"{header}\n"
+        f"{ws_section}"
         f"Target File List: {file_list_str}\n"
         f"══════════════════════════════════════════════════════════\n"
         f"Instruction: {task_instruction}"
@@ -77,6 +98,18 @@ def _build_subagent_message(
 # =============================================================================
 # list_sub_agents Tool
 # =============================================================================
+
+SUB_AGENT_ROLE = "sub"
+
+
+async def _get_sub_agents(client: AsyncAgentClient) -> List[dict]:
+    """Agent Registry에서 AGENT_METADATA["roles"]에 'sub'가 포함된 에이전트만 반환합니다."""
+    agents = await client.get_agents()
+    return [
+        a for a in (agents or [])
+        if isinstance(a, dict) and SUB_AGENT_ROLE in (a.get("roles") or [])
+    ]
+
 
 @tool
 async def list_sub_agents() -> str:
@@ -92,18 +125,17 @@ async def list_sub_agents() -> str:
             - scraper: 웹 데이터 수집 전문 에이전트
             - analyst: 데이터 분석 및 리포트 생성 전문 에이전트
     """
-    client = AsyncAgentClient(base_url="http://localhost:8000")
+    client = get_subagent_client()
     try:
-        agents = await client.get_agents()
+        agents = await _get_sub_agents(client)
         if not agents:
             return "No sub-agents are currently registered on the server."
 
         lines = ["Available sub-agents:"]
         for agent in agents:
-            if isinstance(agent, dict):
-                name = agent.get("name", "unknown")
-                desc = agent.get("description", "No description provided.")
-                lines.append(f"  - {name}: {desc}")
+            name = agent.get("name", "unknown")
+            desc = agent.get("description", "No description provided.")
+            lines.append(f"  - {name}: {desc}")
         return "\n".join(lines)
     except Exception as e:
         return f"[ERROR: Failed to query agent registry — {str(e)}]"
@@ -123,9 +155,8 @@ class InvokeSubAgentInput(BaseModel):
     target_file_list: List[str] = Field(
         default_factory=list,
         description=(
-            "List of relative file paths the sub-agent should inspect or create "
-            "(e.g. ['artifacts/data/quotes.json']). "
-            "These define where the sub-agent stores its output artifacts."
+            "List of relative file paths the sub-agent should inspect or create. "
+            "These define where the sub-agent reads input context or stores its output artifacts."
         )
     )
     subagent_role: str = Field(
@@ -146,6 +177,15 @@ class InvokeSubAgentInput(BaseModel):
             "and the server will automatically wake up Supervisor when completed."
         )
     )
+    sub_thread_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional session ID (Sub-Thread ID) of a previously invoked sub-agent to continue its work "
+            "with preserved short-term memory (e.g. follow-up instructions or blocker recovery on the same task). "
+            "Leave None (default) when starting a new task or invoking multiple sub-agents in parallel "
+            "so a fresh, isolated sub_thread_id is automatically generated."
+        )
+    )
 
 
 @tool(args_schema=InvokeSubAgentInput)
@@ -154,6 +194,7 @@ async def invoke_sub_agent(
     target_file_list: List[str] = [],
     subagent_role: str = "scraper",
     run_in_background: bool = False,
+    sub_thread_id: Optional[str] = None,
     runtime: ToolRuntime = None,
 ) -> str:
     """Delegates a focused task to a specialized sub-agent running on the server.
@@ -164,15 +205,23 @@ async def invoke_sub_agent(
       Use ONLY for tasks requiring specialized tools not available to Supervisor directly.
       Always check available sub-agents using list_sub_agents() before delegation if unsure.
 
+    SESSION ISOLATION & CONTINUATION (sub_thread_id):
+      - NEW TASK / PARALLEL CALLS (sub_thread_id=None, default):
+        Omit sub_thread_id to automatically generate a fresh, isolated session ID.
+        This guarantees that concurrent or unrelated sub-agent calls never mix short-term memory.
+      - FOLLOW-UP / CONTINUATION (sub_thread_id="<Sub-Thread ID from prior result>"):
+        Pass the Sub-Thread ID returned by a previous call when you want the exact same sub-agent
+        instance to continue its prior work or recover from a [BLOCKER] with its memory preserved.
+
     PROTOCOL — BEFORE CALLING:
       1. Register a task with task_create() to track this delegation.
       2. Set target_file_list to exact output artifact path(s)
-         (e.g. ['artifacts/data/quotes.json']).
+         (e.g. ['artifacts/users/default/sessions/.../outputs/quotes.json']).
 
     PROTOCOL — BACKGROUND EXECUTION (run_in_background=True) [RECOMMENDED DEFAULT FOR SUB-AGENTS]:
       - MUST be used for all data analysis, chart/dashboard creation, Excel writing, and scraping.
       - Even if data already exists, generating charts & dashboards takes multiple tool steps (>1 min).
-      - Returns immediately with [JOB SUBMITTED].
+      - Returns immediately with [JOB SUBMITTED] including Job ID and Sub-Thread ID.
       - Inform the user that the background job has started (with Job ID).
       - When finished, the server will automatically notify and wake you up with full results to continue.
 
@@ -186,52 +235,90 @@ async def invoke_sub_agent(
             corrected parameters or an alternative target.
 
     Returns:
-        [TASK REPORT] formatted string on synchronous success.
-        [JOB SUBMITTED] formatted string on background launch.
+        [TASK REPORT] formatted string (with Sub-Thread ID) on synchronous success.
+        [JOB SUBMITTED] formatted string (with Job ID and Sub-Thread ID) on background launch.
         [BLOCKER: reason] string on failure.
     """
-    # 1. ToolRuntime으로 Supervisor의 thread_id 추출
+    # 1. ToolRuntime으로 호출 에이전트 정보 추출
     supervisor_tid = "supervisor_default"
     if runtime and runtime.execution_info and runtime.execution_info.thread_id:
         supervisor_tid = runtime.execution_info.thread_id
 
-    # 2. Sub-agent 전용 세션 ID 구성 (연속성 보장)
-    sub_thread_id = f"{supervisor_tid}_{subagent_role}"
+    caller_agent = _CALLER_AGENT_NAME
+    caller_user_id = "default"
+    if runtime and hasattr(runtime, "context") and runtime.context:
+        caller_agent = getattr(runtime.context, "agent_name", None) or _CALLER_AGENT_NAME
+        caller_user_id = getattr(runtime.context, "user_id", None) or "default"
 
-    client = AsyncAgentClient(base_url="http://localhost:8000", timeout=600.0)
+    client = get_subagent_client()
 
-    # 3. Agent Registry 동적 조회 — 유효하지 않은 role 즉시 차단
+    # 2. Agent Registry 동적 조회 — sub 역할이 없는 에이전트(main_agent, chatbot 등)는 즉시 차단
     try:
-        available_agents = await client.get_agents()
-        agent_names = [a.get("name") for a in available_agents if isinstance(a, dict)]
+        available_agents = await _get_sub_agents(client)
+        agent_names = [a.get("name") for a in available_agents]
         if subagent_role not in agent_names:
             return (
-                f"[BLOCKER: Unknown subagent_role '{subagent_role}'. "
-                f"Available agents on server: {agent_names}]"
+                f"[BLOCKER: Unknown or non-delegatable subagent_role '{subagent_role}'. "
+                f"Available sub-agents on server: {agent_names}]"
             )
     except Exception as e:
         return f"[BLOCKER: Failed to query agent registry — {str(e)}]"
 
-    # 4. 첫 호출 여부 판단 — 세션 이력 조회
-    try:
-        prior_messages = await client.get_messages(sub_thread_id)
-        is_first_call = len(prior_messages) == 0
-    except Exception:
-        # 조회 실패 시 안전하게 첫 호출로 가정
+    # 3. Sub-agent 전용 세션 ID 구성 및 첫 호출 여부 판단
+    if sub_thread_id and sub_thread_id.strip():
+        resolved_sub_tid = sub_thread_id.strip()
+        try:
+            prior_messages = await client.get_messages(resolved_sub_tid)
+            is_first_call = len(prior_messages) == 0
+        except Exception:
+            is_first_call = False
+    else:
+        resolved_sub_tid = f"{supervisor_tid}_{subagent_role}_{uuid.uuid4().hex[:8]}"
         is_first_call = True
 
-    # 5. 3-Layer 메시지 구성 (첫 호출: Full Protocol / 이후: Reminder)
-    message = _build_subagent_message(task_instruction, target_file_list, is_first_call)
+    # 4. 서브에이전트 전용 워크스페이스 경로 해석 및 3-Layer 메시지 구성
+    workspace_info = None
+    try:
+        from app.utils.workspace import resolve_session_workspace
 
-    # 6. 백그라운드 비동기 실행 모드
+        sub_ws = resolve_session_workspace(
+            user_id=caller_user_id,
+            session_id=resolved_sub_tid,
+            parent_session_id=supervisor_tid,
+            subagent_role=subagent_role,
+            ensure_exists=True,
+        )
+        workspace_info = (
+            f"Sub-Agent Dedicated Workspace: {sub_ws.rel_root}\n"
+            f"  - Plan Dir: {sub_ws.rel_plan_dir}\n"
+            f"  - Scripts Dir: {sub_ws.rel_scripts_dir}\n"
+            f"  - Outputs Dir: {sub_ws.rel_outputs_dir}"
+        )
+    except Exception as ws_err:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[invoke_sub_agent] Failed to resolve sub-agent workspace for '{resolved_sub_tid}': {ws_err}"
+        )
+        workspace_info = None
+
+    message = _build_subagent_message(
+        task_instruction,
+        target_file_list,
+        is_first_call,
+        workspace_info=workspace_info,
+    )
+
+    # 5. 백그라운드 비동기 실행 모드
     if run_in_background:
         try:
             job_res = await client.submit_job(
                 agent_name=subagent_role,
                 message=message,
-                thread_id=sub_thread_id,
-                callback_agent="main_agent",
+                thread_id=resolved_sub_tid,
+                callback_agent=caller_agent,
                 callback_thread_id=supervisor_tid,
+                user_id=caller_user_id,
+                parent_thread_id=supervisor_tid,
             )
             if job_res.get("status") == "error":
                 return f"[BLOCKER: Failed to submit background job — {job_res.get('message')}]"
@@ -241,6 +328,7 @@ async def invoke_sub_agent(
                 f"[JOB SUBMITTED]\n"
                 f"- Job ID: {job_id}\n"
                 f"- Sub-Agent: {subagent_role}\n"
+                f"- Sub-Thread ID: {resolved_sub_tid} (use sub_thread_id='{resolved_sub_tid}' to continue this agent)\n"
                 f"- Status: RUNNING (Background)\n"
                 f"- Tracking: The server will automatically notify and wake you up with full results when this job completes.\n"
                 f"Please inform the user that the task has started in the background."
@@ -248,16 +336,22 @@ async def invoke_sub_agent(
         except Exception as e:
             return f"[BLOCKER: Background job submission exception — {str(e)}]"
 
-    # 7. 일반 동기 실행 모드
+    # 6. 일반 동기 실행 모드
     try:
         response = await client.async_invoke(
             agent_name=subagent_role,
             message=message,
-            thread_id=sub_thread_id,
+            thread_id=resolved_sub_tid,
+            user_id=caller_user_id,
+            parent_thread_id=supervisor_tid,
         )
         if response.get("type") == "error":
             return f"[BLOCKER: Sub-agent call failed — {response.get('content', 'unknown error')}]"
-        return response.get("content", "[BLOCKER: Empty response from sub-agent]")
+        content = response.get("content", "[BLOCKER: Empty response from sub-agent]")
+        return (
+            f"{content}\n"
+            f"- Sub-Thread ID: {resolved_sub_tid} (use sub_thread_id='{resolved_sub_tid}' to continue this agent)"
+        )
     except Exception as e:
         return f"[BLOCKER: Sub-agent execution exception — {str(e)}]"
 
@@ -283,38 +377,37 @@ async def get_sub_agent_job_status(job_id: str) -> str:
     Returns:
         Formatted status string containing status (RUNNING, SUCCESS, FAILED) and result/error.
     """
-    client = AsyncAgentClient(base_url="http://localhost:8000", timeout=10.0)
+    client = get_subagent_client()
     try:
         job = await client.get_job(job_id)
         if not job or job.get("status") == "error":
             return f"[ERROR: Job '{job_id}' not found or query failed — {job.get('message', '')}]"
 
-        status = job.get("status")
-        agent_name = job.get("agent_name")
-        created_at = job.get("created_at")
+        status = job.get("status", "UNKNOWN")
+        agent_name = job.get("agent_name", "unknown")
+        sub_tid = job.get("sub_thread_id") or ""
+        created_at = job.get("created_at", "")
+        completed_at = job.get("completed_at") or "In Progress"
 
+        lines = [
+            f"[JOB STATUS REPORT]",
+            f"- Job ID: {job_id}",
+            f"- Sub-Agent: {agent_name}",
+        ]
+        if sub_tid:
+            lines.append(f"- Sub-Thread ID: {sub_tid}")
+        lines.extend([
+            f"- Status: {status}",
+            f"- Started: {created_at}",
+            f"- Completed: {completed_at}",
+        ])
         if status == "SUCCESS":
-            return (
-                f"[JOB STATUS: SUCCESS]\n"
-                f"- Job ID: {job_id}\n"
-                f"- Sub-Agent: {agent_name}\n"
-                f"- Completed At: {job.get('completed_at')}\n"
-                f"- Report Result:\n{job.get('result')}"
-            )
+            lines.append(f"\n[Sub-Agent Final Report]\n{job.get('result', '')}")
+            if job.get("supervisor_response"):
+                lines.append(f"\n[Supervisor Follow-up Action]\n{job.get('supervisor_response')}")
         elif status == "FAILED":
-            return (
-                f"[JOB STATUS: FAILED]\n"
-                f"- Job ID: {job_id}\n"
-                f"- Sub-Agent: {agent_name}\n"
-                f"- Error: {job.get('error')}"
-            )
-        else:
-            return (
-                f"[JOB STATUS: {status}]\n"
-                f"- Job ID: {job_id}\n"
-                f"- Sub-Agent: {agent_name}\n"
-                f"- Created At: {created_at}\n"
-                f"- Status: Currently in progress. Please wait for completion notification."
-            )
+            lines.append(f"\n[Error Detail]\n{job.get('error', 'Unknown error')}")
+
+        return "\n".join(lines)
     except Exception as e:
-        return f"[ERROR: Failed to query job status — {str(e)}]"
+        return f"[ERROR: Exception while checking job status — {str(e)}]"

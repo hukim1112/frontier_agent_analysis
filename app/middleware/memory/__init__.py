@@ -6,10 +6,14 @@
 
 from .semantic_store import SemanticMemoryStore
 from .episodic_store import EpisodicStore
+from .transcript_store import TranscriptStore
+from .review_queue import IdleReviewQueue
 from .memory_middleware import MemoryMiddleware
 
 __all__ = [
     "SemanticMemoryStore",
     "EpisodicStore",
+    "TranscriptStore",
+    "IdleReviewQueue",
     "MemoryMiddleware",
 ]

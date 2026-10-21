@@ -11,7 +11,7 @@ Source: frontier-agent-lab/app/prompts/skill_builder.py
 
 import os
 import re
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 
 class SkillPromptBuilder:
@@ -61,9 +61,14 @@ class SkillPromptBuilder:
             return {}
 
     def build_catalog(self) -> str:
-        """설치된 모든 스킬 디렉토리를 스캔하여 <skills> 카탈로그 텍스트 생성"""
+        """설치된 모든 스킬 디렉토리(폴더형 SKILL.md 및 낱개 .md 스킬 문서)를 스캔하여 <skills> 카탈로그 텍스트 생성"""
         catalog_entries = []
-        seen_dirs = set()
+        seen_paths = set()
+        guidelines_abs = (
+            os.path.normcase(os.path.abspath(self.guidelines_path))
+            if self.guidelines_path and os.path.exists(self.guidelines_path)
+            else None
+        )
 
         for base_dir in self.skills_dirs:
             if not os.path.exists(base_dir):
@@ -74,31 +79,43 @@ class SkillPromptBuilder:
             except Exception:
                 continue
 
+            candidates: List[Tuple[str, str]] = []  # (default_name, file_path)
+
+            # 1. 낱개 마크다운 스킬 파일 (예: app/agents/analyst/skills/chart_patterns.md)
+            for item_name in entries:
+                item_path = os.path.join(base_dir, item_name)
+                if (
+                    os.path.isfile(item_path)
+                    and item_name.lower().endswith(".md")
+                    and item_name not in ("SKILL.md", "Skill.md", "skill.md", "README.md")
+                ):
+                    stem = os.path.splitext(item_name)[0]
+                    candidates.append((stem, item_path))
+
+            # 2. 폴더형 스킬 (예: skills/pykrx-korean-market/SKILL.md)
             for folder_name in entries:
                 dir_path = os.path.join(base_dir, folder_name)
                 if not os.path.isdir(dir_path):
                     continue
-
-                dir_key = os.path.normcase(os.path.abspath(dir_path))
-                if dir_key in seen_dirs:
-                    continue
-
-                found_skill_file = None
-                for fname in ["SKILL.md", "Skill.md", "skill.md"]:
+                for fname in ("SKILL.md", "Skill.md", "skill.md"):
                     candidate = os.path.join(dir_path, fname)
                     if os.path.exists(candidate):
-                        found_skill_file = candidate
+                        candidates.append((folder_name, candidate))
                         break
 
-                if not found_skill_file:
+            for default_name, skill_file in candidates:
+                abs_key = os.path.normcase(os.path.abspath(skill_file))
+                if abs_key == guidelines_abs or abs_key in seen_paths:
                     continue
 
-                seen_dirs.add(dir_key)
-                meta = self._extract_frontmatter(found_skill_file)
+                meta = self._extract_frontmatter(skill_file)
+                if not meta:
+                    continue
 
-                name = meta.get("name", folder_name)
-                desc = meta.get("description", "No description provided.")
-                rel_path = os.path.relpath(found_skill_file).replace("\\", "/")
+                seen_paths.add(abs_key)
+                name = meta.get("name", default_name)
+                desc = " ".join(meta.get("description", "No description provided.").split())
+                rel_path = os.path.relpath(skill_file).replace("\\", "/")
 
                 catalog_entries.append(f"- **{name}** (`{rel_path}`):\n    {desc}")
 

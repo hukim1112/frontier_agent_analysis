@@ -12,7 +12,6 @@
 # - prompt/           : 프롬프트 엔지니어링 (5계층 조립)
 # - guardrails/       : 안전 필터 (Tier 2)
 # - memory/           : Hermes 메모리 (Tier 2)
-# - evaluator/        : 평가 하네스 & LLM-as-a-Judge (Tier 2)
 # ===============================================================================
 
 # --- Observability (H-04) ---
@@ -41,26 +40,19 @@ from .prompt.prompt_assembler import PromptAssembler, create_prompt_assembler_mi
 # --- Memory (Tier 2) ---
 from .memory.semantic_store import SemanticMemoryStore
 from .memory.episodic_store import EpisodicStore
+from .memory.transcript_store import TranscriptStore
+from .memory.review_queue import IdleReviewQueue
 from .memory.memory_middleware import MemoryMiddleware
 
 # --- Guardrails (Tier 2) ---
-try:
-    from .guardrails.guardrails import (
-        InputSafetyGuardrail,
-        TopicAlignmentGuardrail,
-        OutputSchemaRepairGuardrail,
-    )
-except ImportError:
-    InputSafetyGuardrail = None
-    TopicAlignmentGuardrail = None
-    OutputSchemaRepairGuardrail = None
+from .guardrails.guardrails import (
+    InputSafetyGuardrail,
+    TopicAlignmentGuardrail,
+    OutputSchemaRepairGuardrail,
+)
 
 # --- Evaluator & LLM-as-a-Judge (H-06) ---
-try:
-    from .evaluator.evaluator import EvaluatorHarness, JudgeVerdict
-except ImportError:
-    EvaluatorHarness = None
-    JudgeVerdict = None
+from .evaluator.evaluator import EvaluatorHarness, JudgeVerdict
 
 __all__ = [
     # Observability
@@ -85,6 +77,8 @@ __all__ = [
     # Memory
     "SemanticMemoryStore",
     "EpisodicStore",
+    "TranscriptStore",
+    "IdleReviewQueue",
     "MemoryMiddleware",
     # Guardrails
     "InputSafetyGuardrail",

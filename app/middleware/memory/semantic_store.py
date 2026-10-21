@@ -64,10 +64,15 @@ class SemanticMemoryStore:
     def load_from_disk(self) -> None:
         """MEMORY.md, USER.md 로드 → frozen snapshot 캡처.
 
+        파일이 존재하지 않으면 빈 마크다운 파일(MEMORY.md, USER.md)을 즉시 초기화합니다.
         세션 시작 시 한 번 호출. 이후 시스템 프롬프트에 주입되는 내용은
         이 시점의 스냅샷으로 고정됨 (프리픽스 캐시 보존).
         """
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+        for filename in ("MEMORY.md", "USER.md"):
+            fpath = self.memory_dir / filename
+            if not fpath.exists():
+                self._write_file(fpath, [])
 
         self.memory_entries = self._read_file(self.memory_dir / "MEMORY.md")
         self.user_entries = self._read_file(self.memory_dir / "USER.md")

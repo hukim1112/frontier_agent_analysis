@@ -16,8 +16,12 @@ def test_stop_hook_blocking_triggers_on_syntax_error():
     result = middleware.after_agent(state)
     
     assert result is not None
-    assert result.get("transition") == "stop_hook_blocking"
-    assert len(result["messages"]) == 3
+    # Claude Code의 stop_hook_blocking 전이 → LangChain에서는 jump_to="model"로 모델 노드 복귀
+    assert result.get("jump_to") == "model"
+    # add_messages 리듀서: 새로 주입할 blockingError 1건만 반환
+    assert len(result["messages"]) == 1
+    assert isinstance(result["messages"][0], HumanMessage)
+    assert "[stop_hook_blocking]" in result["messages"][0].content
     assert "SyntaxError" in result["messages"][-1].content
 
 def test_stop_hook_passes_on_valid_code():
@@ -28,8 +32,8 @@ def test_stop_hook_passes_on_valid_code():
     state = {"messages": [HumanMessage(content="함수 작성해줘"), valid_code_msg]}
     result = middleware.after_agent(state)
     
-    assert result is not None
-    assert result.get("transition") == "completed"
+    # 검증 통과(completed) → 상태 변경 없이 정상 종료
+    assert result is None
 
 def test_aborted_streaming():
     handler = AbortStreamingHandler()

@@ -34,15 +34,22 @@ def analyze_logs(log_dir: str = "./artifacts/logs") -> Dict[str, Any]:
         "log_files_count": 0,
     }
 
-    if not os.path.exists(log_dir):
-        return stats
+    search_dirs = [log_dir]
+    if os.path.normpath(log_dir) in (os.path.normpath("./artifacts/logs"), os.path.normpath("artifacts/logs")):
+        users_dir = os.path.join(os.path.dirname(os.path.normpath(log_dir)), "users")
+        if os.path.exists(users_dir):
+            search_dirs.append(users_dir)
 
-    log_files = (
-        glob.glob(os.path.join(log_dir, "*.jsonl"))
-        + glob.glob(os.path.join(log_dir, "*.json"))
-        + glob.glob(os.path.join(log_dir, "**", "*.jsonl"), recursive=True)
-        + glob.glob(os.path.join(log_dir, "**", "*.json"), recursive=True)
-    )
+    log_files: List[str] = []
+    for sdir in search_dirs:
+        if not os.path.exists(sdir):
+            continue
+        log_files.extend(
+            glob.glob(os.path.join(sdir, "*.jsonl"))
+            + glob.glob(os.path.join(sdir, "*.json"))
+            + glob.glob(os.path.join(sdir, "**", "*.jsonl"), recursive=True)
+            + glob.glob(os.path.join(sdir, "**", "*.json"), recursive=True)
+        )
     log_files = sorted(list(dict.fromkeys(log_files)))
     stats["log_files_count"] = len(log_files)
 
@@ -65,9 +72,9 @@ def analyze_logs(log_dir: str = "./artifacts/logs") -> Dict[str, Any]:
                     event_type = record.get("event") or record.get("type") or ""
 
                     # 에이전트 실행 이벤트
-                    if event_type in ["agent_execution", "run_summary", "agent_call"]:
+                    if event_type in ["agent_execution", "run_summary", "turn_summary", "agent_call"]:
                         stats["total_executions"] += 1
-                        lat = record.get("latency_ms") or record.get("duration_ms")
+                        lat = record.get("latency_ms") or record.get("duration_ms") or record.get("total_latency_ms")
                         if lat is not None:
                             stats["agent_latencies"].append(float(lat))
 

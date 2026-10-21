@@ -70,6 +70,14 @@ class _AsyncLogWorker:
 _GLOBAL_LOG_WORKER = _AsyncLogWorker()
 
 
+_DEFAULT_LOG_DIRS = {
+    os.path.normpath("./artifacts/logs"),
+    os.path.normpath("artifacts/logs"),
+    os.path.normpath("./artifacts/users"),
+    os.path.normpath("artifacts/users"),
+}
+
+
 class AgentLogTracer(AgentMiddleware):
     """
     에이전트 감사 로깅 및 궤적 관측성 통합 미들웨어 (AgentLogTracer).
@@ -78,7 +86,7 @@ class AgentLogTracer(AgentMiddleware):
     """
     def __init__(
         self,
-        log_dir: str = "./artifacts/logs",
+        log_dir: str = "./artifacts/users",
         log_path: Optional[str] = None,
         verbose: bool = False,
         stream_events: bool = True,
@@ -88,8 +96,13 @@ class AgentLogTracer(AgentMiddleware):
         self.log_dir = os.path.dirname(log_path) if log_path else log_dir
         self.verbose = verbose
         self.stream_events = stream_events  # 개별 tool_execution 이벤트도 실시간 기록할지 여부
-        
-        if self.log_dir:
+        self._use_unified_workspace = (
+            not self.log_path
+            and bool(self.log_dir)
+            and os.path.normpath(self.log_dir) in _DEFAULT_LOG_DIRS
+        )
+
+        if self.log_dir and not self._use_unified_workspace:
             os.makedirs(self.log_dir, exist_ok=True)
 
         # 세션별 런타임 상태 버퍼: {session_id: {...}}
@@ -97,10 +110,112 @@ class AgentLogTracer(AgentMiddleware):
         self._last_session_id: Optional[str] = None
         self._turn_counters: Dict[str, int] = {}
 
-    def _resolve_target_file(self, session_id: str) -> str:
-        """적재 대상 파일 경로 결정 (단일 파일 지정 시 log_path 우선, 미지정 시 session_id 폴더별 audit.jsonl)"""
+    def _get_user_id(
+        self,
+        runtime: Any = None,
+        request: Any = None,
+        state: Any = None,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """컨텍스트/런타임/활성 세션 상태에서 user_id를 추출합니다."""
+        if runtime and hasattr(runtime, "context") and getattr(runtime.context, "user_id", None):
+            uid = str(runtime.context.user_id).strip()
+            if uid:
+                return uid
+        if request and hasattr(request, "runtime") and getattr(request.runtime, "context", None):
+            uid = getattr(request.runtime.context, "user_id", None)
+            if uid and str(uid).strip():
+                return str(uid).strip()
+        if request and hasattr(request, "runtime") and getattr(request.runtime, "config", None):
+            cfg = request.runtime.config
+            if isinstance(cfg, dict):
+                uid = (cfg.get("configurable") or {}).get("user_id")
+                if uid and str(uid).strip():
+                    return str(uid).strip()
+        if runtime and hasattr(runtime, "config") and runtime.config:
+            uid = (runtime.config.get("configurable") or {}).get("user_id")
+            if uid and str(uid).strip():
+                return str(uid).strip()
+        if state and isinstance(state, dict):
+            cfg = state.get("configurable", {})
+            if isinstance(cfg, dict) and cfg.get("user_id"):
+                return str(cfg["user_id"]).strip()
+        if session_id and session_id in self._active_runs:
+            uid = self._active_runs[session_id].get("user_id")
+            if uid:
+                return str(uid)
+        return "default"
+
+    def _get_parent_session_id(
+        self,
+        runtime: Any = None,
+        request: Any = None,
+        state: Any = None,
+        session_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """컨텍스트/런타임/활성 세션 상태에서 명시적 parent_session_id(parent_thread_id)를 추출합니다."""
+        if runtime and hasattr(runtime, "context") and getattr(runtime.context, "parent_session_id", None):
+            psid = str(runtime.context.parent_session_id).strip()
+            if psid:
+                return psid
+        if request and hasattr(request, "runtime") and getattr(request.runtime, "context", None):
+            psid = getattr(request.runtime.context, "parent_session_id", None)
+            if psid and str(psid).strip():
+                return str(psid).strip()
+        if request and hasattr(request, "runtime") and getattr(request.runtime, "config", None):
+            cfg = request.runtime.config
+            if isinstance(cfg, dict):
+                psid = (cfg.get("configurable") or {}).get("parent_thread_id")
+                if psid and str(psid).strip():
+                    return str(psid).strip()
+        if runtime and hasattr(runtime, "config") and runtime.config:
+            psid = (runtime.config.get("configurable") or {}).get("parent_thread_id")
+            if psid and str(psid).strip():
+                return str(psid).strip()
+        if state and isinstance(state, dict):
+            cfg = state.get("configurable", {})
+            if isinstance(cfg, dict) and cfg.get("parent_thread_id"):
+                return str(cfg["parent_thread_id"]).strip()
+        if session_id and session_id in self._active_runs:
+            psid = self._active_runs[session_id].get("parent_session_id")
+            if psid:
+                return str(psid)
+        return None
+
+    def _resolve_target_file(
+        self,
+        session_id: str,
+        user_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+    ) -> str:
+        """적재 대상 파일 경로 결정:
+        - 단일 파일(log_path) 지정 시 log_path 우선
+        - 기본 워크스페이스 모드 시 artifacts/users/{user_id}/sessions/{session_id}/(subagents/{role}_{id}/)logs/audit.jsonl
+        - 커스텀 log_dir 지정 시 {log_dir}/{session_id}/audit.jsonl
+        """
         if self.log_path:
             return self.log_path
+        if self._use_unified_workspace:
+            from app.utils.workspace import PROJECT_ROOT, resolve_session_workspace
+
+            # SSOT: 실행 시작 시점에 AgentContext.workspace_dir가 이미 주입된 경우 그대로 사용
+            if session_id in self._active_runs:
+                ws_dir = self._active_runs[session_id].get("workspace_dir")
+                if ws_dir:
+                    ws_path = (PROJECT_ROOT / ws_dir) if not os.path.isabs(ws_dir) else ws_dir
+                    logs_dir = os.path.join(str(ws_path), "logs")
+                    os.makedirs(logs_dir, exist_ok=True)
+                    return os.path.join(logs_dir, "audit.jsonl")
+
+            uid = user_id or self._get_user_id(session_id=session_id)
+            psid = parent_session_id or self._get_parent_session_id(session_id=session_id)
+            ws = resolve_session_workspace(
+                user_id=uid,
+                session_id=session_id,
+                parent_session_id=psid,
+                ensure_exists=True,
+            )
+            return str(ws.logs_dir / "audit.jsonl")
         session_folder = os.path.join(self.log_dir, session_id)
         os.makedirs(session_folder, exist_ok=True)
         return os.path.join(session_folder, "audit.jsonl")
@@ -173,6 +288,11 @@ class AgentLogTracer(AgentMiddleware):
     def before_agent(self, state: Dict[str, Any], runtime: Any) -> Dict[str, Any] | None:
         """에이전트 전체 실행 시작 시 세션 상태 초기화"""
         session_id = self._get_session_id(runtime=runtime, state=state)
+        user_id = self._get_user_id(runtime=runtime, state=state, session_id=session_id)
+        parent_session_id = self._get_parent_session_id(runtime=runtime, state=state, session_id=session_id)
+        workspace_dir = ""
+        if runtime and getattr(runtime, "context", None) is not None:
+            workspace_dir = getattr(runtime.context, "workspace_dir", "") or ""
         self._sync_session_keys(session_id)
 
         messages = state.get("messages", [])
@@ -185,6 +305,9 @@ class AgentLogTracer(AgentMiddleware):
         start_time = time.time()
         self._active_runs[session_id] = {
             "session_id": session_id,
+            "user_id": user_id,
+            "parent_session_id": parent_session_id,
+            "workspace_dir": workspace_dir,
             "turn_id": turn_id,
             "user_query": user_query,
             "start_time": start_time,
@@ -206,19 +329,21 @@ class AgentLogTracer(AgentMiddleware):
         if self.verbose:
             print(f"\n🪵 [AgentLogTracer] === 에이전트 실행 시작 (Turn #{turn_id}) ===")
             print(f"📥 사용자 질문: {user_query}")
-            print(f"🆔 세션 ID: {session_id}")
+            print(f"🆔 세션 ID: {session_id} (user={user_id})")
 
         return None
 
     def after_agent(self, state: Dict[str, Any], runtime: Any) -> Dict[str, Any] | None:
         """에이전트 전체 실행 완료 시 계층적 턴 감사 로그(turn_summary)를 비동기로 영속화"""
         session_id = self._get_session_id(runtime=runtime, state=state)
+        user_id = self._get_user_id(runtime=runtime, state=state, session_id=session_id)
         self._sync_session_keys(session_id)
 
         run_info = self._active_runs.get(session_id)
         if not run_info:
             run_info = {
                 "session_id": session_id,
+                "user_id": user_id,
                 "turn_id": self._turn_counters.get(session_id, 1),
                 "user_query": "unknown",
                 "start_time": time.time(),
@@ -228,6 +353,8 @@ class AgentLogTracer(AgentMiddleware):
                 "total_tool_calls": 0,
             }
             self._active_runs[session_id] = run_info
+        else:
+            run_info.setdefault("user_id", user_id)
 
         duration_ms = int((time.time() - run_info["start_time"]) * 1000)
         run_info["total_latency_ms"] = duration_ms
@@ -253,6 +380,7 @@ class AgentLogTracer(AgentMiddleware):
         audit_log = {
             "event": "turn_summary",
             "session_id": session_id,
+            "user_id": run_info.get("user_id", user_id),
             "turn_id": run_info.get("turn_id", 1),
             "status": run_info["status"],
             "user_query": run_info["user_query"],
@@ -269,7 +397,7 @@ class AgentLogTracer(AgentMiddleware):
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
-        target_file = self._resolve_target_file(session_id)
+        target_file = self._resolve_target_file(session_id, user_id=run_info.get("user_id", user_id))
         _GLOBAL_LOG_WORKER.enqueue(target_file, audit_log)
 
         if self.verbose:
@@ -353,16 +481,18 @@ class AgentLogTracer(AgentMiddleware):
             self._active_runs[session_id]["total_tool_calls"] += 1
 
         if self.stream_events:
+            uid = self._get_user_id(request=request, session_id=session_id)
             tool_log = {
                 "event": "tool_execution",
                 "session_id": session_id,
+                "user_id": uid,
                 "tool_name": tool_name,
                 "arguments": tool_args,
                 "result": result_str,
                 "latency_ms": duration_ms,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             }
-            target_file = self._resolve_target_file(session_id)
+            target_file = self._resolve_target_file(session_id, user_id=uid)
             _GLOBAL_LOG_WORKER.enqueue(target_file, tool_log)
 
         return response
@@ -442,16 +572,18 @@ class AgentLogTracer(AgentMiddleware):
             self._active_runs[session_id]["total_tool_calls"] += 1
 
         if self.stream_events:
+            uid = self._get_user_id(request=request, session_id=session_id)
             tool_log = {
                 "event": "tool_execution",
                 "session_id": session_id,
+                "user_id": uid,
                 "tool_name": tool_name,
                 "arguments": tool_args,
                 "result": result_str,
                 "latency_ms": duration_ms,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             }
-            target_file = self._resolve_target_file(session_id)
+            target_file = self._resolve_target_file(session_id, user_id=uid)
             _GLOBAL_LOG_WORKER.enqueue(target_file, tool_log)
 
         return response

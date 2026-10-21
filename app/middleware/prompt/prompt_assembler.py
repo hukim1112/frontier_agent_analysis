@@ -38,6 +38,8 @@ from typing import List, Dict, Any, Optional, Union, Callable
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
 from langchain.agents.middleware import AgentMiddleware
 
+from app.utils.message_markers import last_user_turn_start
+
 
 # =============================================================================
 # Constants
@@ -401,10 +403,11 @@ def prepend_user_context(
         + "\n</system-reminder>\n\n"
     )
 
-    # 첫 번째 HumanMessage 복제 후 앞단에 결합
+    # 첫 번째 HumanMessage 복제 후 앞단에 결합 (압축 요약이면 출처 표식 additional_kwargs 유지)
     new_first_msg = HumanMessage(
         content=reminder_header + str(first_msg.content),
         id=getattr(first_msg, "id", None),
+        additional_kwargs=dict(getattr(first_msg, "additional_kwargs", None) or {}),
     )
 
     return messages[:first_human_idx] + [new_first_msg] + messages[first_human_idx + 1:]
@@ -426,12 +429,8 @@ def attach_mcp_delta_if_needed(
     if not new_mcp_instructions or not messages:
         return messages
 
-    # 마지막 HumanMessage 를 찾기
-    last_human_idx = None
-    for i in range(len(messages) - 1, -1, -1):
-        if isinstance(messages[i], HumanMessage):
-            last_human_idx = i
-            break
+    # 현재 사용자 턴의 메시지를 찾기 (압축 요약·StopHooks 피드백 HumanMessage는 제외)
+    last_human_idx = last_user_turn_start(messages)
 
     if last_human_idx is None:
         return messages
@@ -446,6 +445,7 @@ def attach_mcp_delta_if_needed(
     new_last_msg = HumanMessage(
         content=str(last_msg.content) + attachment_block,
         id=getattr(last_msg, "id", None),
+        additional_kwargs=dict(getattr(last_msg, "additional_kwargs", None) or {}),
     )
 
     return messages[:last_human_idx] + [new_last_msg] + messages[last_human_idx + 1:]
@@ -570,9 +570,10 @@ class PromptAssembler:
 
     # ── Formatting Helpers ──
 
-    def format_tool_capabilities(self) -> str:
+    def format_tool_capabilities(self, tools: Optional[list] = None) -> str:
         """Formats L2 tool capabilities sorted alphabetically by name for KV cache consistency."""
-        if not self.tool_schemas:
+        tool_schemas = tools if tools else self.tool_schemas
+        if not tool_schemas:
             return "No registered tools."
 
         def get_tool_name(schema: Any) -> str:
@@ -580,7 +581,7 @@ class PromptAssembler:
                 return schema.get("name", "")
             return getattr(schema, "name", str(schema))
 
-        sorted_tools = sorted(self.tool_schemas, key=get_tool_name)
+        sorted_tools = sorted(tool_schemas, key=get_tool_name)
 
         tool_lines = []
         for idx, tool in enumerate(sorted_tools):
@@ -702,7 +703,7 @@ class PromptAssembler:
 
         return "=== Layer 1: Global Constitution ===\n\n" + "\n\n".join(sections)
 
-    def _build_l2_tools(self) -> str:
+    def _build_l2_tools(self, tools: Optional[list] = None) -> str:
         """Assembles Layer 2 — Tool Guide & Schemas (Module 4).
 
         도구 스키마를 알파벳순으로 정렬하여 캐시 일관성 보장.
@@ -714,7 +715,7 @@ class PromptAssembler:
             parts.append(get_using_your_tools_section())
 
         # 알파벳순 정렬 도구 스키마
-        tool_str = self.format_tool_capabilities()
+        tool_str = self.format_tool_capabilities(tools)
         parts.append(f"## 🛠️ Registered Tool Capabilities (Alphabetical)\n{tool_str}")
 
         # 스킬 카탈로그 통합
@@ -722,16 +723,17 @@ class PromptAssembler:
             raw_skill = self.read_and_truncate_doc(
                 self.skill_catalog, max_lines=300, max_bytes=35000
             )
-            parts.append(
-                f"## 📦 Available Skills Catalog & Execution Policy\n{raw_skill}"
-            )
+            if raw_skill.strip():
+                parts.append(
+                    f"## 📦 Available Skills Catalog & Execution Policy\n{raw_skill}"
+                )
 
         return "=== Layer 2: Capabilities (Tools & Skills) ===\n\n" + "\n\n".join(parts)
 
-    def build_static_content(self) -> str:
+    def build_static_content(self, tools: Optional[list] = None) -> str:
         """Assembles Layers 1~2 + Boundary Marker (Static KV Cache Target)."""
         l1 = self._build_l1_constitution()
-        l2 = self._build_l2_tools()
+        l2 = self._build_l2_tools(tools)
         return f"{l1}\n\n{l2}\n\n{self.boundary_marker}"
 
     def _build_l3_session(self, session_context: dict) -> str:
@@ -782,8 +784,17 @@ class PromptAssembler:
                 session_items.append(f"- User Permission: {session_context['user_permission']}")
             if "active_project" in session_context:
                 session_items.append(f"- Active Project: {session_context['active_project']}")
+            if "user_id" in session_context and session_context["user_id"]:
+                session_items.append(f"- User ID: {session_context['user_id']}")
             if "git_status" in session_context:
                 session_items.append(f"- Git Branch/Status: {session_context['git_status']}")
+            if "workspace_dir" in session_context and session_context["workspace_dir"]:
+                ws_root = session_context["workspace_dir"]
+                session_items.append(f"- Session Workspace Root: {ws_root}")
+                session_items.append(f"  - Plan Dir (plan_state/extraction_plan): {session_context.get('plan_dir', f'{ws_root}/plan')}")
+                session_items.append(f"  - Scripts Dir (.py scripts): {session_context.get('scripts_dir', f'{ws_root}/scripts')}")
+                session_items.append(f"  - Outputs Dir (data/charts/reports): {session_context.get('outputs_dir', f'{ws_root}/outputs')}")
+                session_items.append(f"  - Logs Dir (audit.jsonl): {session_context.get('logs_dir', f'{ws_root}/logs')}")
             parts.append("Session Information:\n" + "\n".join(session_items))
 
         # Module [9]: Memory Index (Recalled Memory from MemoryMiddleware)
@@ -794,7 +805,7 @@ class PromptAssembler:
             else:
                 parts.append(f"[Recalled Memory (injected by MemoryMiddleware)]:\n{recalled.strip()}")
 
-        # 비메모리 동적 문서
+        # 비메모리 동적 문서 (MCP.md 등)
         if self.l4_docs:
             for doc_name, source in self.l4_docs.items():
                 doc_content = self.read_and_truncate_doc(source, max_lines=300, max_bytes=35000)
@@ -846,9 +857,9 @@ class PromptAssembler:
         l5 = self._build_l5_resources(session_context)
         return f"{l3}\n\n{l4}\n\n{l5}"
 
-    def build_system_prompt(self, session_context: dict) -> str:
+    def build_system_prompt(self, session_context: dict, tools: Optional[list] = None) -> str:
         """Assembles all 5 layers into a single prompt string."""
-        static_part = self.build_static_content()
+        static_part = self.build_static_content(tools)
         dynamic_part = self.build_dynamic_content(session_context)
         return f"{static_part}\n\n{dynamic_part}"
 
@@ -897,30 +908,78 @@ class PromptAssemblerMiddleware(AgentMiddleware):
 
     def _prepare_messages(self, request) -> list:
         ctx = getattr(request.runtime, "context", None)
+        user_id = getattr(ctx, "user_id", "default") if ctx else "default"
+        session_id = getattr(ctx, "session_id", "unknown") if ctx else "unknown"
+        parent_session_id = getattr(ctx, "parent_session_id", "") if ctx else ""
+
+        # Retrieve thread_id / user_id / parent_thread_id from config if available
+        config = getattr(request.runtime, "config", None)
+        if config and isinstance(config, dict):
+            configurable = config.get("configurable", {}) or {}
+            tid = configurable.get("thread_id")
+            if tid:
+                session_id = str(tid)
+            cfg_uid = configurable.get("user_id")
+            if cfg_uid and (not user_id or user_id == "default"):
+                user_id = str(cfg_uid)
+            cfg_ptid = configurable.get("parent_thread_id")
+            if cfg_ptid and not parent_session_id:
+                parent_session_id = str(cfg_ptid)
+
+        exec_info = getattr(request.runtime, "execution_info", None)
+        if exec_info and getattr(exec_info, "thread_id", None):
+            session_id = str(exec_info.thread_id)
+
         session_context = {
             "cwd": getattr(ctx, "cwd", os.getcwd()) if ctx else os.getcwd(),
-            "session_id": getattr(ctx, "session_id", "unknown") if ctx else "unknown",
+            "session_id": session_id,
+            "user_id": user_id,
             "os": os.name,
             "user_permission": getattr(ctx, "user_permission", "GUEST") if ctx else "GUEST",
             "active_project": getattr(ctx, "active_project", "UNKNOWN") if ctx else "UNKNOWN",
             "recalled_memory": getattr(ctx, "recalled_memory", "") if ctx else "",
         }
 
-        # Retrieve thread_id from config if available
-        config = getattr(request.runtime, "config", None)
-        if config and isinstance(config, dict):
-            tid = config.get("configurable", {}).get("thread_id")
-            if tid:
-                session_context["session_id"] = str(tid)
+        ctx_ws_dir = (getattr(ctx, "workspace_dir", "") or "").strip() if ctx else ""
+        if ctx_ws_dir:
+            ws_root_rel = ctx_ws_dir.rstrip("/")
+            session_context["workspace_dir"] = ws_root_rel
+            session_context["plan_dir"] = f"{ws_root_rel}/plan"
+            session_context["scripts_dir"] = f"{ws_root_rel}/scripts"
+            session_context["outputs_dir"] = f"{ws_root_rel}/outputs"
+            session_context["logs_dir"] = f"{ws_root_rel}/logs"
+        else:
+            try:
+                from app.utils.workspace import resolve_session_workspace
+
+                ws = resolve_session_workspace(
+                    user_id=user_id,
+                    session_id=session_id,
+                    parent_session_id=parent_session_id or None,
+                    ensure_exists=False,
+                )
+                ws_root_rel = ws.rel_root
+                session_context["workspace_dir"] = ws_root_rel
+                session_context["plan_dir"] = ws.rel_plan_dir
+                session_context["scripts_dir"] = ws.rel_scripts_dir
+                session_context["outputs_dir"] = ws.rel_outputs_dir
+                session_context["logs_dir"] = ws.rel_logs_dir
+                if ctx is not None and hasattr(ctx, "workspace_dir"):
+                    ctx.workspace_dir = ws_root_rel
+            except Exception:
+                pass
+
+        req_tools = list(getattr(request, "tools", None) or [])
+        tools = req_tools if req_tools else None
 
         if self.merge_system:
             # Single SystemMessage (L1~L5 All-in-one)
-            full_system_text = self.assembler.build_system_prompt(session_context)
+            full_system_text = self.assembler.build_system_prompt(session_context, tools)
             system_messages = [SystemMessage(content=full_system_text)]
         else:
             # Dual SystemMessage (Static with cache_control + Dynamic)
             static_msg = SystemMessage(
-                content=self.assembler.build_static_content(),
+                content=self.assembler.build_static_content(tools),
                 additional_kwargs={"cache_control": {"type": "ephemeral"}},
             )
             dynamic_msg = SystemMessage(
@@ -928,11 +987,21 @@ class PromptAssemblerMiddleware(AgentMiddleware):
             )
             system_messages = [static_msg, dynamic_msg]
 
-        # Filter out existing SystemMessages to avoid duplication, and clean empty messages
+        # Filter out existing L1-L5 SystemMessages to avoid duplication, while preserving
+        # Compaction/AmnesiaGuard pipeline SystemMessages stored in state["messages"]
+        _preserved_prefixes = (
+            "[Context Collapsed:",
+            "[Compaction Amnesia Guard:",
+            "[Reactive Compact",
+            "Previous Conversation Summary:",
+        )
         filtered_msgs = []
         for m in request.messages:
             if isinstance(m, SystemMessage):
-                continue
+                ak = getattr(m, "additional_kwargs", None) or {}
+                m_text = str(getattr(m, "content", "") or "")
+                if not (ak.get("compaction_artifact") or m_text.startswith(_preserved_prefixes)):
+                    continue
             # Prevent empty parts / Gemini 400 error
             content = getattr(m, "content", "")
             tool_calls = getattr(m, "tool_calls", None)

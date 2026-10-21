@@ -59,13 +59,8 @@ tools_analyst = [
     grep_search, glob_search, bash_command,
 ]
 
-# Alias for backward compatibility with frontier_agent and notebooks
-common_tools = tools_chatbot
-
 __all__ = [
-    "common_tools",
     "tools_chatbot", "tools_scraper", "tools_supervisor", "tools_analyst",
-
     "tools_planning", "PLANNING_AND_TASK_TOOLS",
     "file_read", "file_edit", "file_writer", "notebook_edit",
     "bash_command", "grep_search", "glob_search", "tool_search",

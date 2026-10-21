@@ -111,8 +111,9 @@ def test_auto_compactor():
     assert "Summarized conversation history." in compacted_small[1].content
 
 def test_extract_code_blocks():
-    text = "Here is some code:\n```python\nprint('hello')\n```\nAnd another one:\n```\n1 + 1\n```"
+    text = "Here is some code:\n```python\nprint('hello')\n```\nAnd another one:\n```py\n1 + 1\n```\nDiagram:\n```mermaid\ngraph TD\n  A-->B\n```\nPlain:\n```\n+--+\n```"
     blocks = extract_code_blocks(text)
+    # python/py 태그 블록만 추출 (mermaid / 태그 없는 블록은 오탐 방지를 위해 제외)
     assert len(blocks) == 2
     assert "print('hello')" in blocks[0]
     assert "1 + 1" in blocks[1]
@@ -133,7 +134,7 @@ def test_stop_hooks_middleware():
         ]
     }
     res = middleware.after_agent(state, None)
-    assert res is None or res.get("transition") == "completed"
+    assert res is None
 
     # Invalid response with syntax_error
     state_err = {
@@ -144,7 +145,8 @@ def test_stop_hooks_middleware():
     }
     res_err = middleware.after_agent(state_err, None)
     assert res_err is not None
-    assert len(res_err["messages"]) == 3
+    assert res_err["jump_to"] == "model"
+    assert len(res_err["messages"]) == 1
     assert "[dummy]: Syntax Error: invalid syntax" in res_err["messages"][-1].content
 
 def test_amnesia_guard():
