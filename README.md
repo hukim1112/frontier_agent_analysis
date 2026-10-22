@@ -8,41 +8,18 @@
 
 ### 1. 🛡️ Claude Code 핵심 하네스 아키텍처
 
-#### ① 5-Layer 16대 모듈 프롬프트 어셈블러 (`app/middleware/prompt/`)
-- **Layer 1: Global Constitution (Modules 0~3, 5~6)**: 정체성, 보안 가이드, 린 엔지니어링, 비가역적 파괴 작업 승인 규칙, 간결한 톤&스타일, 효율적 출력 정책.
-- **Layer 2: Tool Guide & Skills (Module 4)**: Anti-Raw Bash 가드레일, 온디맨드 스킬 카탈로그. 도구 정의는 원본처럼 시스템 프롬프트가 아닌 API `tools` 필드로 보내며, 미들웨어가 이름순(내장 → MCP)으로 정렬합니다.
-- **🔻 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`**: 정적 영역(L1~L2, 전 사용자 공용 캐시)과 동적 영역(L3~L5, 세션별)을 분리합니다.
-- **Layer 3: Session Interaction (Module 8)**: 대화형 CLI 명령 안내(`! <cmd>`), 슬래시 커맨드 인식.
-- **Layer 4: Environment & Memory Index (Modules 9~12)**: CWD, OS, Session ID 등 환경 메타데이터, 언어 정책, 출력 스타일, 인출된 메모리.
-- **Layer 5: Resource Control & Project Rules (Modules 13~16)**: MCP 지침, 권한 면제 Scratchpad 샌드박스, FRC(Function Result Clearing: 오래된 도구 결과 정리) 공지, 도구 결과 요약 정책 및 `AGENT.md` 로컬 규칙.
-- **세션당 1회 계산**: 동적 섹션은 원본 `systemPromptSection`처럼 세션에서 한 번 만들어 재사용합니다. MCP 지침과 메모리(턴마다 에피소드 검색)만 매 호출 다시 계산합니다.
-- **시스템 컨텍스트 / 사용자 컨텍스트**: 원본 `getSystemContext`·`getUserContext`처럼 Git 스냅샷(브랜치·status 2000자 절단·최근 커밋, `@lru_cache` 동결)은 시스템 프롬프트 맨 끝에 `gitStatus:`로, `CLAUDE.md`와 세션 시작 날짜는 대화 맨 앞 별도 `<system-reminder>` 메시지로 넣습니다. 자정이 지나면 앞부분은 그대로 두고 대화 끝에 `date_change` 알림을 붙입니다.
-
-#### ② Claude Code 컨텍스트 압축 파이프라인 & Amnesia Guard (`app/middleware/compaction/`)
-Claude Code(유출 소스 v2.1.88) `query.ts`의 실행 순서를 따릅니다. 🟢는 원본 소스를 옮긴 단계, 🟡는 원본 파일이 빌드에서 빠져 있어 호출부 흔적으로 재구성한 단계입니다. 단계별 on/off와 수치는 `configs/compaction.config`에서 바꿉니다.
-- **Tool Result Budget** 🟢: 도구 결과가 50,000자를 넘으면 `artifacts/tool-results/<세션>/`에 저장하고 모델에는 `<persisted-output>` 미리보기(2,000자)와 파일 경로만 전달. 한 라운드 합계는 200,000자 예산. `file_read` 결과는 저장하지 않음: 도구가 스스로 분량을 제한하고(이 프로젝트: 기본 250줄), 저장 파일을 다시 읽는 순환도 생기기 때문.
-- **Snip** 🟡: 모델이 `snip` 도구로 `[id:...]` 태그가 붙은 메시지를 지목해 컨텍스트에서 뺌. 도구 호출·결과 쌍은 함께 빠지고 현재 턴은 보호. state에는 원본이 남고 모델 입력에서만 빠짐. 컨텍스트가 임계치의 70%를 넘으면 snip 사용을 권하는 알림을 붙임.
-- **Microcompact (time-based)** 🟢: 마지막 응답 후 60분 이상 지나면(서버 캐시 만료) 최근 5개를 뺀 오래된 도구 결과 본문을 `[Old tool result content cleared]`로 비움. 같은 id로 state를 교체하므로 `transcript.db` 원문은 그대로.
-- **Context Collapse** 🟡 (기본 꺼짐): 컨텍스트가 임계치의 90%에 이르면 완료된 이전 턴을 1개씩 LLM으로 요약해 커밋 로그에 쌓고, 모델 입력에서만 접어서 보여줌. 켜면 Auto-Compact는 발동하지 않음(원본 동작).
-- **Auto-Compact (`before_model`)** 🟢: 토큰 임계치 초과 시 **이전 턴까지만** 원본의 9개 섹션 프롬프트로 요약해 checkpointer state를 교체(`RemoveMessage(REMOVE_ALL_MESSAGES)`). 요약 실패 시 압축하지 않고, 3회 연속 실패하면 세션 내 중단(circuit breaker). 요약 요청 자체가 너무 길면 오래된 API 라운드부터 버리고 최대 3회 재시도. 원문은 `transcript.db`에 보존되며 압축 이벤트(`kind=compaction`)가 기록됩니다.
-- **Amnesia Guard**: 압축 후 활성 계획(Plan)과 최근 5개 파일 스냅샷을 복원 블록으로 재주입 (원본 `POST_COMPACT_MAX_FILES_TO_RESTORE = 5`).
-- **Reactive Compact** 🟡: API 413 `prompt_too_long` 에러 시(`ModelFallbackMiddleware`가 413을 가로채지 않고 재전파) 이전 턴 요약을 시도하고, 안 되면 가장 오래된 API 라운드 20%를 잘라낸 뒤 한 번 재시도.
-
-#### ③ Self-Recovery & Self-Correction 에러 컨트롤 및 가드레일 (`app/middleware/`)
-- **Guardrails (`before_agent`)**: `InputSafetyGuardrail` 및 `TopicAlignmentGuardrail`이 `before_agent` 훅(`can_jump_to=["end"]`)에서 턴당 1회만 검사를 수행하며, 차단 시 메모리 인출을 건너뛰고 `transcript.db`에는 `kind=blocked`로 기록(검색·회상·학습 제외).
-- **ModelFallbackMiddleware**: 메인 LLM API 장애 시 백업 모델로 자동 failover (`request.override(model=...)` 사용, 413 컨텍스트 초과 에러는 Compactor로 재전파).
-- **ToolErrorHandlerMiddleware**: 도구 실행 예외를 크래시 대신 `ToolMessage`로 변환하여 에이전트의 자가 회복 유도.
-- **ModelCallLimitMiddleware**: 무한 루프 방지 (호출 횟수 상한 제어).
-- **StopHooksMiddleware**: 에이전트가 생성한 파이썬 코드의 문법/들여쓰기 오류를 사전 인터셉트하여 blockingError를 주입, 스스로 코드를 자가 수정(Self-Correction)하도록 강제.
+- **① 5-Layer 16대 모듈 프롬프트 어셈블러 (`app/middleware/prompt/`)**: 정적 글로벌 캐시 영역(L1~L2)과 세션별 동적 영역(L3~L5)을 경계 마커(`__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`)로 분리해 조립하며, `CLAUDE.md`와 날짜는 대화 앞 별도 `<system-reminder>` 메시지로 주입합니다.
+- **② Claude Code 컨텍스트 압축 파이프라인 & Amnesia Guard (`app/middleware/compaction/`)**: Tool Result Budget ➔ Snip ➔ Microcompact ➔ Context Collapse ➔ Auto-Compact ➔ Reactive Compact 순서로 컨텍스트를 압축하고, 압축 직후 Amnesia Guard가 활성 계획(Plan)과 최근 5개 파일 스냅샷을 복원합니다.
+- **③ Self-Recovery & Self-Correction 에러 컨트롤 및 가드레일 (`app/middleware/`)**: 턴 시작 시 입력 안전성·주제 이탈 가드레일을 검사하고, 모델 폴백(Failover), 도구 예외 복구, 호출 상한 제어 및 생성 코드 문법 오류 자가 수정(Stop Hooks)을 수행합니다.
 
 ---
 
 ### 2. 🧠 Hermes 4-Layer Memory System (`app/middleware/memory/`)
-- **L1 Working Memory (`checkpoints.db`)**: `AsyncSqliteSaver` 기반 세션별 런타임 단기 상태 체크포인팅 (**압축본**).
-- **L2 Episodic — 원문 저장소 (`transcript.db`, `TranscriptStore`)**: 모든 사용자·AI·도구 결과 원문 및 압축 이벤트를 실시간 Append-only로 기록하는 **전체본**. `episodic_memory_enabled` / `episodic_learning_enabled`와 독립된 `transcript.enabled` 스위치로 동작.
-- **L2 Episodic — 요약 색인 (`episodic.db`, `EpisodicStore` + `IdleReviewQueue`)**: 마지막 턴 후 15초 유휴 대기(최대 30분) 뒤 `transcript.db` 원문을 읽어 **다중 주제(Multi-Topic) 구조화 요약(`topics_json`, `tool_names`)** 및 SQLite FTS5 색인을 생성. `session_search`(색인 검색 + 원문 FTS 폴백) ➔ `session_recall`(`transcript.db` Anchor ±window 원문 인출) 2단계 인출 지원.
-- **L3 Semantic Memory (`MEMORY.md` / `USER.md`)**: 에이전트 팩트 및 사용자 프로필 관리. 유휴 큐 백그라운드 리뷰를 통한 스마트 마크다운 병합(`add`, `replace`, `remove`).
-- **L4 Procedural Memory (`artifacts/users/{user_id}/skills/`, `ProceduralMemoryStore`)**: 작업 유형별 절차를 `SKILL.md`로 학습하는 기억. 도구 호출이 10회 쌓인 세션은 유휴 리뷰에서 스킬 도구만 가진 리뷰 에이전트가 스킬을 생성·patch(`skill_review.py`). 카탈로그(이름+설명)만 L4에 세션 단위로 주입하고 본문은 `skill_view`로 열람. 백그라운드 쓰기는 에이전트 소유 스킬만, 이번 리뷰에서 읽은 파일만 허용. 사람이 작성한 번들 스킬(`main_agent/skills/`)은 Layer 2.2 카탈로그로 별도 노출.
+
+- **L1 Working Memory (`checkpoints.db`)**: 세션별 런타임 단기 대화 상태 체크포인팅(압축본).
+- **L2 Episodic Memory (`transcript.db` + `episodic.db`)**: 모든 대화·도구 원문을 실시간 기록(`transcript.db`)하고, 유휴 시점에 다중 주제 요약 및 FTS5 색인(`episodic.db`)을 생성하여 2단계 인출(`session_search` ➔ `session_recall`)을 지원합니다.
+- **L3 Semantic Memory (`MEMORY.md` / `USER.md`)**: 에이전트 영구 팩트 및 사용자 프로필을 백그라운드 리뷰를 통해 마크다운으로 관리합니다.
+- **L4 Procedural Memory (`SKILL.md`)**: 반복된 도구 해결 절차를 `SKILL.md`로 학습·저장하고, 프롬프트에는 스킬 카탈로그(이름·설명)만 노출한 뒤 필요 시 `skill_view`로 열람합니다.
 
 ---
 
@@ -89,7 +66,7 @@ frontier_agent_analysis/
 ├── scripts/                          # 🔄 데이터 마이그레이션 스크립트
 │   └── migrate_episodic_to_transcript.py # └── 구 episodic.db messages ➔ transcript.db 이관 스크립트
 │
-├── tests/                            # 🧪 132개 검증 테스트 수트
+├── tests/                            # 🧪 검증 테스트 수트
 │   ├── test_02_claude_code.py        #   └── Claude Code 기본 하네스 테스트
 │   ├── test_prompt_assembler_advanced.py # └── 16대 모듈, 바이패스 주입, MCP 델타 고급 테스트
 │   ├── test_compactor.py             #   └── 압축 파이프라인 단계별·그래프 통합 테스트
@@ -128,10 +105,9 @@ cp .env.example .env
 # .env 파일을 열어 API 키 입력
 ```
 
-
 ---
 
-## ️ UI 및 서버 구동
+## 🖥️ UI 및 서버 구동
 
 ### 1. Chainlit 채팅 UI 구동 (권장)
 ```bash
