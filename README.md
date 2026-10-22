@@ -10,20 +10,23 @@
 
 #### ① 5-Layer 16대 모듈 프롬프트 어셈블러 (`app/middleware/prompt/`)
 - **Layer 1: Global Constitution (Modules 0~3, 5~6)**: 정체성, 보안 가이드, 린 엔지니어링, 비가역적 파괴 작업 승인 규칙, 간결한 톤&스타일, 효율적 출력 정책.
-- **Layer 2: Capabilities & Tool Guide (Module 4)**: Anti-Raw Bash 가드레일, 알파벳순 정렬된 도구 스키마, 온디맨드 스킬 카탈로그.
-- **🔻 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`**: 정적 영역(L1~L2)과 동적 영역(L3~L5)을 분리하여 **KV Cache Hit Rate(97%+) 극대화**.
+- **Layer 2: Tool Guide & Skills (Module 4)**: Anti-Raw Bash 가드레일, 온디맨드 스킬 카탈로그. 도구 정의는 원본처럼 시스템 프롬프트가 아닌 API `tools` 필드로 보내며, 미들웨어가 이름순(내장 → MCP)으로 정렬합니다.
+- **🔻 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`**: 정적 영역(L1~L2, 전 사용자 공용 캐시)과 동적 영역(L3~L5, 세션별)을 분리합니다.
 - **Layer 3: Session Interaction (Module 8)**: 대화형 CLI 명령 안내(`! <cmd>`), 슬래시 커맨드 인식.
-- **Layer 4: Environment & Memory Index (Modules 9~12)**: CWD, Session ID, Date 등 환경 메타데이터, 언어 정책, 출력 스타일, 인출된 시맨틱 메모리.
-- **Layer 5: Resource Control & Project Rules (Modules 13~16)**: MCP 지침, 권한 면제 Scratchpad 샌드박스, FRC(False Response Claim) 방지 수칙, 도구 결과 요약 정책 및 `AGENT.md` 로컬 규칙.
-- **User Context Bypass Injection**: `CLAUDE.md`와 Git 스냅샷 동결(`@lru_cache`, 2000자 절단)을 시스템 프롬프트 외부(`messages[0]`의 `<system-reminder>`)로 1회 우회 주입.
+- **Layer 4: Environment & Memory Index (Modules 9~12)**: CWD, OS, Session ID 등 환경 메타데이터, 언어 정책, 출력 스타일, 인출된 메모리.
+- **Layer 5: Resource Control & Project Rules (Modules 13~16)**: MCP 지침, 권한 면제 Scratchpad 샌드박스, FRC(Function Result Clearing: 오래된 도구 결과 정리) 공지, 도구 결과 요약 정책 및 `AGENT.md` 로컬 규칙.
+- **세션당 1회 계산**: 동적 섹션은 원본 `systemPromptSection`처럼 세션에서 한 번 만들어 재사용합니다. MCP 지침과 메모리(턴마다 에피소드 검색)만 매 호출 다시 계산합니다.
+- **시스템 컨텍스트 / 사용자 컨텍스트**: 원본 `getSystemContext`·`getUserContext`처럼 Git 스냅샷(브랜치·status 2000자 절단·최근 커밋, `@lru_cache` 동결)은 시스템 프롬프트 맨 끝에 `gitStatus:`로, `CLAUDE.md`와 세션 시작 날짜는 대화 맨 앞 별도 `<system-reminder>` 메시지로 넣습니다. 자정이 지나면 앞부분은 그대로 두고 대화 끝에 `date_change` 알림을 붙입니다.
 
-#### ② 5대 컨텍스트 압축 파이프라인 & Amnesia Guard (`app/middleware/compaction/`)
-- **Snip Compact**: 2턴 이상 경과한 오래된 대용량 툴 결과를 1줄 스텁(`[Output snipped]`)으로 변환 (토큰 90%+ 절감, `wrap_model_call` 사본 변환).
-- **Microcompact**: 5,000자 초과 대용량 툴 로그를 결정적 해시 기반 디스크 스왑 파일(`.claude/swaps/`)로 1회 덤프 후 포인터만 잔류 (`wrap_model_call` 사본 변환).
-- **Context Collapse**: 3회 이상 연속 탐색 툴 실행 내역을 단일 접힌 블록으로 병합 (`wrap_model_call` 사본 변환).
-- **Auto-Compact (`before_model`)**: 토큰 임계치 초과 시 `before_model` 훅에서 **이전 턴까지만** 4대 영역 구조화 요약으로 압축하고 현재 진행 중인 턴(도구 호출·결과 쌍 포함)은 보존하여 checkpointer state에 영구 반영(`RemoveMessage(REMOVE_ALL_MESSAGES)`). 원문은 `transcript.db`에 보존되며 압축 이벤트(`kind=compaction`)가 기록됩니다.
-- **Amnesia Guard**: 압축으로 인해 활성 계획(Plan)과 수정 중인 최근 5개 파일 스냅샷이 소실(기억상실)되는 것을 방지하기 위해 복구 어태치먼트를 재주입.
-- **Reactive Compact**: API 413 `prompt_too_long` 에러 발생 시(`ModelFallbackMiddleware`가 413을 가로채지 않고 재전파) 에러를 은폐(Silent Withholding)하고 오래된 대화 20% 절단 후 자동 재시도.
+#### ② Claude Code 컨텍스트 압축 파이프라인 & Amnesia Guard (`app/middleware/compaction/`)
+Claude Code(유출 소스 v2.1.88) `query.ts`의 실행 순서를 따릅니다. 🟢는 원본 소스를 옮긴 단계, 🟡는 원본 파일이 빌드에서 빠져 있어 호출부 흔적으로 재구성한 단계입니다. 단계별 on/off와 수치는 `configs/compaction.config`에서 바꿉니다.
+- **Tool Result Budget** 🟢: 도구 결과가 50,000자를 넘으면 `artifacts/tool-results/<세션>/`에 저장하고 모델에는 `<persisted-output>` 미리보기(2,000자)와 파일 경로만 전달. 한 라운드 합계는 200,000자 예산. `file_read` 결과는 저장하지 않음: 도구가 스스로 분량을 제한하고(이 프로젝트: 기본 250줄), 저장 파일을 다시 읽는 순환도 생기기 때문.
+- **Snip** 🟡: 모델이 `snip` 도구로 `[id:...]` 태그가 붙은 메시지를 지목해 컨텍스트에서 뺌. 도구 호출·결과 쌍은 함께 빠지고 현재 턴은 보호. state에는 원본이 남고 모델 입력에서만 빠짐. 컨텍스트가 임계치의 70%를 넘으면 snip 사용을 권하는 알림을 붙임.
+- **Microcompact (time-based)** 🟢: 마지막 응답 후 60분 이상 지나면(서버 캐시 만료) 최근 5개를 뺀 오래된 도구 결과 본문을 `[Old tool result content cleared]`로 비움. 같은 id로 state를 교체하므로 `transcript.db` 원문은 그대로.
+- **Context Collapse** 🟡 (기본 꺼짐): 컨텍스트가 임계치의 90%에 이르면 완료된 이전 턴을 1개씩 LLM으로 요약해 커밋 로그에 쌓고, 모델 입력에서만 접어서 보여줌. 켜면 Auto-Compact는 발동하지 않음(원본 동작).
+- **Auto-Compact (`before_model`)** 🟢: 토큰 임계치 초과 시 **이전 턴까지만** 원본의 9개 섹션 프롬프트로 요약해 checkpointer state를 교체(`RemoveMessage(REMOVE_ALL_MESSAGES)`). 요약 실패 시 압축하지 않고, 3회 연속 실패하면 세션 내 중단(circuit breaker). 요약 요청 자체가 너무 길면 오래된 API 라운드부터 버리고 최대 3회 재시도. 원문은 `transcript.db`에 보존되며 압축 이벤트(`kind=compaction`)가 기록됩니다.
+- **Amnesia Guard**: 압축 후 활성 계획(Plan)과 최근 5개 파일 스냅샷을 복원 블록으로 재주입 (원본 `POST_COMPACT_MAX_FILES_TO_RESTORE = 5`).
+- **Reactive Compact** 🟡: API 413 `prompt_too_long` 에러 시(`ModelFallbackMiddleware`가 413을 가로채지 않고 재전파) 이전 턴 요약을 시도하고, 안 되면 가장 오래된 API 라운드 20%를 잘라낸 뒤 한 번 재시도.
 
 #### ③ Self-Recovery & Self-Correction 에러 컨트롤 및 가드레일 (`app/middleware/`)
 - **Guardrails (`before_agent`)**: `InputSafetyGuardrail` 및 `TopicAlignmentGuardrail`이 `before_agent` 훅(`can_jump_to=["end"]`)에서 턴당 1회만 검사를 수행하며, 차단 시 메모리 인출을 건너뛰고 `transcript.db`에는 `kind=blocked`로 기록(검색·회상·학습 제외).
@@ -52,7 +55,7 @@ frontier_agent_analysis/
 │   │                                 #   └── chatbot.py, analyst.py, scraper.py
 │   ├── middleware/                   #   📁 체계화된 하네스 미들웨어 패키지
 │   │   ├── prompt/                   #   │   └── prompt_assembler.py (16-Module 5-Layer 조립기)
-│   │   ├── compaction/               #   │   └── compactor.py (before_model Auto-Compact + wrap_model_call), amnesia_guard.py
+│   │   ├── compaction/               #   │   └── compactor.py (Claude Code 압축 파이프라인), amnesia_guard.py
 │   │   ├── error_control/            #   │   └── self_recovery.py, self_correction.py
 │   │   ├── guardrails.py             #   │   └── InputSafety & TopicAlignment (before_agent + jump_to end)
 │   │   ├── memory/                   #   │   └── transcript_store.py, episodic_store.py, review_queue.py, semantic_store.py, memory_middleware.py
@@ -87,7 +90,7 @@ frontier_agent_analysis/
 ├── tests/                            # 🧪 132개 검증 테스트 수트
 │   ├── test_02_claude_code.py        #   └── Claude Code 기본 하네스 테스트
 │   ├── test_prompt_assembler_advanced.py # └── 16대 모듈, 바이패스 주입, MCP 델타 고급 테스트
-│   ├── test_compactor.py             #   └── 5대 압축 파이프라인 정밀 테스트
+│   ├── test_compactor.py             #   └── 압축 파이프라인 단계별·그래프 통합 테스트
 │   └── test_harness_regressions.py   #   └── 원문/색인 분리, 유휴 큐, 가드레일 before_agent, Auto-Compact before_model E2E 회귀 테스트
 │
 ├── .devcontainer/                    # 🐳 GitHub Codespaces 원클릭 실행 환경

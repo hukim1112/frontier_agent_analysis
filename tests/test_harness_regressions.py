@@ -6,7 +6,7 @@ Graph-level regression tests for the harness middleware pipeline.
 
 1. StopHooksMiddleware: @hook_config(can_jump_to=["model"]) + jump_to="model" 자가 수정 루프
 2. AmnesiaGuardMiddleware: thread_id별 파일/계획 추적 격리 (공유 에이전트 인스턴스에서도 누수 없음)
-3. UNSAFE_TO_COLLAPSE_TOOLS: 프로젝트 실제 쓰기/실행 도구명이 ContextCollapse에서 보존되는지
+3. ContextCollapse: 진행 중인 현재 턴은 접지 않고, 접은 뒤에도 원본 메시지는 state에 남는지
 4. 세션 데이터 이원화: transcript.db 원문 기록, 원문 스위치 독립성, HITL 대기 중 기록, 대기 후 요약
 5. 훅 재배치: 가드레일 before_agent 차단, Compactor before_model state 교체, 413 재전파
 6. 사용자 턴 경계 규칙(app.utils.message_markers): 요약·복원 블록·StopHooks 피드백은 턴이 아님
@@ -255,40 +255,39 @@ def test_amnesia_guard_bounds_session_buckets(Guard):
 
 
 # =============================================================================
-# 3. UNSAFE_TO_COLLAPSE_TOOLS uses real project tool names
+# 3. ContextCollapse never folds the in-progress turn
 # =============================================================================
-def _exploration_sequence(middle_tool):
+def _two_turns_with_tools():
+    """완료된 1턴 + 탐색 도구를 연달아 부르는 진행 중인 2턴 (id가 있는 state 메시지)."""
     return [
-        SystemMessage(content="System Rules"),
-        AIMessage(content="", tool_calls=[{"name": "file_read", "args": {}, "id": "1"}]),
-        ToolMessage(content="read", tool_call_id="1", name="file_read"),
-        AIMessage(content="", tool_calls=[{"name": middle_tool, "args": {}, "id": "2"}]),
-        ToolMessage(content="result", tool_call_id="2", name=middle_tool),
-        AIMessage(content="", tool_calls=[{"name": "grep_search", "args": {}, "id": "3"}]),
-        ToolMessage(content="grep", tool_call_id="3", name="grep_search"),
-        HumanMessage(content="Status?"),
+        SystemMessage(content="System Rules", id="sys"),
+        HumanMessage(content="첫 질문", id="h1"),
+        AIMessage(content="첫 답변", id="a1"),
+        HumanMessage(content="저장소를 분석해줘", id="h2"),
+        AIMessage(content="", id="a2", tool_calls=[{"name": "file_read", "args": {}, "id": "c1"}]),
+        ToolMessage(content="RESULT-1", tool_call_id="c1", name="file_read", id="t1"),
+        AIMessage(content="", id="a3", tool_calls=[{"name": "grep_search", "args": {}, "id": "c2"},
+                                                     {"name": "glob_search", "args": {}, "id": "c3"}]),
+        ToolMessage(content="RESULT-2", tool_call_id="c2", name="grep_search", id="t2"),
+        ToolMessage(content="RESULT-3", tool_call_id="c3", name="glob_search", id="t3"),
     ]
 
 
 @pytest.mark.parametrize("ContextCollapse", COLLAPSE_IMPLS)
-@pytest.mark.parametrize("unsafe_tool", [
-    "file_writer", "file_edit", "notebook_edit", "bash_command", "data_query",
-    "chart_generator", "excel_writer", "html_report", "file_converter",
-    "exit_plan", "task_create", "task_update", "memory", "invoke_sub_agent",
-])
-def test_context_collapse_preserves_real_write_tools(ContextCollapse, unsafe_tool, tmp_path):
-    collapse = ContextCollapse(min_consecutive=3, swap_dir=str(tmp_path))
-    messages = _exploration_sequence(unsafe_tool)
-    compacted, modified = collapse.compact(messages)
-    assert modified is False, f"{unsafe_tool} 기록이 접혀서는 안 됩니다"
-    assert len(compacted) == len(messages)
+def test_context_collapse_keeps_current_turn_tool_results(ContextCollapse):
+    """이전 구현은 연속 도구 호출 3개 이상을 턴과 무관하게 접어, 모델이 방금 받은 결과를 보지 못했습니다."""
+    collapse = ContextCollapse(llm=scripted("1턴 요약"))
+    messages = _two_turns_with_tools()
 
+    span = collapse.next_span(messages, [])
+    assert [m.id for m in span] == ["h1", "a1"], "접을 대상은 완료된 이전 턴뿐이어야 합니다"
+    commit = collapse.commit(span)
+    view = collapse.project(messages, [commit])
 
-@pytest.mark.parametrize("ContextCollapse", COLLAPSE_IMPLS)
-def test_context_collapse_still_folds_pure_exploration(ContextCollapse, tmp_path):
-    collapse = ContextCollapse(min_consecutive=3, swap_dir=str(tmp_path))
-    _, modified = collapse.compact(_exploration_sequence("glob_search"))
-    assert modified is True
+    contents = [str(m.content) for m in view]
+    assert all(r in contents for r in ("RESULT-1", "RESULT-2", "RESULT-3"))
+    assert "첫 질문" not in contents and any("1턴 요약" in c for c in contents)
+    assert collapse.next_span(messages, [commit]) is None, "현재 턴만 남으면 더 접지 않습니다"
 
 
 # =============================================================================
@@ -796,7 +795,7 @@ def test_auto_compact_runs_once_per_turn_and_keeps_current_turn_originals(tmp_pa
     @tool
     def big_reader(path: str) -> str:
         """Read a large log file."""
-        return f"[{path}] " + ("LOG " * 1800)  # MicroCompactor 기준(5000자)을 넘는 대형 출력
+        return f"[{path}] " + ("LOG " * 1800)  # 약 7,200자: 압축 임계치를 넘기지만 디스크 저장 기준(50,000자)보다 작음
 
     sem, tr, epi = _memory_stores(tmp_path)
     memory_mw = MemoryMiddleware(sem, epi, transcript_store=tr)
@@ -833,8 +832,9 @@ def test_auto_compact_runs_once_per_turn_and_keeps_current_turn_originals(tmp_pa
     state = out["messages"]
     assert sum(1 for m in state if is_compaction_summary(m)) == 1
     tool_msgs = [m for m in state if isinstance(m, ToolMessage)]
-    assert len(tool_msgs) == 3 and all("microcompacted" not in str(m.content) for m in tool_msgs), \
-        "현재 턴의 도구 결과는 state에 원본으로 남아야 합니다 (Micro 스텁은 모델 입력 사본에만)"
+    assert len(tool_msgs) == 3 and all(str(m.content).startswith("[") and "LOG" in str(m.content)
+                                       for m in tool_msgs), \
+        "현재 턴의 도구 결과는 state에 원본으로 남아야 합니다"
 
     rows = tr.read_session("sess_compact_once", user_id="default", include_hidden=True)
     assert sum(1 for r in rows if r["kind"] == "tool_result") == 3
@@ -875,7 +875,11 @@ def test_user_turn_boundary_rule_ignores_harness_messages():
     assert user_turn_starts(messages) == [2]
     assert last_user_turn_start(messages) == 2
     assert app_stop_hooks.StopHooksMiddleware._count_consecutive_blocks(messages) == 1
-    assert SnipCompactor(age_threshold=1).compact(messages)[1] is False  # 턴이 1개뿐이므로 스니핑 없음
+    # 요약·복원 블록 HumanMessage는 턴이 아니므로, 실제 질문(인덱스 2)부터가 snip할 수 없는 현재 턴
+    for i, m in enumerate(messages):
+        m.id = f"msg-{i:08d}"
+    _, error = SnipCompactor().plan_snip(messages, SnipCompactor.short_id(messages[3].id))
+    assert error == "The current user turn cannot be snipped."
 
     # Reactive 413 슬라이싱은 요약을 잘라내지 않고 앞에 고정
     sliced = app_compactor.ReactiveCompactor().handle_overflow([

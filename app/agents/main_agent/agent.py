@@ -190,9 +190,11 @@ async def create_agent_executor(checkpointer=None):
     # 4-5. Claude Code 표준 16-Module 5-Layer Prompt Assembler 구성
     #    - 스킬: 에이전트 내장 skills/ 만 스캔 (Mission 04 금융 스킬도 이 폴더에 설치)
     #    - skills/SKILL.md(스킬 실행 지침)는 Layer 2.2 카탈로그 상단에만 주입 (L5 중복 주입 안 함)
-    #    - claude_code_modules=True: 16대 표준 모듈 + Static/Dynamic 캐시 경계 분리
-    #    - bypass_user_context=True: 첫 번째 HumanMessage 앞단에 CLAUDE.md(또는 AGENT.md)와
-    #      동결된 Git 스냅샷(git status + recent commits)을 <system-reminder>로 1회 우회 주입
+    #    - claude_code_modules=True: 16대 표준 모듈 + Static/Dynamic 캐시 경계 분리 (동적 섹션은 세션당 1회 계산)
+    #    - bypass_user_context=True: 원본 Claude Code처럼
+    #      · git 스냅샷(브랜치·status·최근 커밋)은 시스템 프롬프트 맨 끝에 gitStatus로
+    #      · CLAUDE.md(또는 AGENT.md) + 세션 시작 날짜는 대화 맨 앞 별도 <system-reminder> 메시지로
+    #      (자정이 지나면 before_model이 대화 끝에 date_change 알림을 추가)
     skill_guidelines = str(SKILLS_DIR / "SKILL.md") if (SKILLS_DIR / "SKILL.md").exists() else None
     skill_builder = SkillPromptBuilder(
         skills_dirs=[str(SKILLS_DIR)],
@@ -276,15 +278,16 @@ async def create_agent_executor(checkpointer=None):
             )
             middleware.append(amnesia_guard)
         auto_cfg = compaction_cfg.get("auto", {})
-        micro_cfg = compaction_cfg.get("micro", {})
         middleware.append(
             create_compactor_middleware(
                 llm=llm,
                 threshold_tokens=auto_cfg.get("threshold_tokens", 8000),
                 amnesia_guard=amnesia_guard,
-                swap_dir=micro_cfg.get("swap_dir", "./artifacts/swaps"),
+                max_consecutive_failures=auto_cfg.get("max_consecutive_failures", 3),
                 # 원문 기록이 꺼져 있으면 압축 이벤트도 transcript.db에 남기지 않음
                 transcript_store=transcript_store if tr_cfg.get("enabled", True) else None,
+                # 단계별 on/off와 수치 (tool_result_budget / snip / micro / collapse / auto / reactive)
+                config=compaction_cfg,
             )
         )
 

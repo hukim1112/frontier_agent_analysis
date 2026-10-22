@@ -2,8 +2,9 @@
 ===============================================================================
 Advanced Tests for Claude Code 16-Module Prompt Assembler
 ===============================================================================
-Validates: 16-module factory, alphabetical tool sort, User Context Bypass,
-           Git snapshot freezing, MCP Delta, Scratchpad, Middleware extensions.
+Validates: 16-module factory, alphabetical tool sort, User Context (separate message),
+           Git snapshot (system context), session-cached sections, date_change,
+           MCP Delta, Scratchpad, Middleware extensions.
 """
 
 import os
@@ -39,9 +40,17 @@ from app.middleware.prompt.prompt_assembler import (
     prepend_user_context,
     attach_mcp_delta_if_needed,
     create_session_scratchpad,
+    sort_tools_for_cache,
     # Constants
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     MAX_STATUS_CHARS,
+)
+from app.utils.message_markers import (
+    ORIGIN_DATE_CHANGE,
+    ORIGIN_USER_CONTEXT,
+    is_user_turn_start,
+    last_user_turn_start,
+    message_origin,
 )
 
 
@@ -170,8 +179,8 @@ class TestPromptAssemblerModules:
         assert "IMPORTANT" in static  # Module 2 or 3
         assert "Custom project rules." in static  # 사용자 규칙 합성
 
-        # L2 도구
-        assert "read_file" in static
+        # L2: 도구 사용 원칙(Module 4)만 들어가고, 도구 정의는 원본처럼 API tools 필드로 보냅니다.
+        assert "read_file" not in static
         assert "Anti-Raw Bash" in static or "FileRead" in static  # Module 4
 
         # 경계선
@@ -208,7 +217,7 @@ class TestPromptAssemblerModules:
         assert "key findings" in dynamic.lower() or "persist" in dynamic.lower()
 
     def test_full_assembly_structure(self):
-        """assemble()가 정확히 3개 메시지(SystemMessage x2 + HumanMessage)를 반환하는지 검증."""
+        """assemble(): SystemMessage x2 + 사용자 컨텍스트 메시지 + 사용자 질문."""
         assembler = PromptAssembler(
             system_rules="Test rules",
             tool_schemas=[{"name": "z_tool", "description": "Z"}, {"name": "a_tool", "description": "A"}],
@@ -216,13 +225,51 @@ class TestPromptAssemblerModules:
         )
         messages = assembler.assemble(
             user_input="Hello",
-            session_context={"cwd": "/workspace", "session_id": "test"}
+            session_context={"cwd": "/workspace", "session_id": "test", "current_date": "2026-10-23"},
+            claude_md_content="Use pytest.",
         )
-        assert len(messages) == 3
+        assert len(messages) == 4
         assert isinstance(messages[0], SystemMessage)  # Static (L1+L2+Boundary)
         assert isinstance(messages[1], SystemMessage)  # Dynamic (L3+L4+L5)
-        assert isinstance(messages[2], HumanMessage)
+        assert message_origin(messages[2]) == ORIGIN_USER_CONTEXT
+        assert "# claudeMd\nUse pytest." in messages[2].content
+        assert "Today's date is 2026-10-23." in messages[2].content
+        assert messages[3].content == "Hello"
         assert SYSTEM_PROMPT_DYNAMIC_BOUNDARY in messages[0].content
+
+    def test_date_and_git_are_not_in_system_env(self):
+        """원본 env_info에는 날짜·git 상태가 없습니다. git은 시스템 프롬프트 맨 끝(gitStatus)으로 갑니다."""
+        assembler = PromptAssembler(system_rules="", claude_code_modules=True)
+        dynamic = assembler.build_dynamic_content(
+            {"session_id": "s1", "current_date": "2026-10-23", "git_status": "Current branch: main"}
+        )
+        assert "Current Date" not in dynamic and "2026-10-23" not in dynamic
+        assert dynamic.rstrip().endswith("gitStatus: Current branch: main")
+
+    def test_dynamic_sections_are_computed_once_per_session(self):
+        """systemPromptSection: 같은 세션에서는 처음 계산한 값을 재사용하고, 새 세션은 새로 계산합니다."""
+        assembler = PromptAssembler(system_rules="", claude_code_modules=True)
+        first = assembler.build_dynamic_content({"session_id": "s1", "cwd": "/a"})
+        again = assembler.build_dynamic_content({"session_id": "s1", "cwd": "/b"})
+        other = assembler.build_dynamic_content({"session_id": "s2", "cwd": "/b"})
+        assert first == again and "/a" in again
+        assert "/b" in other
+        assembler.clear_session_sections("s1")
+        assert "/b" in assembler.build_dynamic_content({"session_id": "s1", "cwd": "/b"})
+
+    def test_memory_section_is_recomputed_every_call(self):
+        """recalled_memory는 턴마다 바뀌므로(에피소드 검색) 캐시하지 않습니다."""
+        assembler = PromptAssembler(system_rules="", claude_code_modules=True)
+        assert "first recall" in assembler.build_dynamic_content({"session_id": "s1", "recalled_memory": "first recall"})
+        assert "second recall" in assembler.build_dynamic_content({"session_id": "s1", "recalled_memory": "second recall"})
+
+    def test_session_date_is_fixed_within_session(self):
+        assembler = PromptAssembler(system_rules="", claude_code_modules=True)
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            assert assembler.session_date("s1") == "2026-10-23"
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-24"):
+            assert assembler.session_date("s1") == "2026-10-23"
+            assert assembler.session_date("s2") == "2026-10-24"
 
 
 # =============================================================================
@@ -247,6 +294,11 @@ class TestAlphabeticalToolSort:
         idx_z = formatted.index("z_write")
         assert idx_a < idx_m < idx_z
 
+    def test_sort_tools_for_cache_keeps_mcp_after_builtins(self):
+        tools = [{"name": "mcp__db__query"}, {"name": "z_write"}, {"name": "mcp__a__x"}, {"name": "a_read"}]
+        assert [t["name"] for t in sort_tools_for_cache(tools)] == [
+            "a_read", "z_write", "mcp__a__x", "mcp__db__query"]
+
     def test_tool_sort_determinism(self):
         """동일한 도구 집합은 항상 동일한 출력을 생성해야 함 (캐시 일관성)."""
         tools = [
@@ -265,9 +317,9 @@ class TestAlphabeticalToolSort:
 # =============================================================================
 
 class TestUserContextBypass:
-    """prepend_user_context가 messages[0]에 <system-reminder>를 정확히 1회 주입하는지 검증."""
+    """prepend_user_context: 원본 prependUserContext처럼 대화 맨 앞에 별도 메시지를 1회 끼워 넣는지 검증."""
 
-    def test_injection_adds_system_reminder(self):
+    def test_injection_adds_separate_message(self):
         messages = [
             HumanMessage(content="What is this project?"),
             AIMessage(content="Let me check."),
@@ -275,35 +327,36 @@ class TestUserContextBypass:
         result = prepend_user_context(
             messages,
             claude_md_content="Always use pytest for testing.",
-            git_snapshot="main: (clean)\nRecent commits: abc1234",
+            current_date="2026-10-23",
         )
-        assert len(result) == 2
-        assert "<system-reminder>" in result[0].content
-        assert "Always use pytest for testing." in result[0].content
-        assert "abc1234" in result[0].content
-        assert "What is this project?" in result[0].content
+        assert len(result) == 3
+        ctx_msg = result[0]
+        assert message_origin(ctx_msg) == ORIGIN_USER_CONTEXT
+        assert ctx_msg.content.startswith("<system-reminder>\nAs you answer the user's questions")
+        assert "# claudeMd\nAlways use pytest for testing." in ctx_msg.content
+        assert "# currentDate\nToday's date is 2026-10-23." in ctx_msg.content
+        assert "may or may not be relevant" in ctx_msg.content
+        assert result[1].content == "What is this project?", "첫 사용자 메시지는 고치지 않습니다"
 
     def test_injection_is_idempotent(self):
         """이미 주입된 경우 재주입하지 않아야 함."""
-        messages = [
-            HumanMessage(content="<system-reminder>\nAlready injected.\n</system-reminder>\n\nHello"),
-        ]
-        result = prepend_user_context(
-            messages,
-            claude_md_content="New content",
-            git_snapshot="new snapshot",
-        )
-        # 이미 <system-reminder>가 있으므로 변경 없어야 함
-        assert result[0].content == messages[0].content
+        once = prepend_user_context([HumanMessage(content="Hello")], claude_md_content="Rules",
+                                    current_date="2026-10-23")
+        twice = prepend_user_context(once, claude_md_content="New content", current_date="2026-10-24")
+        assert twice == once
+
+    def test_user_context_is_not_a_user_turn(self):
+        result = prepend_user_context([HumanMessage(content="Hello")], current_date="2026-10-23")
+        assert last_user_turn_start(result) == 1
 
     def test_injection_skipped_when_no_content(self):
         """주입할 내용이 없으면 원본 메시지 그대로 반환."""
         messages = [HumanMessage(content="Hello")]
-        result = prepend_user_context(messages, claude_md_content="", git_snapshot="")
-        assert result[0].content == "Hello"
+        result = prepend_user_context(messages, claude_md_content="", current_date="")
+        assert result == messages
 
-    def test_injection_preserves_non_human_messages(self):
-        """SystemMessage 뒤에 HumanMessage가 있는 경우 올바르게 처리."""
+    def test_injection_goes_after_system_messages(self):
+        """SystemMessage 뒤, 첫 대화 메시지 앞에 들어갑니다."""
         messages = [
             SystemMessage(content="System"),
             HumanMessage(content="User query"),
@@ -314,7 +367,8 @@ class TestUserContextBypass:
         )
         assert isinstance(result[0], SystemMessage)
         assert result[0].content == "System"
-        assert "<system-reminder>" in result[1].content
+        assert message_origin(result[1]) == ORIGIN_USER_CONTEXT
+        assert result[2].content == "User query"
 
     def test_injection_empty_messages(self):
         """빈 메시지 리스트에 대해 안전하게 처리."""
@@ -329,33 +383,56 @@ class TestUserContextBypass:
 class TestGitSnapshotFreezing:
     """Git 스냅샷이 2,000자 상한선을 적용하고 동결되는지 검증."""
 
+    @staticmethod
+    def _git_outputs(status="M file.py", log="abc1234 commit msg"):
+        # rev-parse(is-inside) → branch → origin HEAD → user.name → status → log
+        return ["true", "feature-x", "origin/main", "Alice", status, log]
+
+    @patch("app.middleware.prompt.prompt_assembler.subprocess.check_output")
+    def test_snapshot_matches_original_format(self, mock_check_output):
+        get_frozen_git_snapshot.cache_clear()
+        mock_check_output.side_effect = self._git_outputs()
+        result = get_frozen_git_snapshot(cwd="/fmt")
+        assert result.startswith("This is the git status at the start of the conversation.")
+        assert "Current branch: feature-x" in result
+        assert "Main branch (you will usually use this for PRs): main" in result
+        assert "Git user: Alice" in result
+        assert "Status:\nM file.py" in result
+        assert result.endswith("Recent commits:\nabc1234 commit msg")
+        get_frozen_git_snapshot.cache_clear()
+
     @patch("app.middleware.prompt.prompt_assembler.subprocess.check_output")
     def test_snapshot_truncation(self, mock_check_output):
         # lru_cache 초기화
         get_frozen_git_snapshot.cache_clear()
 
         long_status = "M  " + "a" * 3000 + ".py"
-        mock_check_output.side_effect = [long_status, "abc1234 Initial commit"]
+        mock_check_output.side_effect = self._git_outputs(status=long_status)
 
         result = get_frozen_git_snapshot(cwd="/test")
-        assert "truncated" in result
-        assert len(result.split("snapshot in time")[0]) < MAX_STATUS_CHARS + 500
+        assert "truncated because it exceeds 2k characters" in result
+        status_part = result.split("Status:\n")[1].split("\n\nRecent commits")[0]
+        assert len(status_part) < MAX_STATUS_CHARS + 200
         get_frozen_git_snapshot.cache_clear()
 
     @patch("app.middleware.prompt.prompt_assembler.subprocess.check_output")
     def test_snapshot_frozen(self, mock_check_output):
-        """lru_cache에 의해 동결되므로 두 번 호출해도 subprocess가 한 번만 실행."""
+        """lru_cache에 의해 동결되므로 두 번 호출해도 git은 한 번만 실행."""
         get_frozen_git_snapshot.cache_clear()
 
-        mock_check_output.side_effect = [
-            "M file.py",
-            "abc1234 commit msg",
-        ]
+        mock_check_output.side_effect = self._git_outputs()
         result1 = get_frozen_git_snapshot(cwd="/freeze_test")
         result2 = get_frozen_git_snapshot(cwd="/freeze_test")
 
         assert result1 == result2
-        assert mock_check_output.call_count == 2  # status + log = 2 calls (1 invocation)
+        assert mock_check_output.call_count == 6  # 1회 수집분만
+        get_frozen_git_snapshot.cache_clear()
+
+    @patch("app.middleware.prompt.prompt_assembler.subprocess.check_output")
+    def test_snapshot_not_a_repo(self, mock_check_output):
+        get_frozen_git_snapshot.cache_clear()
+        mock_check_output.side_effect = ["false"]
+        assert get_frozen_git_snapshot(cwd="/plain_dir") == ""
         get_frozen_git_snapshot.cache_clear()
 
     @patch("app.middleware.prompt.prompt_assembler.subprocess.check_output")
@@ -568,22 +645,69 @@ class TestMiddlewareBypass:
         def dummy_handler(req):
             return req
 
+        request = request.override(state={**request.state, "session_start_date": "2026-10-23"})
         # Mock git snapshot to avoid real git calls
         with patch(
             "app.middleware.prompt.prompt_assembler.get_frozen_git_snapshot",
-            return_value="M file.py\nRecent commits: abc1234"
+            return_value="Current branch: main\n\nRecent commits:\nabc1234"
         ):
             modified_req = middleware.wrap_model_call(request, dummy_handler)
 
-        # 3 messages: Static System + Dynamic System + HumanMessage (with bypass)
-        assert len(modified_req.messages) == 3
+        # 4 messages: Static System + Dynamic System(+gitStatus) + 사용자 컨텍스트 + 사용자 질문
+        assert len(modified_req.messages) == 4
+        assert modified_req.messages[1].content.rstrip().endswith("abc1234")
+        assert "gitStatus: Current branch: main" in modified_req.messages[1].content
 
-        # HumanMessage에 <system-reminder>가 주입되었는지 확인
-        human_msg = modified_req.messages[2]
-        assert isinstance(human_msg, HumanMessage)
-        assert "<system-reminder>" in human_msg.content
-        assert "Always use type hints." in human_msg.content
-        assert "Hello World" in human_msg.content
+        ctx_msg = modified_req.messages[2]
+        assert message_origin(ctx_msg) == ORIGIN_USER_CONTEXT
+        assert "Always use type hints." in ctx_msg.content
+        assert "Today's date is 2026-10-23." in ctx_msg.content, "state에 고정된 세션 시작 날짜를 씁니다"
+        assert modified_req.messages[3].content == "Hello World"
+
+    def test_middleware_sorts_tools(self):
+        from langchain.agents.middleware import ModelRequest
+
+        middleware = create_prompt_assembler_middleware(PromptAssembler(system_rules="", claude_code_modules=True))
+        tools = [{"name": "mcp__db__q"}, {"name": "z_tool"}, {"name": "a_tool"}]
+        request = ModelRequest(
+            messages=[HumanMessage(content="hi")], model="mock-model", tools=tools, tool_choice="auto",
+            model_settings={}, state={"messages": []}, runtime=MagicMock(context=None, config=None,
+                                                                         execution_info=None),
+        )
+        out = middleware.wrap_model_call(request, lambda req: req)
+        assert [t["name"] for t in out.tools] == ["a_tool", "z_tool", "mcp__db__q"]
+
+
+# =============================================================================
+# Test: Session date & date_change (before_model)
+# =============================================================================
+
+class TestDateChange:
+    """원본 getDateChangeAttachments: 첫 호출은 기록만, 날짜가 바뀌면 대화 끝에 알림."""
+
+    def _mw(self):
+        return create_prompt_assembler_middleware(PromptAssembler(system_rules="", claude_code_modules=True))
+
+    def test_first_call_records_date_only(self):
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            update = self._mw().before_model({"messages": []})
+        assert update == {"session_start_date": "2026-10-23", "last_emitted_date": "2026-10-23"}
+
+    def test_same_day_does_nothing(self):
+        state = {"messages": [], "session_start_date": "2026-10-23", "last_emitted_date": "2026-10-23"}
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            assert self._mw().before_model(state) is None
+
+    def test_midnight_appends_notice_and_keeps_start_date(self):
+        state = {"messages": [], "session_start_date": "2026-10-23", "last_emitted_date": "2026-10-23"}
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-24"):
+            update = self._mw().before_model(state)
+        assert "session_start_date" not in update, "앞부분(사용자 컨텍스트)의 날짜는 바꾸지 않습니다"
+        assert update["last_emitted_date"] == "2026-10-24"
+        notice = update["messages"][0]
+        assert message_origin(notice) == ORIGIN_DATE_CHANGE
+        assert "Today's date is now 2026-10-24" in notice.content
+        assert not is_user_turn_start(notice)
 
     def test_middleware_without_bypass(self):
         """bypass_user_context=False 시 기존과 동일한 동작."""

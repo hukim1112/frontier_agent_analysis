@@ -10,6 +10,14 @@
    - compaction_summary : AutoCompactor가 만든 이전 대화 요약
    - amnesia_restore    : AmnesiaGuard가 만든 작업 맥락(파일·계획) 복원 블록
    - stop_hook_feedback : StopHooks가 넣은 코드 검증 실패 피드백
+   아래 출처는 Compactor가 모델 입력 사본에만 넣고 state에는 저장하지 않습니다.
+   - context_collapse   : ContextCollapse가 접은 이전 턴 요약
+   - snip_boundary      : Snip으로 제거된 구간 표시
+   - context_efficiency : Snip 사용을 권하는 알림
+   - compaction_marker  : 413 대응·요약 재시도에서 앞부분을 잘라냈다는 표시
+   PromptAssembler가 넣는 메시지:
+   - user_context       : CLAUDE.md + 세션 시작 날짜 (모델 입력 사본의 맨 앞, state에는 저장 안 함)
+   - date_change        : 자정이 지나 날짜가 바뀌었다는 알림 (state 끝에 저장)
 2. 사용자 턴의 시작 = 출처 표식이 없는 HumanMessage.
 3. 표식이 없는 구버전 메시지(체크포인터에 남은 이전 버전 state)는 내용 머리말로 판별합니다.
 
@@ -25,6 +33,12 @@ ORIGIN_COMPACTION_SUMMARY = "compaction_summary"
 ORIGIN_AMNESIA_RESTORE = "amnesia_restore"
 ORIGIN_STOP_HOOK = "stop_hook_feedback"
 COMPACTION_ORIGINS = frozenset({ORIGIN_COMPACTION_SUMMARY, ORIGIN_AMNESIA_RESTORE})
+ORIGIN_CONTEXT_COLLAPSE = "context_collapse"
+ORIGIN_SNIP_BOUNDARY = "snip_boundary"
+ORIGIN_CONTEXT_EFFICIENCY = "context_efficiency"
+ORIGIN_COMPACTION_MARKER = "compaction_marker"
+ORIGIN_USER_CONTEXT = "user_context"
+ORIGIN_DATE_CHANGE = "date_change"
 
 # 원문 저장소(transcript.db)에 기록하지 않을 메시지 표식 (압축 요약은 record_compaction()으로 따로 기록)
 TRANSCRIPT_SKIP_KEY = "transcript_skip"
@@ -33,6 +47,9 @@ TRANSCRIPT_SKIP_KEY = "transcript_skip"
 COMPACTION_SUMMARY_HEADER = "[Compaction Summary: Previous Conversation]"
 AMNESIA_RESTORE_HEADER = "[Compaction Amnesia Guard: Restoring Recent Work Context]"
 STOP_HOOK_TAG = "[stop_hook_blocking]"
+CONTEXT_COLLAPSE_HEADER = "[Context Collapse: Earlier Turn Summarized]"
+SNIP_BOUNDARY_HEADER = "[Snip Boundary]"
+CONTEXT_EFFICIENCY_HEADER = "[Context Efficiency Reminder]"
 AUTO_GENERATED_NOTE = (
     "(This message was generated automatically by the agent harness. "
     "It is NOT a new request from the user.)"

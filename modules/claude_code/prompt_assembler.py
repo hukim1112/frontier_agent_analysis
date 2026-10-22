@@ -2,43 +2,47 @@
 ===============================================================================
 [H-05] Claude Code 16-Module Prompt Assembler with Cache Control & Middleware
 ===============================================================================
-Source: Claude Code Architecture Spec & Frontier Agent Lab
+Source: Claude Code v2.1.88 (constants/prompts.ts, constants/systemPromptSections.ts,
+        context.ts, utils/api.ts, utils/attachments.ts, tools.ts)
 
 Claude Code 표준 5계층 × 16대 프롬프트 모듈 조립기
-(Prompt Caching, User Context Bypass Injection, MCP Delta, Scratchpad Sandbox)
+("5계층"과 "16모듈"은 이 강의의 묶음 이름입니다. 원본의 조립 순서는 아래 [요청 구조]와 같습니다.)
 
-[STATIC PREFIX: GPU KV-Cache HIT 🎯]
-- Layer 1: Global Constitution (Modules 0-3, 5-6)
-- Layer 2: Tool Guide & Schemas (Module 4) — Alphabetical Sort
-- ⚡ __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ (Module 7)
-
-[DYNAMIC SUFFIX: 매 턴/세션 가변 영역 ⚡]
-- Layer 3: Session Interaction & Skills (Module 8)
-- Layer 4: Environment Metadata & Memory Index (Modules 9-12)
-- Layer 5: Resource Control & MCP & Compression (Modules 13-16)
-
-[USER CONTEXT BYPASS: messages[0] 우회 주입 — 캐시 격리]
-- CLAUDE.md + Git Snapshot → <system-reminder> 태그로 첫 HumanMessage에 1회 동결 주입
-- MCP Delta → <attachment type='mcp_instructions_delta'> 태그로 현재 턴 HumanMessage 꼬리에 주입
+[요청 구조] 앞쪽일수록 잘 안 바뀌고, 앞부분이 같은 만큼 프롬프트 캐시가 재사용됩니다.
+  ① 도구 정의     : API tools 필드. 이름순 정렬(내장 → MCP)            tools.ts
+  ② STATIC PREFIX : Layer 1 (Modules 0-3, 5-6) + Layer 2 (Module 4)      prompts.ts getSystemPrompt
+  ⚡ __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ (Module 7): 여기까지 전 사용자 공용 캐시
+  ③ DYNAMIC       : Layer 3 (Module 8) + Layer 4 (Modules 9-12) + Layer 5 (Modules 13-16)
+                    세션당 1회 계산 후 재사용 (systemPromptSection), MCP·메모리만 매 턴 계산
+  ④ 시스템 컨텍스트: gitStatus 스냅샷을 시스템 프롬프트 맨 끝에 덧붙임    appendSystemContext
+  ⑤ 사용자 컨텍스트: CLAUDE.md + 세션 시작 날짜를 대화 맨 앞 별도 메시지로 prependUserContext
+  ⑥ 대화           : 뒤에 붙기만 함. 자정이 지나면 끝에 date_change 알림   getDateChangeAttachments
 
 통합 미들웨어: PromptAssemblerMiddleware (AgentMiddleware 상속)
 - merge_system=False: SystemMessage 2개 (Static cache_control: ephemeral + Dynamic)
 - merge_system=True : SystemMessage 1개 (단일 System Prompt로 결합 출력)
-- bypass_user_context=True: CLAUDE.md & Git 상태를 L5 대신 messages[0]로 우회 주입
+- bypass_user_context=True: ④ git 스냅샷 + ⑤ 사용자 컨텍스트 메시지 주입
+- before_model: 세션 시작 날짜를 state에 고정하고, 날짜가 바뀌면 date_change 알림을 state에 추가
 ===============================================================================
 """
 
 import os
-import json
 import functools
 import subprocess
 import tempfile
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union, Callable
+from typing_extensions import NotRequired
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, AgentState
 
-from .message_markers import last_user_turn_start
+from .message_markers import (
+    ORIGIN_DATE_CHANGE,
+    ORIGIN_USER_CONTEXT,
+    last_user_turn_start,
+    message_origin,
+    origin_kwargs,
+)
 
 
 # =============================================================================
@@ -47,6 +51,18 @@ from .message_markers import last_user_turn_start
 
 MAX_STATUS_CHARS = 2000  # Claude Code MAX_STATUS_CHARS 상한선
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
+
+# utils/api.ts prependUserContext()의 문구
+USER_CONTEXT_INTRO = "As you answer the user's questions, you can use the following context:"
+USER_CONTEXT_FOOTER = (
+    "IMPORTANT: this context may or may not be relevant to your tasks. "
+    "You should not respond to this context unless it is highly relevant to your task."
+)
+
+
+def get_local_iso_date() -> str:
+    """원본 getLocalISODate(): 로컬 시간 기준 YYYY-MM-DD."""
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 # =============================================================================
@@ -154,7 +170,7 @@ def get_output_efficiency_section() -> str:
     )
 
 
-# ── L2: Tool Guide & Schemas (Module [4]) ──
+# ── L2: Tool Guide (Module [4]) ──
 
 def get_using_your_tools_section() -> str:
     """[Module 4] getUsingYourToolsSection — 전용 도구 우선 & 병렬 실행 원칙.
@@ -162,6 +178,7 @@ def get_using_your_tools_section() -> str:
     Source: src/constants/prompts.ts:269
     - shell(cat, sed, grep) 대신 전용 도구(FileRead, FileEdit, Grep, Glob) 강제
     - 독립적 도구 호출은 반드시 병렬(Parallel)로 일괄 실행
+    ※ 도구 정의(스키마) 자체는 시스템 프롬프트가 아니라 API tools 필드로 전달됩니다.
     """
     return (
         "Tool Usage Rules (Anti-Raw Bash):\n"
@@ -208,8 +225,11 @@ def get_memory_index_section(memory_content: str) -> str:
 def get_env_info_section(cwd: str, host_os: str, session_id: str, **kwargs) -> str:
     """[Module 10] env_info_simple — 런타임 실행 환경 주입.
 
-    Source: src/constants/prompts.ts:606
+    Source: src/constants/prompts.ts:651 computeSimpleEnvInfo
     - CWD, 호스트 OS, 모델 ID, 세션 ID 주입
+    - 원본 env_info에는 날짜와 git 상태가 없습니다. 날짜는 사용자 컨텍스트(⑤),
+      git 상태는 시스템 컨텍스트(④)로 따로 보냅니다. current_date / git_status는
+      Claude Code 모드가 아닌 하위 호환 경로에서만 넘어옵니다.
     """
     items = [
         f"- Working Directory (CWD): {cwd}",
@@ -220,8 +240,6 @@ def get_env_info_section(cwd: str, host_os: str, session_id: str, **kwargs) -> s
         items.append(f"- Model: {kwargs['model_id']}")
     if kwargs.get("current_date"):
         items.append(f"- Current Date: {kwargs['current_date']}")
-    else:
-        items.append(f"- Current Date: {datetime.now().strftime('%Y-%m-%d')}")
     if kwargs.get("user_permission"):
         items.append(f"- User Permission: {kwargs['user_permission']}")
     if kwargs.get("active_project"):
@@ -317,100 +335,158 @@ def get_summarize_tool_results_section() -> str:
 
 
 # =============================================================================
-# User Context Bypass Injection (CLAUDE.md & Git Snapshot)
+# ① Tool ordering (tools.ts assembleToolPool)
 # =============================================================================
 
-@functools.lru_cache(maxsize=1)
+def _tool_name(tool: Any) -> str:
+    if isinstance(tool, dict):
+        return str(tool.get("name", ""))
+    return str(getattr(tool, "name", "") or "")
+
+
+def sort_tools_for_cache(tools: Optional[list]) -> list:
+    """도구를 이름순으로 정렬합니다. 내장 도구 먼저, MCP 도구(mcp__*)는 뒤에 따로 정렬합니다.
+
+    Source: src/tools.ts:356-364
+    - 도구 정의는 요청의 맨 앞에 오므로, 불러오는 순서가 실행마다 달라지면 전체 캐시가 깨집니다.
+    - 전체를 한 번에 정렬하지 않는 이유: MCP 도구가 내장 도구 사이에 끼면, MCP 서버가
+      연결·해제될 때마다 내장 도구 구간의 캐시까지 깨지기 때문입니다.
+    """
+    tools = list(tools or [])
+    builtin = sorted((t for t in tools if not _tool_name(t).startswith("mcp__")), key=_tool_name)
+    mcp = sorted((t for t in tools if _tool_name(t).startswith("mcp__")), key=_tool_name)
+    return builtin + mcp
+
+
+# =============================================================================
+# ④ System Context: Git Snapshot (context.ts getGitStatus / getSystemContext)
+# =============================================================================
+
+def _git(args: List[str], cwd: str = "") -> str:
+    kwargs = {"text": True, "stderr": subprocess.DEVNULL, "timeout": 5}
+    if cwd:
+        kwargs["cwd"] = cwd
+    return subprocess.check_output(["git", "--no-optional-locks", *args], **kwargs).strip()
+
+
+@functools.lru_cache(maxsize=8)
 def get_frozen_git_snapshot(cwd: str = "") -> str:
-    """세션 시작 시 단 1회만 수집하고 영구 동결하는 Git 스냅샷.
+    """세션 시작 시 단 1회만 수집하고 동결하는 Git 스냅샷 (git 저장소가 아니면 "").
 
     Source: src/context.ts:36 — `export const getGitStatus = memoize(async () => ...)`
-    - MAX_STATUS_CHARS (2,000자) 상한선 적용
-    - 세션 중 Git 상태가 바뀌어도 이 스냅샷은 불변 유지 (Snapshot Freeze 철학)
+    - 현재 브랜치, 기본 브랜치, git 사용자, status(2,000자 상한), 최근 커밋 5개
+    - 세션 중 Git 상태가 바뀌어도 이 스냅샷은 불변 유지 (최신 상태는 모델이 git status를 직접 실행)
     """
     try:
-        kwargs = {"text": True, "stderr": subprocess.DEVNULL, "timeout": 5}
-        if cwd:
-            kwargs["cwd"] = cwd
-
-        status = subprocess.check_output(
-            ["git", "status", "--short"], **kwargs
-        ).strip()
-        log = subprocess.check_output(
-            ["git", "log", "--oneline", "-n", "5"], **kwargs
-        ).strip()
-
-        # MAX_STATUS_CHARS 상한선 적용
-        if len(status) > MAX_STATUS_CHARS:
-            status = status[:MAX_STATUS_CHARS] + (
-                "\n...(truncated >2k chars. Use BashTool('git status') for full status)"
-            )
-
-        return (
-            "This is the git status at the start of the conversation. "
-            "Note that this status is a snapshot in time, and will not update during the conversation.\n"
-            f"{status or '(clean)'}\n\nRecent commits:\n{log}"
-        )
+        if _git(["rev-parse", "--is-inside-work-tree"], cwd) != "true":
+            return ""
+        branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+        try:
+            main_branch = _git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd).split("/", 1)[-1]
+        except Exception:
+            main_branch = "main"
+        try:
+            user_name = _git(["config", "user.name"], cwd)
+        except Exception:
+            user_name = ""
+        status = _git(["status", "--short"], cwd)
+        log = _git(["log", "--oneline", "-n", "5"], cwd)
     except Exception:
         return ""
+
+    if len(status) > MAX_STATUS_CHARS:
+        status = status[:MAX_STATUS_CHARS] + (
+            "\n... (truncated because it exceeds 2k characters. "
+            'If you need more information, run "git status" using BashTool)'
+        )
+
+    parts = [
+        "This is the git status at the start of the conversation. "
+        "Note that this status is a snapshot in time, and will not update during the conversation.",
+        f"Current branch: {branch}",
+        f"Main branch (you will usually use this for PRs): {main_branch}",
+    ]
+    if user_name:
+        parts.append(f"Git user: {user_name}")
+    parts += [f"Status:\n{status or '(clean)'}", f"Recent commits:\n{log}"]
+    return "\n\n".join(parts)
+
+
+def append_system_context(system_text: str, context: Dict[str, str]) -> str:
+    """시스템 컨텍스트(gitStatus 등)를 시스템 프롬프트 맨 끝에 `key: value` 줄로 덧붙입니다.
+
+    Source: src/utils/api.ts appendSystemContext()
+    """
+    block = "\n".join(f"{key}: {value}" for key, value in context.items() if value)
+    return f"{system_text}\n\n{block}" if block else system_text
+
+
+# =============================================================================
+# ⑤ User Context: CLAUDE.md + 날짜 (context.ts getUserContext / utils/api.ts prependUserContext)
+# =============================================================================
+
+def build_user_context(claude_md_content: str = "", current_date: str = "") -> Dict[str, str]:
+    """원본 getUserContext()와 같은 키: claudeMd(있을 때만) + currentDate."""
+    context: Dict[str, str] = {}
+    if claude_md_content and claude_md_content.strip():
+        context["claudeMd"] = claude_md_content.strip()
+    if current_date:
+        context["currentDate"] = f"Today's date is {current_date}."
+    return context
+
+
+def make_user_context_message(context: Dict[str, str]) -> HumanMessage:
+    """사용자 컨텍스트를 담은 별도 메시지 (사용자 턴이 아니라는 출처 표식 포함)."""
+    body = "\n".join(f"# {key}\n{value}" for key, value in context.items())
+    return HumanMessage(
+        content=f"<system-reminder>\n{USER_CONTEXT_INTRO}\n{body}\n\n{USER_CONTEXT_FOOTER}\n</system-reminder>\n",
+        additional_kwargs=origin_kwargs(ORIGIN_USER_CONTEXT),
+    )
 
 
 def prepend_user_context(
     messages: List[BaseMessage],
     claude_md_content: str = "",
-    git_snapshot: str = "",
+    current_date: str = "",
 ) -> List[BaseMessage]:
-    """messages[0] (첫 유저 턴) 앞단에 CLAUDE.md와 Git 스냅샷을 1회 결합 주입.
+    """대화 맨 앞(시스템 메시지 바로 뒤)에 사용자 컨텍스트 메시지를 끼워 넣습니다.
 
-    Source: src/query.ts — prependUserContext(messages, userContext)
-    - 이후 턴이 누적되어도 messages[0]의 내용은 불변으로 유지
-    - 대화 히스토리 전체의 프리픽스 캐시를 100% 보존
+    Source: src/utils/api.ts prependUserContext(messages, userContext)
+    - 첫 사용자 메시지를 고치지 않고 별도 메시지를 앞에 둡니다. 내용은 세션 시작 때 정한 값을
+      매 호출 똑같이 넣으므로, 대화가 길어져도 앞부분(프리픽스) 캐시가 유지됩니다.
+    - 이미 들어 있으면 다시 넣지 않습니다 (멱등).
     """
     if not messages:
         return messages
-
-    # 첫 HumanMessage 를 찾기
-    first_human_idx = None
-    for i, m in enumerate(messages):
-        if isinstance(m, HumanMessage):
-            first_human_idx = i
-            break
-
-    if first_human_idx is None:
+    context = build_user_context(claude_md_content, current_date)
+    if not context:
         return messages
-
-    first_msg = messages[first_human_idx]
-
-    # 이미 주입된 경우 건너뛰기 (멱등성 보장)
-    if isinstance(first_msg.content, str) and "<system-reminder>" in first_msg.content:
+    if any(message_origin(m) == ORIGIN_USER_CONTEXT for m in messages):
         return messages
+    insert_at = 0
+    while insert_at < len(messages) and isinstance(messages[insert_at], SystemMessage):
+        insert_at += 1
+    return messages[:insert_at] + [make_user_context_message(context)] + messages[insert_at:]
 
-    # 주입할 내용이 없으면 건너뛰기
-    if not claude_md_content and not git_snapshot:
-        return messages
 
-    # <system-reminder> 블록 구성
-    reminder_parts = []
-    if claude_md_content:
-        reminder_parts.append(f"# Project Rules (CLAUDE.md)\n{claude_md_content}")
-    if git_snapshot:
-        reminder_parts.append(f"# Git Context\n{git_snapshot}")
+# =============================================================================
+# ⑥ Date Change Notice (utils/attachments.ts getDateChangeAttachments)
+# =============================================================================
 
-    reminder_header = (
-        "<system-reminder>\n"
-        "As you answer the user's questions, you can use the following project context:\n\n"
-        + "\n\n".join(reminder_parts)
-        + "\n</system-reminder>\n\n"
+def make_date_change_message(new_date: str) -> HumanMessage:
+    """자정이 지나 날짜가 바뀌었음을 알리는 메시지. 대화 끝에 붙으므로 앞부분 캐시를 깨지 않습니다.
+
+    Source: src/utils/messages.ts case 'date_change'
+    """
+    return HumanMessage(
+        content=(
+            "<system-reminder>\n"
+            f"The date has changed. Today's date is now {new_date}. "
+            "DO NOT mention this to the user explicitly because they are already aware.\n"
+            "</system-reminder>"
+        ),
+        additional_kwargs=origin_kwargs(ORIGIN_DATE_CHANGE),
     )
-
-    # 첫 번째 HumanMessage 복제 후 앞단에 결합
-    new_first_msg = HumanMessage(
-        content=reminder_header + str(first_msg.content),
-        id=getattr(first_msg, "id", None),
-        additional_kwargs=dict(getattr(first_msg, "additional_kwargs", None) or {}),
-    )
-
-    return messages[:first_human_idx] + [new_first_msg] + messages[first_human_idx + 1:]
 
 
 # =============================================================================
@@ -482,11 +558,15 @@ class PromptAssembler:
 
     Layers:
     - Layer 1: Global Constitution (Modules 0-3, 5-6) — Static
-    - Layer 2: Tool Guide & Schemas (Module 4) — Static, Alphabetical Sort
+    - Layer 2: Tool Guide (Module 4) + Skills — Static
+      (claude_code_modules=False일 때만 도구 설명을 텍스트로 나열, 이름순)
     - Boundary: __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ (Module 7)
     - Layer 3: Session Interaction (Module 8) — Dynamic
     - Layer 4: Environment & Memory (Modules 9-12) — Dynamic
     - Layer 5: Resource & MCP & Compression (Modules 13-16) — Dynamic
+
+    claude_code_modules=True일 때 동적 섹션은 원본 systemPromptSection처럼 세션당 1회 계산해
+    재사용합니다. 매 턴 다시 계산하는 섹션(cache_break)은 이유와 함께 표시합니다.
     """
 
     def __init__(
@@ -535,6 +615,10 @@ class PromptAssembler:
         self.scratchpad_base_dir = scratchpad_base_dir
         self._scratchpad_dir: Optional[str] = None  # Lazy init per session
 
+        # 세션별 캐시: 동적 섹션(systemPromptSection)과 세션 시작 날짜(getUserContext memoize)
+        self._section_cache: Dict[str, Dict[str, str]] = {}
+        self._session_dates: Dict[str, str] = {}
+
     # ── Accessor Methods (Backward Compatible) ──
 
     def set_skill_catalog(self, source: Union[str, Callable]) -> None:
@@ -544,18 +628,49 @@ class PromptAssembler:
     def add_l4_doc(self, name: str, source: Union[str, Callable]) -> None:
         """Layer 4에 동적 세션/메모리 문서를 추가합니다 (e.g. 'MEMORY.md', 'USER.md', 'MCP.md')."""
         self.l4_docs[name] = source
+        self.clear_session_sections()
 
     def remove_l4_doc(self, name: str) -> None:
         """Layer 4에서 특정 문서를 제거합니다."""
         self.l4_docs.pop(name, None)
+        self.clear_session_sections()
 
     def add_l5_doc(self, name: str, source: Union[str, Callable]) -> None:
         """Layer 5에 프로젝트 컨텍스트 규칙 문서를 추가합니다 (e.g. 'CLAUDE.md', 'AGENT.md')."""
         self.l5_docs[name] = source
+        self.clear_session_sections()
 
     def remove_l5_doc(self, name: str) -> None:
         """Layer 5에서 특정 문서를 제거합니다."""
         self.l5_docs.pop(name, None)
+        self.clear_session_sections()
+
+    # ── Session Caches ──
+
+    def session_date(self, session_id: str = "unknown") -> str:
+        """세션에서 처음 물어본 날의 날짜를 세션 내내 돌려줍니다 (원본 getUserContext memoize)."""
+        return self._session_dates.setdefault(session_id or "unknown", get_local_iso_date())
+
+    def clear_session_sections(self, session_id: Optional[str] = None) -> None:
+        """세션 섹션 캐시를 비웁니다. 원본은 /clear, /compact 때 clearSystemPromptSections()를 부릅니다."""
+        if session_id is None:
+            self._section_cache.clear()
+        else:
+            self._section_cache.pop(session_id, None)
+
+    def _section(self, session_id: str, name: str, compute: Callable[[], str],
+                 cache_break: bool = False) -> str:
+        """원본 systemPromptSection / DANGEROUS_uncachedSystemPromptSection.
+
+        cache_break=False: 세션에서 처음 한 번 계산한 값을 재사용합니다.
+        cache_break=True : 매 호출 다시 계산합니다. 값이 바뀌면 그 지점부터 캐시가 깨지므로 이유가 있을 때만 씁니다.
+        """
+        if cache_break:
+            return compute()
+        cache = self._section_cache.setdefault(session_id or "unknown", {})
+        if name not in cache:
+            cache[name] = compute()
+        return cache[name]
 
     # ── Scratchpad Management ──
 
@@ -570,21 +685,17 @@ class PromptAssembler:
 
     # ── Formatting Helpers ──
 
-    def format_tool_capabilities(self) -> str:
+    def format_tool_capabilities(self, tools: Optional[list] = None) -> str:
         """Formats L2 tool capabilities sorted alphabetically by name for KV cache consistency."""
-        if not self.tool_schemas:
+        tool_schemas = tools if tools else self.tool_schemas
+        if not tool_schemas:
             return "No registered tools."
 
-        def get_tool_name(schema: Any) -> str:
-            if isinstance(schema, dict):
-                return schema.get("name", "")
-            return getattr(schema, "name", str(schema))
-
-        sorted_tools = sorted(self.tool_schemas, key=get_tool_name)
+        sorted_tools = sort_tools_for_cache(tool_schemas)
 
         tool_lines = []
         for idx, tool in enumerate(sorted_tools):
-            name = get_tool_name(tool)
+            name = _tool_name(tool)
             desc = ""
             args_dict = {}
 
@@ -702,36 +813,37 @@ class PromptAssembler:
 
         return "=== Layer 1: Global Constitution ===\n\n" + "\n\n".join(sections)
 
-    def _build_l2_tools(self) -> str:
-        """Assembles Layer 2 — Tool Guide & Schemas (Module 4).
+    def _build_l2_tools(self, tools: Optional[list] = None) -> str:
+        """Assembles Layer 2 — Tool Guide (Module 4) + Skills.
 
-        도구 스키마를 알파벳순으로 정렬하여 캐시 일관성 보장.
+        claude_code_modules=True : 원본처럼 도구 사용 원칙만 넣고, 도구 정의는 API tools 필드에 맡깁니다.
+        claude_code_modules=False: 도구 설명을 이름순 텍스트로 나열합니다 (하위 호환).
         """
         parts = []
 
-        # Module [4]: Anti-Raw Bash 가드레일 (claude_code_modules 활성 시)
         if self.claude_code_modules:
-            parts.append(get_using_your_tools_section())
-
-        # 알파벳순 정렬 도구 스키마
-        tool_str = self.format_tool_capabilities()
-        parts.append(f"## 🛠️ Registered Tool Capabilities (Alphabetical)\n{tool_str}")
+            parts.append(get_using_your_tools_section())  # Module [4]
+        else:
+            tool_str = self.format_tool_capabilities(tools)
+            parts.append(f"## 🛠️ Registered Tool Capabilities (Alphabetical)\n{tool_str}")
 
         # 스킬 카탈로그 통합
         if self.skill_catalog:
             raw_skill = self.read_and_truncate_doc(
                 self.skill_catalog, max_lines=300, max_bytes=35000
             )
-            parts.append(
-                f"## 📦 Available Skills Catalog & Execution Policy\n{raw_skill}"
-            )
+            if raw_skill.strip():
+                parts.append(
+                    f"## 📦 Available Skills Catalog & Execution Policy\n{raw_skill}"
+                )
 
-        return "=== Layer 2: Capabilities (Tools & Skills) ===\n\n" + "\n\n".join(parts)
+        title = "Tool Guide & Skills" if self.claude_code_modules else "Capabilities (Tools & Skills)"
+        return f"=== Layer 2: {title} ===\n\n" + "\n\n".join(parts)
 
-    def build_static_content(self) -> str:
+    def build_static_content(self, tools: Optional[list] = None) -> str:
         """Assembles Layers 1~2 + Boundary Marker (Static KV Cache Target)."""
         l1 = self._build_l1_constitution()
-        l2 = self._build_l2_tools()
+        l2 = self._build_l2_tools(tools)
         return f"{l1}\n\n{l2}\n\n{self.boundary_marker}"
 
     def _build_l3_session(self, session_context: dict) -> str:
@@ -739,121 +851,157 @@ class PromptAssembler:
         parts = ["=== Layer 3: Session Interaction ==="]
 
         if self.claude_code_modules:
-            parts.append(get_session_guidance_section())
+            sid = session_context.get("session_id", "unknown")
+            parts.append(self._section(sid, "session_guidance", get_session_guidance_section))
 
         return "\n\n".join(parts)
+
+    def _l4_docs_text(self) -> List[str]:
+        return [
+            f"[{doc_name}]:\n{self.read_and_truncate_doc(source, max_lines=300, max_bytes=35000)}"
+            for doc_name, source in self.l4_docs.items()
+        ]
 
     def _build_l4_environment(self, session_context: dict) -> str:
         """Assembles Layer 4 — Environment & Memory (Modules 9-12)."""
         parts = ["=== Layer 4: Environment & Memory ==="]
+        sid = session_context.get("session_id", "unknown")
+        recalled = (session_context.get("recalled_memory") or "").strip()
 
         if self.claude_code_modules:
-            # Module [10]: 환경 정보
-            parts.append(get_env_info_section(
+            # Module [9]: Memory Index — 원본은 세션당 1회 계산하지만, 이 프로젝트의 MemoryMiddleware는
+            # 턴마다 에피소드 기억을 다시 검색해 recalled_memory에 넣으므로 매 호출 다시 계산합니다.
+            # (원본은 이런 "관련 기억"을 relevant_memories 첨부로 대화 끝에 붙입니다.)
+            memory_section = self._section(
+                sid, "memory", lambda: get_memory_index_section(recalled), cache_break=True
+            )
+            if memory_section:
+                parts.append(memory_section)
+
+            # Module [10]: 환경 정보 (날짜·git 상태는 여기 넣지 않음: ⑤ 사용자 컨텍스트 / ④ 시스템 컨텍스트)
+            parts.append(self._section(sid, "env_info_simple", lambda: get_env_info_section(
                 cwd=session_context.get("cwd", "/workspace"),
                 host_os=session_context.get("os", os.name),
-                session_id=session_context.get("session_id", "unknown"),
+                session_id=sid,
                 model_id=session_context.get("model_id", ""),
-                current_date=session_context.get("current_date", ""),
                 user_permission=session_context.get("user_permission", ""),
                 active_project=session_context.get("active_project", ""),
-                git_status=session_context.get("git_status", ""),
-            ))
+            )))
 
-            # Module [11]: 언어 정책
-            lang_section = get_language_section(self.language)
-            if lang_section:
-                parts.append(lang_section)
+            # Module [11], [12]: 언어 정책 · 출력 스타일
+            for name, factory, value in (("language", get_language_section, self.language),
+                                         ("output_style", get_output_style_section, self.output_style)):
+                section = self._section(sid, name, lambda f=factory, v=value: f(v))
+                if section:
+                    parts.append(section)
 
-            # Module [12]: 출력 스타일
-            style_section = get_output_style_section(self.output_style)
-            if style_section:
-                parts.append(style_section)
-        else:
-            # 하위 호환: 기존 세션 컨텍스트 형식
-            current_date_str = session_context.get("current_date") or datetime.now().strftime("%Y-%m-%d")
-            session_items = [
-                f"- Current Date: {current_date_str}",
-                f"- Working Directory (CWD): {session_context.get('cwd', '/workspace')}",
-                f"- Session ID: {session_context.get('session_id', 'unknown')}",
-                f"- Host OS: {session_context.get('os', os.name)}",
-            ]
-            if "user_permission" in session_context:
-                session_items.append(f"- User Permission: {session_context['user_permission']}")
-            if "active_project" in session_context:
-                session_items.append(f"- Active Project: {session_context['active_project']}")
-            if "git_status" in session_context:
-                session_items.append(f"- Git Branch/Status: {session_context['git_status']}")
-            parts.append("Session Information:\n" + "\n".join(session_items))
+            # 비메모리 동적 문서 (MCP.md 등)
+            if self.l4_docs:
+                parts.append(self._section(sid, "l4_docs", lambda: "\n\n".join(self._l4_docs_text())))
+            elif not memory_section:
+                parts.append("No dynamic memory or session documents active.")
+            return "\n\n".join(parts)
 
-        # Module [9]: Memory Index (Recalled Memory from MemoryMiddleware)
-        recalled = session_context.get("recalled_memory", "")
-        if recalled and recalled.strip():
-            if self.claude_code_modules:
-                parts.append(get_memory_index_section(recalled))
-            else:
-                parts.append(f"[Recalled Memory (injected by MemoryMiddleware)]:\n{recalled.strip()}")
+        # 하위 호환: 기존 세션 컨텍스트 형식 (날짜는 세션 시작일로 고정)
+        current_date_str = session_context.get("current_date") or self.session_date(sid)
+        session_items = [
+            f"- Current Date: {current_date_str}",
+            f"- Working Directory (CWD): {session_context.get('cwd', '/workspace')}",
+            f"- Session ID: {sid}",
+            f"- Host OS: {session_context.get('os', os.name)}",
+        ]
+        if "user_permission" in session_context:
+            session_items.append(f"- User Permission: {session_context['user_permission']}")
+        if "active_project" in session_context:
+            session_items.append(f"- Active Project: {session_context['active_project']}")
+        if "user_id" in session_context and session_context["user_id"]:
+            session_items.append(f"- User ID: {session_context['user_id']}")
+        if "git_status" in session_context:
+            session_items.append(f"- Git Branch/Status: {session_context['git_status']}")
+        if "workspace_dir" in session_context and session_context["workspace_dir"]:
+            ws_root = session_context["workspace_dir"]
+            session_items.append(f"- Session Workspace Root: {ws_root}")
+            session_items.append(f"  - Plan Dir (plan_state/extraction_plan): {session_context.get('plan_dir', f'{ws_root}/plan')}")
+            session_items.append(f"  - Scripts Dir (.py scripts): {session_context.get('scripts_dir', f'{ws_root}/scripts')}")
+            session_items.append(f"  - Outputs Dir (data/charts/reports): {session_context.get('outputs_dir', f'{ws_root}/outputs')}")
+            session_items.append(f"  - Logs Dir (audit.jsonl): {session_context.get('logs_dir', f'{ws_root}/logs')}")
+        parts.append("Session Information:\n" + "\n".join(session_items))
+
+        # Recalled Memory from MemoryMiddleware
+        if recalled:
+            parts.append(f"[Recalled Memory (injected by MemoryMiddleware)]:\n{recalled}")
 
         # 비메모리 동적 문서 (MCP.md 등)
         if self.l4_docs:
-            for doc_name, source in self.l4_docs.items():
-                doc_content = self.read_and_truncate_doc(source, max_lines=300, max_bytes=35000)
-                parts.append(f"[{doc_name}]:\n{doc_content}")
-        elif not recalled or not recalled.strip():
+            parts.extend(self._l4_docs_text())
+        elif not recalled:
             parts.append("No dynamic memory or session documents active.")
 
         return "\n\n".join(parts)
+
+    def _l5_docs_text(self) -> List[str]:
+        if not self.l5_docs:
+            return ["No local project rules (AGENT.md/CLAUDE.md) provided."]
+        return [
+            f"[{doc_name} Rules]:\n{self.read_and_truncate_doc(source, max_lines=500, max_bytes=50000)}"
+            for doc_name, source in self.l5_docs.items()
+        ]
 
     def _build_l5_resources(self, session_context: dict) -> str:
         """Assembles Layer 5 — Resource & MCP & Compression (Modules 13-16)."""
         parts = ["=== Layer 5: Resource Control & Project Rules ==="]
 
         if self.claude_code_modules:
-            # Module [13]: MCP Instructions
-            mcp_section = get_mcp_instructions_section(
+            sid = session_context.get("session_id", "unknown")
+
+            # Module [13]: MCP Instructions — 원본 DANGEROUS_uncachedSystemPromptSection
+            # (이유: MCP 서버가 턴 사이에 연결·해제됨). Delta 모드에서는 비어 있고 첨부로 대신 보냅니다.
+            mcp_section = self._section(sid, "mcp_instructions", lambda: get_mcp_instructions_section(
                 self.mcp_instructions, self.mcp_delta_enabled
-            )
+            ), cache_break=True)
             if mcp_section:
                 parts.append(mcp_section)
 
-            # Module [14]: Scratchpad
-            sid = session_context.get("session_id", "")
-            scratch_dir = self.get_scratchpad_dir(session_id=sid)
-            scratch_section = get_scratchpad_section(scratch_dir)
-            if scratch_section:
-                parts.append(scratch_section)
+            # Module [14]~[16]: Scratchpad, FRC, Summarize Tool Results
+            for name, compute in (
+                ("scratchpad", lambda: get_scratchpad_section(self.get_scratchpad_dir(session_id=sid))),
+                ("frc", get_frc_section),
+                ("summarize_tool_results", get_summarize_tool_results_section),
+            ):
+                section = self._section(sid, name, compute)
+                if section:
+                    parts.append(section)
 
-            # Module [15]: FRC
-            parts.append(get_frc_section())
-
-            # Module [16]: Summarize Tool Results
-            parts.append(get_summarize_tool_results_section())
+            parts.append(self._section(sid, "l5_docs", lambda: "\n\n".join(self._l5_docs_text())))
+            return "\n\n".join(parts)
 
         # User & Local Project Rules (l5_docs: CLAUDE.md, AGENT.md 등)
-        if not self.l5_docs:
-            parts.append("No local project rules (AGENT.md/CLAUDE.md) provided.")
-        else:
-            for doc_name, source in self.l5_docs.items():
-                doc_content = self.read_and_truncate_doc(source, max_lines=500, max_bytes=50000)
-                parts.append(f"[{doc_name} Rules]:\n{doc_content}")
-
+        parts.extend(self._l5_docs_text())
         return "\n\n".join(parts)
 
     def build_dynamic_content(self, session_context: dict) -> str:
-        """Assembles Layers 3~5 (Dynamic Session, Memory, and Project Context)."""
+        """Assembles Layers 3~5 (+ ④ 시스템 컨텍스트: Claude Code 모드에서 git_status를 맨 끝에 덧붙임)."""
         l3 = self._build_l3_session(session_context)
         l4 = self._build_l4_environment(session_context)
         l5 = self._build_l5_resources(session_context)
-        return f"{l3}\n\n{l4}\n\n{l5}"
+        dynamic = f"{l3}\n\n{l4}\n\n{l5}"
+        if self.claude_code_modules:
+            dynamic = append_system_context(dynamic, {"gitStatus": session_context.get("git_status", "")})
+        return dynamic
 
-    def build_system_prompt(self, session_context: dict) -> str:
+    def build_system_prompt(self, session_context: dict, tools: Optional[list] = None) -> str:
         """Assembles all 5 layers into a single prompt string."""
-        static_part = self.build_static_content()
+        static_part = self.build_static_content(tools)
         dynamic_part = self.build_dynamic_content(session_context)
         return f"{static_part}\n\n{dynamic_part}"
 
-    def assemble(self, user_input: str, session_context: dict, chat_history: list = None) -> list:
-        """Assembles full list of messages as structured SystemMessages + Chat History + HumanMessage."""
+    def assemble(self, user_input: str, session_context: dict, chat_history: list = None,
+                 claude_md_content: str = "") -> list:
+        """Assembles full list of messages as structured SystemMessages + Chat History + HumanMessage.
+
+        claude_code_modules=True이면 원본처럼 시스템 메시지 뒤에 ⑤ 사용자 컨텍스트 메시지
+        (CLAUDE.md + 세션 시작 날짜)를 끼워 넣습니다.
+        """
         static_content = self.build_static_content()
         dynamic_content = self.build_dynamic_content(session_context)
 
@@ -866,6 +1014,11 @@ class PromptAssembler:
             assembled.extend(chat_history)
 
         assembled.append(HumanMessage(content=user_input))
+
+        if self.claude_code_modules:
+            sid = session_context.get("session_id", "unknown")
+            current_date = session_context.get("current_date") or self.session_date(sid)
+            assembled = prepend_user_context(assembled, claude_md_content, current_date)
         return assembled
 
 
@@ -873,13 +1026,24 @@ class PromptAssembler:
 # Production AgentMiddleware Class (Supports both Sync & Async Agent calls)
 # =============================================================================
 
+class PromptState(AgentState):
+    """PromptAssemblerMiddleware가 checkpointer state에 남기는 필드."""
+    session_start_date: NotRequired[str]   # 사용자 컨텍스트에 쓰는 날짜 (세션 내내 고정)
+    last_emitted_date: NotRequired[str]    # 마지막으로 모델에게 알린 날짜 (date_change 판단용)
+
+
 class PromptAssemblerMiddleware(AgentMiddleware):
     """Production AgentMiddleware implementing both wrap_model_call & awrap_model_call.
 
     확장 기능:
-    - bypass_user_context=True: CLAUDE.md & Git 상태를 L5 대신 messages[0]로 우회 주입
+    - bypass_user_context=True: git 스냅샷은 시스템 프롬프트 끝(④), CLAUDE.md와 세션 시작 날짜는
+      대화 맨 앞 별도 메시지(⑤)로 주입
     - mcp_delta_instructions: 동적 MCP 지침을 현재 유저 메시지 꼬리에 첨부
+    - before_model: 세션 시작 날짜를 state에 고정하고, 날짜가 바뀌면 date_change 알림을 대화 끝에 추가
+    - 도구 목록을 이름순으로 정렬해 모델에 전달 (내장 → MCP)
     """
+
+    state_schema = PromptState
 
     def __init__(
         self,
@@ -895,32 +1059,109 @@ class PromptAssemblerMiddleware(AgentMiddleware):
         self.claude_md_content = claude_md_content
         self.mcp_delta_instructions = mcp_delta_instructions
 
+    # ── before_model: 세션 날짜 고정 & 자정 알림 ──
+
+    def before_model(self, state: Dict[str, Any], runtime: Any = None) -> Optional[Dict[str, Any]]:
+        today = get_local_iso_date()
+        start = state.get("session_start_date")
+        if not start:
+            # 첫 호출: 날짜만 기록 (원본도 첫 턴에는 알림을 붙이지 않음)
+            return {"session_start_date": today, "last_emitted_date": today}
+        if state.get("last_emitted_date", start) == today:
+            return None
+        # 앞부분(사용자 컨텍스트의 날짜)은 그대로 두고, 대화 끝에만 새 날짜를 알립니다.
+        return {"messages": [make_date_change_message(today)], "last_emitted_date": today}
+
+    async def abefore_model(self, state: Dict[str, Any], runtime: Any = None) -> Optional[Dict[str, Any]]:
+        return self.before_model(state, runtime)
+
+    # ── wrap_model_call: 프롬프트 조립 ──
+
     def _prepare_messages(self, request) -> list:
         ctx = getattr(request.runtime, "context", None)
+        user_id = getattr(ctx, "user_id", "default") if ctx else "default"
+        session_id = getattr(ctx, "session_id", "unknown") if ctx else "unknown"
+        parent_session_id = getattr(ctx, "parent_session_id", "") if ctx else ""
+
+        # Retrieve thread_id / user_id / parent_thread_id from config if available
+        config = getattr(request.runtime, "config", None)
+        if config and isinstance(config, dict):
+            configurable = config.get("configurable", {}) or {}
+            tid = configurable.get("thread_id")
+            if tid:
+                session_id = str(tid)
+            cfg_uid = configurable.get("user_id")
+            if cfg_uid and (not user_id or user_id == "default"):
+                user_id = str(cfg_uid)
+            cfg_ptid = configurable.get("parent_thread_id")
+            if cfg_ptid and not parent_session_id:
+                parent_session_id = str(cfg_ptid)
+
+        exec_info = getattr(request.runtime, "execution_info", None)
+        if exec_info and getattr(exec_info, "thread_id", None):
+            session_id = str(exec_info.thread_id)
+
+        # 세션 시작 날짜: state에 고정된 값(재시작 후에도 유지) → 없으면 조립기의 세션 캐시
+        state = getattr(request, "state", None) or {}
+        session_date = state.get("session_start_date") or self.assembler.session_date(session_id)
+
         session_context = {
             "cwd": getattr(ctx, "cwd", os.getcwd()) if ctx else os.getcwd(),
-            "session_id": getattr(ctx, "session_id", "unknown") if ctx else "unknown",
+            "session_id": session_id,
+            "user_id": user_id,
             "os": os.name,
             "user_permission": getattr(ctx, "user_permission", "GUEST") if ctx else "GUEST",
             "active_project": getattr(ctx, "active_project", "UNKNOWN") if ctx else "UNKNOWN",
             "recalled_memory": getattr(ctx, "recalled_memory", "") if ctx else "",
+            "current_date": session_date,
         }
 
-        # Retrieve thread_id from config if available
-        config = getattr(request.runtime, "config", None)
-        if config and isinstance(config, dict):
-            tid = config.get("configurable", {}).get("thread_id")
-            if tid:
-                session_context["session_id"] = str(tid)
+        ctx_ws_dir = (getattr(ctx, "workspace_dir", "") or "").strip() if ctx else ""
+        if ctx_ws_dir:
+            ws_root_rel = ctx_ws_dir.rstrip("/")
+            session_context["workspace_dir"] = ws_root_rel
+            session_context["plan_dir"] = f"{ws_root_rel}/plan"
+            session_context["scripts_dir"] = f"{ws_root_rel}/scripts"
+            session_context["outputs_dir"] = f"{ws_root_rel}/outputs"
+            session_context["logs_dir"] = f"{ws_root_rel}/logs"
+        else:
+            try:
+                from app.utils.workspace import resolve_session_workspace
+
+                ws = resolve_session_workspace(
+                    user_id=user_id,
+                    session_id=session_id,
+                    parent_session_id=parent_session_id or None,
+                    ensure_exists=False,
+                )
+                ws_root_rel = ws.rel_root
+                session_context["workspace_dir"] = ws_root_rel
+                session_context["plan_dir"] = ws.rel_plan_dir
+                session_context["scripts_dir"] = ws.rel_scripts_dir
+                session_context["outputs_dir"] = ws.rel_outputs_dir
+                session_context["logs_dir"] = ws.rel_logs_dir
+                if ctx is not None and hasattr(ctx, "workspace_dir"):
+                    ctx.workspace_dir = ws_root_rel
+            except Exception:
+                pass
+
+        # ④ 시스템 컨텍스트: 세션 시작 시점의 git 스냅샷 (동적 시스템 프롬프트 맨 끝)
+        if self.bypass_user_context:
+            git_snapshot = get_frozen_git_snapshot(cwd=session_context.get("cwd", ""))
+            if git_snapshot:
+                session_context["git_status"] = git_snapshot
+
+        req_tools = list(getattr(request, "tools", None) or [])
+        tools = req_tools if req_tools else None
 
         if self.merge_system:
             # Single SystemMessage (L1~L5 All-in-one)
-            full_system_text = self.assembler.build_system_prompt(session_context)
+            full_system_text = self.assembler.build_system_prompt(session_context, tools)
             system_messages = [SystemMessage(content=full_system_text)]
         else:
             # Dual SystemMessage (Static with cache_control + Dynamic)
             static_msg = SystemMessage(
-                content=self.assembler.build_static_content(),
+                content=self.assembler.build_static_content(tools),
                 additional_kwargs={"cache_control": {"type": "ephemeral"}},
             )
             dynamic_msg = SystemMessage(
@@ -952,14 +1193,12 @@ class PromptAssemblerMiddleware(AgentMiddleware):
 
         result_messages = system_messages + filtered_msgs
 
-        # ── User Context Bypass Injection ──
+        # ⑤ 사용자 컨텍스트: CLAUDE.md + 세션 시작 날짜를 대화 맨 앞 별도 메시지로
         if self.bypass_user_context:
-            cwd = session_context.get("cwd", "")
-            git_snapshot = get_frozen_git_snapshot(cwd=cwd)
             result_messages = prepend_user_context(
                 result_messages,
                 claude_md_content=self.claude_md_content,
-                git_snapshot=git_snapshot,
+                current_date=session_date,
             )
 
         # ── MCP Attachments Delta ──
@@ -971,15 +1210,18 @@ class PromptAssemblerMiddleware(AgentMiddleware):
 
         return result_messages
 
+    def _override(self, request):
+        overrides: Dict[str, Any] = {"messages": self._prepare_messages(request)}
+        tools = list(getattr(request, "tools", None) or [])
+        if tools:
+            overrides["tools"] = sort_tools_for_cache(tools)  # ① 도구 정의 순서 고정
+        return request.override(**overrides)
+
     def wrap_model_call(self, request, handler):
-        new_messages = self._prepare_messages(request)
-        new_request = request.override(messages=new_messages)
-        return handler(new_request)
+        return handler(self._override(request))
 
     async def awrap_model_call(self, request, handler):
-        new_messages = self._prepare_messages(request)
-        new_request = request.override(messages=new_messages)
-        return await handler(new_request)
+        return await handler(self._override(request))
 
 
 def create_prompt_assembler_middleware(

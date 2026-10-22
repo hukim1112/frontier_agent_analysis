@@ -1,277 +1,822 @@
 """
 ===============================================================================
-[H-01] 5-Stage Context Compactor Pipeline (Advanced Middleware Edition)
+[H-01] Claude Code Context Compaction Pipeline
 ===============================================================================
-Source: frontier_agent_analysis/modules/claude_code/compactor.py
+Source: frontier-agent-lab/modules/claude_code/compactor.py
 
-Claude Code 아키텍처의 5단계 컨텍스트 압축 엔진:
-1. SnipCompactor      : 사용자 턴(Turn) 기반 오래된 ToolMessage 1줄 스텁 대체
-2. MicroCompactor     : 대형 출력(>5000 chars) 디스크 스왑 (SWAP_MARKER 멱등성 가드 포함)
-3. ContextCollapse    : 연속 탐색 스텝(3+) 그룹 접기 (UNSAFE_TO_COLLAPSE_TOOLS 변경성 도구 자동 제외)
-4. AutoCompactor      : 토큰 임계치 초과 시 LLM 4대 영역 요약 + AmnesiaGuard 연동 + 서킷 브레이커(MAX 3회)
-5. ReactiveCompactor  : 413 에러 대응 턴 경계(Turn-Boundary) 기반 슬라이싱 (AI-Tool 페어 보존)
+Claude Code(유출 소스 v2.1.88)의 query.ts가 매 모델 호출 직전에 실행하는 순서를 따릅니다.
 
-통합 미들웨어: CompactorMiddleware(AgentMiddleware) + create_compactor_middleware()
-- before_model / abefore_model : Stage 1~3 적용 후에도 임계치를 넘으면, 원본 state에서 "이전 턴"만
-                                 요약해 state["messages"]를 교체 (현재 턴은 그대로 보존, 턴당 최대 1회)
-                                 (원문 전체본은 MemoryMiddleware가 transcript.db에 별도 보존)
-- wrap_model_call / awrap_model_call : 매 모델 호출마다 Stage 1~3(Snip → Micro → Collapse) 사본 압축 + Stage 5(Reactive 413 방어)
+  applyToolResultBudget → snip → microcompact → contextCollapse → autocompact
+  (+ API가 prompt_too_long을 돌려주면 reactive compact)
 
-요약·복원 블록은 HumanMessage로 넣고 additional_kwargs["harness_origin"]과 첫 줄 머리말로
-"하네스가 만든 메시지"임을 표시합니다. 턴 경계는 message_markers 규칙으로 판별합니다.
+각 단계의 근거 등급:
+  🟢 원본 소스가 남아 있어 그대로 옮김   🟡 원본 파일이 빌드에서 빠져 있어 호출부 흔적으로 재구성
+
+| 단계 | 클래스 | 원본 위치 | 등급 | 이 구현의 훅 |
+|---|---|---|---|---|
+| 0. Tool Result Budget | ToolResultBudget | utils/toolResultStorage.ts | 🟢 | wrap_tool_call(도구별) + before_model(라운드 합계) |
+| 1. Snip | SnipCompactor | services/compact/snipCompact.ts (없음) | 🟡 | snip 도구 + wrap_model_call 투영 |
+| 2. Microcompact (time-based) | MicroCompactor | services/compact/microCompact.ts | 🟢 | before_model (같은 id로 state 교체) |
+| 3. Context Collapse | ContextCollapse | services/contextCollapse/ (없음) | 🟡 | before_model 커밋 + wrap_model_call 투영 |
+| 4. Auto-Compact | AutoCompactor | autoCompact.ts, compact.ts, prompt.ts | 🟢 | before_model (state 교체) |
+| 5. Reactive Compact | ReactiveCompactor | reactiveCompact.ts (없음) | 🟡 | wrap_model_call (413 재시도) |
+
+원본과 다르게 구현한 부분:
+- Cached microcompact(서버 캐시를 cache_edits로 편집)는 Anthropic 내부 전용 API라 구현하지 않았습니다.
+- 원본 Auto-Compact는 캐시를 공유하는 fork 에이전트에게 대화를 그대로 넘깁니다. 여기서는 모델 제공사와
+  무관하게 동작하도록 대화를 텍스트로 직렬화해 요약 LLM에 넘깁니다.
+- 원본 Auto-Compact는 대화 전체를 요약합니다. 여기서는 현재 사용자 턴을 원본 그대로 남기고 이전 턴만 요약합니다.
+- 압축 임계치는 원본 공식(컨텍스트 윈도우 - 20K - 13K) 대신 threshold_tokens로 직접 지정합니다.
+  원본 공식은 claude_code_autocompact_threshold()로 계산할 수 있습니다.
+
+요약·접기·표시 메시지는 HumanMessage로 넣고 additional_kwargs["harness_origin"]과 첫 줄 머리말로
+"하네스가 만든 메시지"임을 표시합니다. 턴 경계는 message_markers 모듈의 규칙으로 판별합니다.
+
+modules/claude_code/compactor.py는 이 파일의 사본입니다 (message_markers import 경로만 다름).
 ===============================================================================
 """
 
+import asyncio
+import math
 import os
 import re
-import json
 import time
 import uuid
-import asyncio
-import hashlib
-from typing import List, Tuple, Dict, Any, Optional
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, RemoveMessage
+from typing import Annotated, Any, Dict, List, NotRequired, Optional, Sequence, Tuple
+
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langchain.agents.middleware import AgentMiddleware, wrap_model_call
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
+from langchain.agents.middleware import AgentMiddleware, AgentState
 
 from .message_markers import (
     AUTO_GENERATED_NOTE,
     COMPACTION_SUMMARY_HEADER,
+    CONTEXT_COLLAPSE_HEADER,
+    CONTEXT_EFFICIENCY_HEADER,
     ORIGIN_AMNESIA_RESTORE,
+    ORIGIN_COMPACTION_MARKER,
     ORIGIN_COMPACTION_SUMMARY,
+    ORIGIN_CONTEXT_COLLAPSE,
+    ORIGIN_CONTEXT_EFFICIENCY,
+    ORIGIN_SNIP_BOUNDARY,
+    SNIP_BOUNDARY_HEADER,
     is_compaction_artifact,
     is_compaction_summary,
+    is_user_turn_start,
     last_user_turn_start,
     message_origin,
     origin_kwargs,
     user_turn_starts,
 )
+from .amnesia_guard import resolve_session_key
 
 
 # =============================================================================
-# Blocklist: Tools that MUST NOT be collapsed (write/modify/execute operations)
+# 원본 상수 (괄호 안은 원본 파일)
 # =============================================================================
-UNSAFE_TO_COLLAPSE_TOOLS = {
-    # File write/edit operations (generic names + 프로젝트 실제 도구명)
-    "write_file", "create_file", "edit_file", "replace_file_content",
-    "multi_replace_file_content", "write_to_file", "patch_file",
-    "file_writer", "file_edit", "notebook_edit",
-    # Command / code execution
-    "run_command", "execute", "exec", "shell", "bash", "terminal",
-    "bash_command", "data_query",
-    # Artifact generation (analyst: 차트/엑셀/HTML/포맷 변환 산출물 생성)
-    "chart_generator", "excel_writer", "html_report", "file_converter",
-    # Browser actions with side effects (navigator)
-    "interact_page", "browse_web",
-    # File delete operations
-    "delete_file", "remove", "rm", "rmdir",
-    # Plan / task management
-    "update_plan", "create_plan", "set_plan", "enter_plan", "exit_plan",
-    "task_create", "task_update",
-    # Long-term memory writes & sub-agent delegation
-    "memory", "invoke_sub_agent",
-    # Git operations
-    "git_commit", "git_push", "git_merge",
-}
+DEFAULT_MAX_RESULT_SIZE_CHARS = 50_000          # constants/toolLimits.ts
+MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000    # constants/toolLimits.ts
+PREVIEW_SIZE_CHARS = 2_000                      # utils/toolResultStorage.ts (PREVIEW_SIZE_BYTES)
+PERSISTED_OUTPUT_TAG = "<persisted-output>"     # utils/toolResultStorage.ts
+PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
+
+TIME_BASED_MC_CLEARED_MESSAGE = "[Old tool result content cleared]"   # services/compact/microCompact.ts
+TIME_BASED_MC_GAP_MINUTES = 60                  # services/compact/timeBasedMCConfig.ts (서버 캐시 TTL 1시간)
+TIME_BASED_MC_KEEP_RECENT = 5                   # services/compact/timeBasedMCConfig.ts
+
+MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000          # services/compact/autoCompact.ts
+AUTOCOMPACT_BUFFER_TOKENS = 13_000              # services/compact/autoCompact.ts
+MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3        # services/compact/autoCompact.ts
+MAX_PTL_RETRIES = 3                             # services/compact/compact.ts
+PTL_RETRY_MARKER = "[earlier conversation truncated for compaction retry]"   # services/compact/compact.ts
+
+COLLAPSE_COMMIT_RATIO = 0.9                     # autoCompact.ts 주석: "90% commit / 95% blocking-spawn"
+
+# 디스크 저장 대상에서 빼는 도구. 원본 Read 도구의 maxResultSizeChars = Infinity는 '상한 없음'이 아니라
+# '이 래퍼를 적용하지 않음' 표시입니다. Read는 스스로 분량을 제한하고(256KB 초과 파일, 25,000토큰 초과 출력은
+# offset/limit을 쓰라는 에러로 거절), 저장한 파일을 다시 Read로 읽으면 순환이 생기기 때문입니다.
+# 이 프로젝트의 file_read는 줄 수(기본 250줄)로만 제한하므로, 줄이 매우 긴 파일은 큰 결과가 될 수 있습니다.
+UNBOUNDED_RESULT_TOOLS = frozenset({"file_read"})
+
+# 원본 COMPACTABLE_TOOLS(Read, Bash, Grep, Glob, WebSearch, WebFetch, Edit, Write)를 이 프로젝트 도구명으로 옮김
+COMPACTABLE_TOOLS = frozenset({
+    "file_read", "bash_command", "grep_search", "glob_search",
+    "web_search", "web_fetch", "file_edit", "file_writer",
+})
+
+_OVERFLOW_PATTERNS = (
+    "413", "prompt_too_long", "prompt is too long", "context_length_exceeded",
+    "too many tokens", "maximum context length", "request too large",
+)
+
+
+def claude_code_autocompact_threshold(context_window: int,
+                                      max_output_tokens: int = MAX_OUTPUT_TOKENS_FOR_SUMMARY) -> int:
+    """원본 Auto-Compact 발동 지점: 윈도우 - 요약 출력 예약(최대 20K) - 버퍼 13K.
+
+    200K 윈도우라면 200,000 - 20,000 - 13,000 = 167,000 토큰(83.5%)입니다.
+    """
+    reserved = min(max_output_tokens, MAX_OUTPUT_TOKENS_FOR_SUMMARY)
+    return context_window - reserved - AUTOCOMPACT_BUFFER_TOKENS
+
+
+def is_prompt_too_long_error(error: Exception) -> bool:
+    err = str(error).lower()
+    return any(p in err for p in _OVERFLOW_PATTERNS)
 
 
 # =============================================================================
-# 1. SnipCompactor (Age-based Old Tool Output Truncation)
+# 공통 도우미
+# =============================================================================
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [c.get("text", "") if isinstance(c, dict) else str(c) for c in content]
+        return "\n".join(p for p in parts if p)
+    return str(content or "")
+
+
+_SYSTEM_REMINDER_RE = re.compile(r"^\s*<system-reminder>[\s\S]*?</system-reminder>\s*")
+
+
+def _leading_system_reminder(msg: Any) -> str:
+    """PromptAssembler가 첫 사용자 메시지 앞에 붙인 CLAUDE.md 블록. 그 메시지가 투영에서 빠질 때 옮겨 붙입니다."""
+    content = getattr(msg, "content", "")
+    match = _SYSTEM_REMINDER_RE.match(content) if isinstance(content, str) else None
+    return match.group(0) if match else ""
+
+
+def rough_token_count(messages: Sequence[Any]) -> int:
+    """원본 roughTokenCountEstimation처럼 글자 수/4로 추정하고 4/3배 여유를 둡니다."""
+    chars = sum(len(_content_text(getattr(m, "content", ""))) for m in messages)
+    return math.ceil(chars / 4 * 4 / 3)
+
+
+def _format_size(chars: int) -> str:
+    return f"{chars / 1024:.1f}KB" if chars >= 1024 else f"{chars} chars"
+
+
+def _replace_tool_message(msg: ToolMessage, content: str) -> ToolMessage:
+    """같은 id를 유지한 채 내용만 바꾼 ToolMessage (state 교체·transcript 멱등 기록에 필요)."""
+    return ToolMessage(
+        content=content,
+        tool_call_id=msg.tool_call_id,
+        name=getattr(msg, "name", None),
+        id=getattr(msg, "id", None),
+        status=getattr(msg, "status", "success"),
+    )
+
+
+def _apply_replacements(messages: List[Any], replacements: List[Any]) -> List[Any]:
+    by_id = {m.id: m for m in replacements if getattr(m, "id", None)}
+    if not by_id:
+        return messages
+    return [by_id.get(getattr(m, "id", None), m) for m in messages]
+
+
+def group_messages_by_api_round(messages: Sequence[Any]) -> List[List[Any]]:
+    """원본 groupMessagesByApiRound: 새 AI 응답이 시작될 때마다 그룹을 나눕니다.
+
+    AI 메시지의 tool_calls와 그 ToolMessage들은 항상 같은 그룹에 들어가므로, 그룹 단위로
+    잘라내도 도구 호출·결과 쌍이 깨지지 않습니다. 첫 그룹은 첫 AI 응답 앞의 메시지들입니다.
+    """
+    groups: List[List[Any]] = []
+    current: List[Any] = []
+    last_ai_id = object()
+    for m in messages:
+        if isinstance(m, AIMessage):
+            ai_id = getattr(m, "id", None) or id(m)
+            if ai_id != last_ai_id and current:
+                groups.append(current)
+                current = []
+            last_ai_id = ai_id
+        current.append(m)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _marker_message(text: str) -> HumanMessage:
+    return HumanMessage(content=text, additional_kwargs=origin_kwargs(ORIGIN_COMPACTION_MARKER))
+
+
+def truncate_head_for_ptl_retry(messages: Sequence[Any], drop_ratio: float = 0.2) -> Optional[List[Any]]:
+    """원본 truncateHeadForPTLRetry: 가장 오래된 API 라운드부터 버립니다 (토큰 차이를 모를 때 20%).
+
+    요약할 것이 남도록 최소 1개 그룹은 남기고, 결과가 AI 메시지로 시작하면 표시 메시지를 앞에 붙입니다.
+    """
+    items = list(messages)
+    if items and message_origin(items[0]) == ORIGIN_COMPACTION_MARKER:
+        items = items[1:]
+    groups = group_messages_by_api_round(items)
+    if len(groups) < 2:
+        return None
+    drop = min(max(1, int(len(groups) * drop_ratio)), len(groups) - 1)
+    sliced = [m for g in groups[drop:] for m in g]
+    if sliced and isinstance(sliced[0], AIMessage):
+        return [_marker_message(PTL_RETRY_MARKER)] + sliced
+    return sliced
+
+
+def _serialize_for_summary(messages: Sequence[Any], max_chars_per_message: int) -> str:
+    """요약 LLM에 넘길 대화 텍스트. 대형 도구 출력이 요약 프롬프트를 키우지 않도록 메시지당 길이를 제한합니다."""
+    role_by_origin = {
+        ORIGIN_COMPACTION_SUMMARY: "PREVIOUS_SUMMARY",
+        ORIGIN_AMNESIA_RESTORE: "RESTORED_CONTEXT",
+        ORIGIN_CONTEXT_COLLAPSE: "COLLAPSED_CONTEXT",
+    }
+    lines = []
+    for m in messages:
+        origin = message_origin(m)
+        if origin in (ORIGIN_SNIP_BOUNDARY, ORIGIN_CONTEXT_EFFICIENCY, ORIGIN_COMPACTION_MARKER):
+            role = "HARNESS_NOTE"
+        elif origin in role_by_origin:
+            role = role_by_origin[origin]
+        elif isinstance(m, SystemMessage):
+            role = "SYSTEM_NOTE"
+        elif isinstance(m, AIMessage):
+            role = "Assistant"
+        elif isinstance(m, ToolMessage):
+            role = f"ToolResult({getattr(m, 'name', None) or 'tool'})"
+        else:
+            role = "User"
+        text = _content_text(getattr(m, "content", ""))
+        if len(text) > max_chars_per_message:
+            omitted = len(text) - max_chars_per_message
+            text = text[:max_chars_per_message] + f" ... [{omitted} chars omitted]"
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            names = ", ".join(tc.get("name", "tool") for tc in m.tool_calls if isinstance(tc, dict))
+            text = f"{text} [ToolCalls: {names}]".strip()
+        lines.append(f"{role}: {text}")
+    return "\n".join(lines)
+
+
+class CompactionState(AgentState):
+    """Compactor가 checkpointer state에 남기는 필드."""
+    snipped_message_ids: NotRequired[List[str]]     # Snip이 모델 입력에서 뺀 메시지 id
+    collapse_commits: NotRequired[List[Dict[str, Any]]]   # ContextCollapse 커밋 로그
+    last_assistant_at: NotRequired[float]           # time-based microcompact 기준 시각
+
+
+# =============================================================================
+# 0. ToolResultBudget (utils/toolResultStorage.ts) 🟢
+# =============================================================================
+class ToolResultBudget:
+    """큰 도구 결과를 디스크에 저장하고, 모델에게는 미리보기와 파일 경로만 보여줍니다.
+
+    - 도구별 상한(기본 50,000자)을 넘는 결과는 도구가 끝나는 즉시 저장합니다 (원본 maybePersistLargeToolResult).
+    - 한 라운드(병렬 도구 호출 한 번)의 결과 합계가 200,000자를 넘으면, 새 결과 중 큰 것부터 저장해
+      예산 아래로 낮춥니다 (원본 enforceToolResultBudget). 한 번 내린 결정은 state에 남아 이후에도 유지됩니다.
+    - file_read 결과는 저장하지 않습니다 (UNBOUNDED_RESULT_TOOLS 참고).
+    """
+
+    def __init__(self, storage_dir: str = "./artifacts/tool-results",
+                 max_result_chars: int = DEFAULT_MAX_RESULT_SIZE_CHARS,
+                 per_message_chars: int = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS,
+                 preview_chars: int = PREVIEW_SIZE_CHARS,
+                 unbounded_tools: Optional[set] = None,
+                 tool_limits: Optional[Dict[str, int]] = None):
+        self.storage_dir = storage_dir
+        self.max_result_chars = max_result_chars
+        self.per_message_chars = per_message_chars
+        self.preview_chars = preview_chars
+        self.unbounded_tools = set(UNBOUNDED_RESULT_TOOLS if unbounded_tools is None else unbounded_tools)
+        self.tool_limits = dict(tool_limits or {})
+
+    def threshold_for(self, tool_name: Optional[str]) -> float:
+        """원본 getPersistenceThreshold: 도구가 선언한 상한과 전역 상한 중 작은 값."""
+        if tool_name in self.unbounded_tools:
+            return math.inf
+        return min(self.tool_limits.get(tool_name or "", self.max_result_chars), self.max_result_chars)
+
+    def session_dir(self) -> str:
+        # 원본 경로 <project>/<sessionId>/tool-results 처럼 세션별로 나눕니다.
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", resolve_session_key())
+        return os.path.join(self.storage_dir, safe)
+
+    def generate_preview(self, content: str) -> Tuple[str, bool]:
+        """원본 generatePreview: 한도 안에서 마지막 줄바꿈 위치로 자릅니다 (너무 앞이면 한도 그대로)."""
+        if len(content) <= self.preview_chars:
+            return content, False
+        truncated = content[:self.preview_chars]
+        last_newline = truncated.rfind("\n")
+        cut = last_newline if last_newline > self.preview_chars * 0.5 else self.preview_chars
+        return content[:cut], True
+
+    def persist(self, content: str, tool_call_id: str) -> Optional[str]:
+        """결과를 파일로 저장하고 모델에게 보낼 대체 문자열을 반환합니다. 실패하면 None (원본 그대로 전달)."""
+        directory = self.session_dir()
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", tool_call_id or uuid.uuid4().hex)
+        path = os.path.join(directory, f"{safe_id}.txt")
+        try:
+            os.makedirs(directory, exist_ok=True)
+            # tool_call_id마다 내용이 정해져 있으므로 이미 있으면 다시 쓰지 않습니다 (원본 flag 'wx').
+            with open(path, "x", encoding="utf-8") as f:
+                f.write(content)
+        except FileExistsError:
+            pass
+        except OSError:
+            return None
+        preview, has_more = self.generate_preview(content)
+        return (
+            f"{PERSISTED_OUTPUT_TAG}\n"
+            f"Output too large ({_format_size(len(content))}). Full output saved to: {path}\n\n"
+            f"Preview (first {_format_size(self.preview_chars)}):\n"
+            f"{preview}{chr(10) + '...' + chr(10) if has_more else chr(10)}"
+            f"{PERSISTED_OUTPUT_CLOSING_TAG}"
+        )
+
+    @staticmethod
+    def is_persisted(msg: Any) -> bool:
+        return isinstance(msg.content, str) and msg.content.startswith(PERSISTED_OUTPUT_TAG)
+
+    def apply_to_tool_message(self, msg: ToolMessage, tool_name: Optional[str] = None) -> ToolMessage:
+        """도구별 상한을 넘는 결과를 저장된 미리보기로 바꿉니다."""
+        if not isinstance(msg.content, str) or self.is_persisted(msg):
+            return msg   # 원본도 텍스트가 아닌 결과(이미지 등)는 저장하지 않습니다
+        name = tool_name or getattr(msg, "name", None)
+        if len(msg.content) <= self.threshold_for(name):
+            return msg
+        replacement = self.persist(msg.content, msg.tool_call_id)
+        return _replace_tool_message(msg, replacement) if replacement else msg
+
+    def enforce_round_budget(self, messages: Sequence[Any]) -> List[ToolMessage]:
+        """마지막 라운드(대화 끝에 이어진 ToolMessage들)의 합계 예산을 적용하고, 교체할 메시지를 반환합니다."""
+        tail: List[ToolMessage] = []
+        for m in reversed(messages):
+            if not isinstance(m, ToolMessage):
+                break
+            tail.append(m)
+        counted = [m for m in tail if getattr(m, "name", None) not in self.unbounded_tools]
+        total = sum(len(_content_text(m.content)) for m in counted)
+        if total <= self.per_message_chars:
+            return []
+        fresh = [m for m in counted if isinstance(m.content, str) and not self.is_persisted(m)]
+        replacements = []
+        for m in sorted(fresh, key=lambda x: len(x.content), reverse=True):
+            replacement = self.persist(m.content, m.tool_call_id)
+            if replacement is None:
+                continue
+            total -= len(m.content) - len(replacement)
+            replacements.append(_replace_tool_message(m, replacement))
+            if total <= self.per_message_chars:
+                break
+        return replacements
+
+
+# =============================================================================
+# 1. SnipCompactor (services/compact/snipCompact.ts — 빌드에서 빠짐) 🟡
 # =============================================================================
 class SnipCompactor:
-    """Replaces verbose tool results older than age_threshold turns with concise 1-line stubs."""
-    def __init__(self, age_threshold: int = 2):
-        self.age_threshold = age_threshold
+    """모델이 snip 도구로 고른 메시지를 모델 입력에서 뺍니다 (LLM 요약 없음).
 
-    def compact(self, messages: list) -> tuple[list, bool]:
-        # 턴(Turn) 구분: 실제 사용자 메시지만 턴 시작으로 간주 (요약·복원 블록·StopHooks 피드백 제외)
-        human_indices = user_turn_starts(messages)
-        total_turns = len(human_indices)
-        
-        # 턴 수가 age_threshold 이하이면 스니핑 불필요
-        if total_turns <= self.age_threshold:
-            return messages, False
+    원본 흔적: utils/messages.ts가 사용자 메시지에 [id:...] 태그를 붙여 "모델이 snip 도구로 메시지를
+    지목"하게 하고, 컨텍스트가 커지면 SNIP_NUDGE_TEXT로 사용을 권합니다. 화면(REPL)에는 메시지가 남고
+    API로 보내는 뷰(projectSnippedView)에서만 빠집니다. 현재 턴(protected tail)은 snip되지 않습니다.
+    도구 인자, 태그 형식, 권유 문구는 원본 파일이 없어 이 구현에서 정한 것입니다.
+    """
 
-        # 최근 age_threshold개의 턴이 시작되는 인덱스를 cutoff로 지정
-        cutoff_msg_idx = human_indices[total_turns - self.age_threshold]
+    TAG_PATTERN = re.compile(r"\[id:([A-Za-z0-9]{8})\]")
 
-        modified = False
-        new_messages = list(messages)
+    def __init__(self, nudge_ratio: float = 0.7):
+        self.nudge_ratio = nudge_ratio
 
-        for idx in range(cutoff_msg_idx):
-            msg = new_messages[idx]
-            if isinstance(msg, ToolMessage) and len(str(msg.content)) > 80:
-                tool_name = getattr(msg, "name", "tool") or "tool"
-                snipped_content = f"[Tool result snipped: Executed '{tool_name}' successfully ({len(str(msg.content))} chars)]"
-                new_messages[idx] = ToolMessage(content=snipped_content, tool_call_id=msg.tool_call_id, name=tool_name)
-                modified = True
+    @staticmethod
+    def short_id(message_id: Optional[str]) -> Optional[str]:
+        if not message_id:
+            return None
+        compact = re.sub(r"[^A-Za-z0-9]", "", str(message_id))
+        return compact[-8:] if len(compact) >= 8 else None
 
-        return new_messages, modified
+    def tag_messages(self, messages: Sequence[Any]) -> List[Any]:
+        """실제 사용자 메시지와 도구 결과 끝에 [id:xxxxxxxx] 태그를 붙인 사본을 만듭니다."""
+        out = []
+        for m in messages:
+            sid = self.short_id(getattr(m, "id", None))
+            taggable = isinstance(m, ToolMessage) or is_user_turn_start(m)
+            if not sid or not taggable:
+                out.append(m)
+                continue
+            tag = f"[id:{sid}]"
+            if isinstance(m.content, str):
+                new_content: Any = f"{m.content}\n{tag}"
+            elif isinstance(m.content, list):
+                new_content = list(m.content) + [{"type": "text", "text": tag}]
+            else:
+                out.append(m)
+                continue
+            out.append(m.model_copy(update={"content": new_content}))
+        return out
+
+    def plan_snip(self, messages: Sequence[Any], start_id: str,
+                  end_id: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
+        """제거할 메시지 id 목록을 계산합니다. 문제가 있으면 ([], 오류 문구)를 반환합니다.
+
+        - 도구 호출(AIMessage)과 그 결과(ToolMessage)는 함께 지웁니다 (API 쌍 규칙).
+        - 현재 사용자 턴부터는 지우지 않습니다.
+        - 시스템 메시지와 압축 요약·복원 블록은 남깁니다.
+        """
+        index_by_short = {}
+        for i, m in enumerate(messages):
+            sid = self.short_id(getattr(m, "id", None))
+            if sid:
+                index_by_short[sid] = i
+        start_key = (start_id or "").strip().removeprefix("[id:").removesuffix("]")
+        end_key = (end_id or start_key).strip().removeprefix("[id:").removesuffix("]")
+        if start_key not in index_by_short or end_key not in index_by_short:
+            return [], f"Unknown message id. Use the 8-character ids shown in [id:...] tags."
+        i, j = sorted((index_by_short[start_key], index_by_short[end_key]))
+
+        protected = last_user_turn_start(messages)
+        protected = len(messages) if protected is None else protected
+        if i >= protected:
+            return [], "The current user turn cannot be snipped."
+        j = min(j, protected - 1)
+
+        while i > 0 and isinstance(messages[i], ToolMessage):
+            i -= 1
+        while j + 1 < protected and isinstance(messages[j + 1], ToolMessage):
+            j += 1
+
+        ids = [
+            m.id for m in messages[i:j + 1]
+            if getattr(m, "id", None)
+            and not isinstance(m, SystemMessage)
+            and not is_compaction_artifact(m)
+        ]
+        if not ids:
+            return [], "Nothing to snip in that range."
+        return ids, None
+
+    def project(self, messages: Sequence[Any], snipped_ids: Sequence[str]) -> List[Any]:
+        """snip된 메시지를 빼고, 빠진 자리마다 경계 표시 메시지를 하나 넣습니다."""
+        snipped = set(snipped_ids or [])
+        if not snipped:
+            return list(messages)
+        out: List[Any] = []
+        run, carried = 0, ""
+        for m in messages:
+            if getattr(m, "id", None) in snipped:
+                run += 1
+                carried += _leading_system_reminder(m)
+                continue
+            if run:
+                out.append(self._boundary(run, carried))
+                run, carried = 0, ""
+            out.append(m)
+        if run:
+            out.append(self._boundary(run, carried))
+        return out
+
+    @staticmethod
+    def _boundary(count: int, prefix: str = "") -> HumanMessage:
+        return HumanMessage(
+            content=(f"{prefix}{SNIP_BOUNDARY_HEADER} {count} earlier message(s) were removed from context "
+                     f"with the snip tool.\n{AUTO_GENERATED_NOTE}"),
+            additional_kwargs=origin_kwargs(ORIGIN_SNIP_BOUNDARY),
+        )
+
+    def nudge(self, used_tokens: int, limit_tokens: int) -> Optional[HumanMessage]:
+        """컨텍스트가 임계치의 nudge_ratio를 넘으면 snip 사용을 권하는 알림을 만듭니다."""
+        if limit_tokens <= 0 or used_tokens < limit_tokens * self.nudge_ratio:
+            return None
+        pct = int(used_tokens * 100 / limit_tokens)
+        return HumanMessage(
+            content=(
+                f"{CONTEXT_EFFICIENCY_HEADER}\n{AUTO_GENERATED_NOTE}\n"
+                f"Context usage is about {pct}% of the compaction threshold "
+                f"(~{used_tokens:,} / {limit_tokens:,} tokens). If earlier messages are no longer needed, "
+                "call the `snip` tool with their [id:...] tags to remove them before older context "
+                "is summarized automatically."
+            ),
+            additional_kwargs=origin_kwargs(ORIGIN_CONTEXT_EFFICIENCY),
+        )
+
+    def build_tool(self):
+        compactor = self
+
+        @tool("snip")
+        def snip_tool(
+            start_id: str,
+            tool_call_id: Annotated[str, InjectedToolCallId],
+            state: Annotated[dict, InjectedState],
+            end_id: str = "",
+            reason: str = "",
+        ) -> Command:
+            """Remove earlier messages from your context window to free space.
+
+            Messages in your context carry tags like [id:ab12cd34]. Pass the id of the first message
+            to remove as start_id and, for a range, the id of the last one as end_id. Tool calls and
+            their results are removed together, and the current user turn cannot be removed.
+            Snipped messages stay in the session log but you will no longer see them, so only snip
+            content you are sure you no longer need (old file dumps, finished searches, long logs).
+            """
+            messages = list(state.get("messages", []))
+            ids, error = compactor.plan_snip(messages, start_id, end_id or None)
+            if error:
+                return Command(update={"messages": [
+                    ToolMessage(content=f"Snip failed: {error}", tool_call_id=tool_call_id,
+                                name="snip", status="error"),
+                ]})
+            previous = list(state.get("snipped_message_ids") or [])
+            new_ids = [i for i in ids if i not in set(previous)]
+            removed = [m for m in messages if getattr(m, "id", None) in set(new_ids)]
+            freed = rough_token_count(removed)
+            note = f" Reason: {reason}" if reason else ""
+            return Command(update={
+                "snipped_message_ids": previous + new_ids,
+                "messages": [ToolMessage(
+                    content=f"Snipped {len(new_ids)} message(s), about {freed:,} tokens freed.{note}",
+                    tool_call_id=tool_call_id, name="snip",
+                )],
+            })
+
+        return snip_tool
 
 
 # =============================================================================
-# 2. MicroCompactor (Size-based Disk Swap for Large Tool Outputs)
+# 2. MicroCompactor — time-based (services/compact/microCompact.ts) 🟢
 # =============================================================================
 class MicroCompactor:
-    """Swaps large tool outputs exceeding max_chars to local disk swap files.
-    Includes idempotency guard to skip already-swapped stubs."""
-    SWAP_MARKER = "microcompacted to disk:"  # Idempotency marker
+    """마지막 AI 응답 이후 오래(기본 60분) 지났다면, 오래된 도구 결과의 본문을 비웁니다.
 
-    def __init__(self, max_chars: int = 5000, swap_dir: str = "./.claude/swaps"):
-        self.max_chars = max_chars
-        self.swap_dir = swap_dir
-        os.makedirs(self.swap_dir, exist_ok=True)
+    서버의 프롬프트 캐시(TTL 1시간)가 이미 만료되어 어차피 전체를 다시 보내야 하므로, 보내기 전에
+    줄이는 것이 이득이라는 판단입니다. 최근 keep_recent개의 결과는 남깁니다. LLM 호출은 없습니다.
+    원본의 기본값은 enabled=false이고 원격 설정(GrowthBook)으로 켭니다.
+    원본에는 서버 캐시를 직접 편집하는 cached microcompact 경로도 있지만 내부 전용 API라 구현하지 않습니다.
+    """
 
-    def compact(self, messages: list) -> tuple[list, bool]:
-        modified = False
-        new_messages = []
+    def __init__(self, gap_threshold_minutes: float = TIME_BASED_MC_GAP_MINUTES,
+                 keep_recent: int = TIME_BASED_MC_KEEP_RECENT,
+                 compactable_tools: Optional[set] = None):
+        self.gap_threshold_minutes = gap_threshold_minutes
+        self.keep_recent = keep_recent
+        self.compactable_tools = set(COMPACTABLE_TOOLS if compactable_tools is None else compactable_tools)
 
-        for msg in messages:
-            content_str = str(msg.content) if msg.content else ""
-            # Idempotency guard: skip already-swapped stubs
-            if isinstance(msg, ToolMessage) and self.SWAP_MARKER in content_str:
-                new_messages.append(msg)
-                continue
-            if isinstance(msg, ToolMessage) and len(content_str) > self.max_chars:
-                tc_id = getattr(msg, "tool_call_id", "") or ""
-                digest = hashlib.sha1(
-                    f"{tc_id}:{content_str}".encode("utf-8", errors="ignore")
-                ).hexdigest()[:12]
-                swap_filename = f"swap_{digest}.txt"
-                swap_path = os.path.join(self.swap_dir, swap_filename)
-                if not os.path.exists(swap_path):
-                    with open(swap_path, "w", encoding="utf-8") as f:
-                        f.write(content_str)
-                
-                tool_name = getattr(msg, "name", "tool") or "tool"
-                swap_stub = (
-                    f"[Output ({len(content_str)} chars) microcompacted to disk: {swap_path}]\n"
-                    f"💡 Actionable Hint: If you need specific details from this large result, use "
-                    f"file inspection tools (e.g. `file_read` with line slices or `grep_search`) on '{swap_path}' "
-                    f"instead of re-running the full query."
-                )
-                new_messages.append(ToolMessage(content=swap_stub, tool_call_id=msg.tool_call_id, name=tool_name))
-                modified = True
-            else:
-                new_messages.append(msg)
+    def evaluate_trigger(self, last_assistant_at: Optional[float], now: Optional[float] = None) -> Optional[float]:
+        """발동하면 경과 분을, 아니면 None을 반환합니다 (원본 evaluateTimeBasedTrigger)."""
+        if last_assistant_at is None:
+            return None
+        gap = ((now if now is not None else time.time()) - last_assistant_at) / 60
+        return gap if gap >= self.gap_threshold_minutes else None
 
-        return new_messages, modified
+    def clear_old_results(self, messages: Sequence[Any]) -> Tuple[List[ToolMessage], int]:
+        """최근 keep_recent개를 뺀 대상 도구 결과를 비운 교체 메시지와 절약 토큰 추정치를 반환합니다."""
+        compactable_ids = [
+            tc.get("id") for m in messages if isinstance(m, AIMessage)
+            for tc in (getattr(m, "tool_calls", None) or [])
+            if tc.get("name") in self.compactable_tools and tc.get("id")
+        ]
+        # 0이면 전부 지워 작업 맥락이 사라지므로 최소 1개는 남깁니다 (원본과 동일).
+        keep = set(compactable_ids[-max(1, self.keep_recent):])
+        clear = set(compactable_ids) - keep
+        replacements, saved = [], 0
+        for m in messages:
+            if (isinstance(m, ToolMessage) and m.tool_call_id in clear
+                    and m.content != TIME_BASED_MC_CLEARED_MESSAGE):
+                saved += rough_token_count([m])
+                replacements.append(_replace_tool_message(m, TIME_BASED_MC_CLEARED_MESSAGE))
+        return replacements, saved
 
 
 # =============================================================================
-# 3. ContextCollapse (Grouping Intermediate Exploration Work Blocks)
+# 3. ContextCollapse (services/contextCollapse/ — 빌드에서 빠짐) 🟡
 # =============================================================================
+COLLAPSE_SUMMARY_PROMPT = (
+    "Summarize the following completed portion of a conversation between a user and a coding agent "
+    "in a few sentences. Keep file names, decisions, results, errors and anything the user asked "
+    "to remember. Respond with plain text only and do not call tools.\n\n"
+)
+
+
 class ContextCollapse:
-    """Folds 3+ consecutive exploration/research tool calls into 1 collapsed snapshot SystemMessage.
-    Uses UNSAFE_TO_COLLAPSE_TOOLS blocklist: groups containing write/execute tools are NOT collapsed.
-    Preserves tool_call_ids in collapsed message additional_kwargs for protocol compliance."""
-    def __init__(self, min_consecutive: int = 3, swap_dir: str = "./.claude/swaps",
-                 unsafe_tools: set = None):
-        self.min_consecutive = min_consecutive
-        self.swap_dir = swap_dir
-        self.unsafe_tools = unsafe_tools if unsafe_tools is not None else UNSAFE_TO_COLLAPSE_TOOLS
-        if self.swap_dir and not os.path.exists(self.swap_dir):
-            os.makedirs(self.swap_dir, exist_ok=True)
+    """완료된 이전 턴을 요약으로 "접되", 원본 메시지는 state에 그대로 둡니다.
 
-    def _is_collapsible_candidate(self, msg) -> bool:
-        """Check if a message is part of a potentially collapsible tool sequence."""
-        if isinstance(msg, ToolMessage):
-            return True
-        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
-            return True
-        return False
+    원본 흔적(query.ts, logs.ts, autoCompact.ts 주석):
+    - 원본 대화를 고쳐 쓰지 않고, 커밋 로그를 매 호출마다 다시 적용해 접힌 뷰를 만듭니다 (read-time projection).
+    - 컨텍스트가 90%에 이르면 커밋을 시작하고, 접힌 요약은 별도 에이전트(ctx-agent)가 만듭니다.
+    - Collapse가 켜져 있으면 Auto-Compact는 발동하지 않습니다 (둘이 경쟁하면 세밀한 맥락이 사라지므로).
+    접는 단위(완료된 사용자 턴 1개씩)와 요약 프롬프트는 원본 파일이 없어 이 구현에서 정한 것입니다.
+    """
 
-    def _group_is_safe(self, group: list) -> bool:
-        """Check that NO tools in the group are in the unsafe blocklist."""
-        for m in group:
-            if isinstance(m, ToolMessage):
-                tool_name = getattr(m, "name", None) or ""
-                if tool_name in self.unsafe_tools:
-                    return False
-            elif isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-                for tc in m.tool_calls:
-                    tc_name = tc.get("name", "")
-                    if tc_name in self.unsafe_tools:
-                        return False
-        return True
+    def __init__(self, llm, commit_ratio: float = COLLAPSE_COMMIT_RATIO, max_chars_per_message: int = 2000):
+        self.llm = llm
+        self.commit_ratio = commit_ratio
+        self.max_chars_per_message = max_chars_per_message
 
-    def compact(self, messages: list) -> tuple[list, bool]:
-        new_messages = []
-        i = 0
-        n = len(messages)
-        modified = False
+    @staticmethod
+    def _collapsed_ids(commits: Sequence[Dict[str, Any]]) -> set:
+        return {mid for c in commits for mid in c.get("message_ids", [])}
 
-        while i < n:
-            msg = messages[i]
-            if self._is_collapsible_candidate(msg):
-                group = []
-                while i < n and self._is_collapsible_candidate(messages[i]):
-                    group.append(messages[i])
-                    i += 1
-                
-                # Only collapse if group is large enough AND no unsafe tools present
-                if len(group) >= self.min_consecutive and self._group_is_safe(group):
-                    tool_names = set()
-                    tool_call_ids = []
-                    raw_lines = []
-                    for m in group:
-                        if isinstance(m, ToolMessage) and getattr(m, "name", None):
-                            tool_names.add(m.name)
-                            tool_call_ids.append(m.tool_call_id)
-                            raw_lines.append(f"[ToolResult:{m.name}] {m.content}")
-                        elif isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-                            for tc in m.tool_calls:
-                                tool_names.add(tc.get("name", "tool"))
-                                if tc.get("id"):
-                                    tool_call_ids.append(tc["id"])
-                            raw_lines.append(f"[AIThought] {m.content}")
-                    
-                    tools_str = ", ".join(sorted(tool_names)) if tool_names else "exploration tools"
-                    
-                    # Save raw snapshot to disk for 100% restoration if needed by agent
-                    snap_full_path = None
-                    if self.swap_dir:
-                        joined_raw = "\n\n".join(raw_lines)
-                        digest = hashlib.sha1(
-                            joined_raw.encode("utf-8", errors="ignore")
-                        ).hexdigest()[:12]
-                        snap_filename = f"collapse_snap_{digest}.txt"
-                        snap_full_path = os.path.join(self.swap_dir, snap_filename)
-                        try:
-                            if not os.path.exists(snap_full_path):
-                                with open(snap_full_path, "w", encoding="utf-8") as sf:
-                                    sf.write(joined_raw)
-                        except Exception:
-                            snap_full_path = None
+    def next_span(self, messages: Sequence[Any], commits: Sequence[Dict[str, Any]]) -> Optional[List[Any]]:
+        """아직 접지 않은 가장 오래된 완료 턴의 메시지를 반환합니다. 현재 턴은 대상이 아닙니다."""
+        collapsed = self._collapsed_ids(commits)
+        starts = user_turn_starts(messages)
+        for k in range(len(starts) - 1):
+            span = [
+                m for m in messages[starts[k]:starts[k + 1]]
+                if getattr(m, "id", None) and message_origin(m) is None
+                and not isinstance(m, SystemMessage) and m.id not in collapsed
+            ]
+            if span:
+                return span
+        return None
 
-                    hint_str = ""
-                    if snap_full_path:
-                        hint_str = (
-                            f"\n💡 Actionable Hint: Full intermediate research logs are preserved at '{snap_full_path}'. "
-                            f"If you need to recall past investigation details, use `file_read(path='{snap_full_path}')` or `grep_search`."
-                        )
+    def _summary_prompt(self, span: Sequence[Any]) -> str:
+        return COLLAPSE_SUMMARY_PROMPT + _serialize_for_summary(span, self.max_chars_per_message)
 
-                    collapse_msg = SystemMessage(
-                        content=(
-                            f"[Context Collapsed: {len(group)} research steps ({tools_str}) performed in workspace]"
-                            + hint_str
-                        ),
-                        additional_kwargs={"collapsed_tool_call_ids": tool_call_ids},
-                    )
-                    new_messages.append(collapse_msg)
-                    modified = True
-                else:
-                    new_messages.extend(group)
-            else:
-                new_messages.append(msg)
-                i += 1
+    def _build_commit(self, span: Sequence[Any], summary: str) -> Dict[str, Any]:
+        return {
+            "commit_id": uuid.uuid4().hex[:8],
+            "message_ids": [m.id for m in span],
+            "summary": summary.strip(),
+            "created_at": time.time(),
+        }
 
-        return new_messages, modified
+    def commit(self, span: Sequence[Any]) -> Optional[Dict[str, Any]]:
+        try:
+            response = self.llm.invoke([HumanMessage(content=self._summary_prompt(span))])
+        except Exception as e:
+            print(f"⚠️ [ContextCollapse] summary failed, skipping commit: {e}")
+            return None
+        summary = _content_text(getattr(response, "content", response))
+        return self._build_commit(span, summary) if summary.strip() else None
+
+    def project(self, messages: Sequence[Any], commits: Sequence[Dict[str, Any]]) -> List[Any]:
+        """커밋된 구간을 요약 메시지 하나로 바꾼 뷰를 만듭니다."""
+        if not commits:
+            return list(messages)
+        commit_by_id = {mid: c for c in commits for mid in c.get("message_ids", [])}
+        out: List[Any] = []
+        emitted = set()
+        for m in messages:
+            c = commit_by_id.get(getattr(m, "id", None))
+            if c is None:
+                out.append(m)
+                continue
+            if c["commit_id"] not in emitted:
+                emitted.add(c["commit_id"])
+                # 커밋은 사용자 턴 시작 메시지부터 담으므로, 첫 구성원에 붙은 CLAUDE.md 블록을 요약 앞으로 옮깁니다.
+                out.append(HumanMessage(
+                    content=(f"{_leading_system_reminder(m)}{CONTEXT_COLLAPSE_HEADER}\n{AUTO_GENERATED_NOTE}\n"
+                             f"({len(c['message_ids'])} messages collapsed)\n\n{c['summary']}"),
+                    additional_kwargs=origin_kwargs(ORIGIN_CONTEXT_COLLAPSE),
+                ))
+        return out
 
 
 # =============================================================================
-# 4. AutoCompactor (Proactive Token Threshold Summary + Amnesia Guard)
+# 4. AutoCompactor (services/compact/autoCompact.ts, compact.ts, prompt.ts) 🟢
 # =============================================================================
+# 원본 prompt.ts의 NO_TOOLS_PREAMBLE + BASE_COMPACT_PROMPT + NO_TOOLS_TRAILER
+NO_TOOLS_PREAMBLE = """CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use any tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+"""
+
+BASE_COMPACT_PROMPT = """Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
+
+Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
+
+1. Chronologically analyze each message and section of the conversation. For each section thoroughly identify:
+   - The user's explicit requests and intents
+   - Your approach to addressing the user's requests
+   - Key decisions, technical concepts and code patterns
+   - Specific details like:
+     - file names
+     - full code snippets
+     - function signatures
+     - file edits
+   - Errors that you ran into and how you fixed them
+   - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
+2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.
+
+Your summary should include the following sections:
+
+1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail
+2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks discussed.
+3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages and include full code snippets where applicable and include a summary of why this file read or edit is important.
+4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
+5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.
+6. All user messages: List ALL user messages that are not tool results. These are critical for understanding the users' feedback and changing intent.
+7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
+8. Current Work: Describe in detail precisely what was being worked on immediately before this summary request, paying special attention to the most recent messages from both user and assistant. Include file names and code snippets where applicable.
+9. Optional Next Step: List the next step that you will take that is related to the most recent work you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most recent explicit requests, and the task you were working on immediately before this summary request. If your last task was concluded, then only list next steps if they are explicitly in line with the users request. Do not start on tangential requests or really old requests that were already completed without confirming with the user first.
+                       If there is a next step, include direct quotes from the most recent conversation showing exactly what task you were working on and where you left off. This should be verbatim to ensure there's no drift in task interpretation.
+
+Here's an example of how your output should be structured:
+
+<example>
+<analysis>
+[Your thought process, ensuring all points are covered thoroughly and accurately]
+</analysis>
+
+<summary>
+1. Primary Request and Intent:
+   [Detailed description]
+
+2. Key Technical Concepts:
+   - [Concept 1]
+   - [Concept 2]
+   - [...]
+
+3. Files and Code Sections:
+   - [File Name 1]
+      - [Summary of why this file is important]
+      - [Summary of the changes made to this file, if any]
+      - [Important Code Snippet]
+   - [File Name 2]
+      - [Important Code Snippet]
+   - [...]
+
+4. Errors and fixes:
+    - [Detailed description of error 1]:
+      - [How you fixed the error]
+      - [User feedback on the error if any]
+    - [...]
+
+5. Problem Solving:
+   [Description of solved problems and ongoing troubleshooting]
+
+6. All user messages:
+    - [Detailed non tool use user message]
+    - [...]
+
+7. Pending Tasks:
+   - [Task 1]
+   - [Task 2]
+   - [...]
+
+8. Current Work:
+   [Precise description of current work]
+
+9. Optional Next Step:
+   [Optional Next step to take]
+
+</summary>
+</example>
+
+Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response.
+"""
+
+NO_TOOLS_TRAILER = (
+    "\n\nREMINDER: Do NOT call any tools. Respond with plain text only — "
+    "an <analysis> block followed by a <summary> block. "
+    "Tool calls will be rejected and you will fail the task."
+)
+
+
+def get_compact_prompt(custom_instructions: Optional[str] = None) -> str:
+    prompt = NO_TOOLS_PREAMBLE + BASE_COMPACT_PROMPT
+    if custom_instructions and custom_instructions.strip():
+        prompt += f"\n\nAdditional Instructions:\n{custom_instructions}"
+    return prompt + NO_TOOLS_TRAILER
+
+
+def format_compact_summary(summary: str) -> str:
+    """원본 formatCompactSummary: <analysis> 초안을 지우고 <summary> 태그를 'Summary:' 머리말로 바꿉니다."""
+    text = re.sub(r"<analysis>[\s\S]*?</analysis>", "", summary, count=1)
+    match = re.search(r"<summary>([\s\S]*?)</summary>", text)
+    if match:
+        text = text.replace(match.group(0), f"Summary:\n{match.group(1).strip()}", 1)
+    text = re.sub(r"\n\n+", "\n\n", text)
+    return text.strip()
+
+
+def get_compact_user_summary_message(summary: str, recent_messages_preserved: bool = False,
+                                     suppress_follow_up_questions: bool = True) -> str:
+    """원본 getCompactUserSummaryMessage의 본문."""
+    text = (
+        "This session is being continued from a previous conversation that ran out of context. "
+        "The summary below covers the earlier portion of the conversation.\n\n"
+        f"{format_compact_summary(summary)}"
+    )
+    if recent_messages_preserved:
+        text += "\n\nRecent messages are preserved verbatim."
+    if suppress_follow_up_questions:
+        text += (
+            "\nContinue the conversation from where it left off without asking the user any further "
+            "questions. Resume directly — do not acknowledge the summary, do not recap what was happening, "
+            "do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened."
+        )
+    return text
+
+
 def build_compaction_summary_message(summary_text: str) -> HumanMessage:
     """이전 대화 요약을 HumanMessage로 만듭니다.
 
@@ -285,20 +830,19 @@ def build_compaction_summary_message(summary_text: str) -> HumanMessage:
 
 
 class AutoCompactor:
-    """Proactively summarizes history when token count exceeds threshold.
-    Preserves only original L1-L5 system prompts at the top.
-    Intermediate SystemMessages (Collapse artifacts, etc.) are included in the summary.
+    """토큰이 임계치를 넘으면 이전 턴을 원본의 9개 섹션 형식으로 요약해 대화를 교체합니다.
 
-    Includes Claude Code Circuit Breaker:
-    - Tracks consecutive failures (MAX_CONSECUTIVE_FAILURES = 3)
-    - If 3 consecutive compactions fail, circuit trips and further attempts are skipped
-      to prevent infinite API call storms and billing exhaustion.
+    - 요약에 실패하면 압축하지 않고 실패 횟수만 늘립니다. 3회 연속 실패하면 이 세션에서는 더 시도하지
+      않습니다 (원본 circuit breaker: MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3).
+    - 요약 호출 자체가 prompt_too_long이면 가장 오래된 API 라운드부터 버리고 최대 3회 다시 시도합니다.
+    - 압축 뒤에는 AmnesiaGuard가 최근 파일과 활성 계획을 복원 블록으로 붙입니다
+      (원본 POST_COMPACT_MAX_FILES_TO_RESTORE = 5, createPlanAttachmentIfNeeded).
+    - 원본 L1~L5 시스템 프롬프트만 맨 앞에 남기고, 나머지 SystemMessage는 요약 대상에 넣습니다.
     """
 
-    # Prefixes used by pipeline-generated SystemMessages (not original L1-L5)
-    MAX_CONSECUTIVE_FAILURES = 3
+    MAX_CONSECUTIVE_FAILURES = MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
 
-    # Prefixes used by pipeline-generated SystemMessages (not original L1-L5)
+    # 이전 버전 파이프라인이 만든 SystemMessage 머리말 (원본 L1~L5 시스템 프롬프트가 아님)
     _PIPELINE_PREFIXES = (
         "[Context Collapsed:",
         "[Compaction Amnesia Guard:",
@@ -307,37 +851,32 @@ class AutoCompactor:
     )
 
     def __init__(self, llm, threshold_tokens: int = 8000, amnesia_guard=None,
-                 max_consecutive_failures: int = 3):
+                 max_consecutive_failures: int = MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES,
+                 max_chars_per_message: int = 4000):
         self.llm = llm
         self.threshold_tokens = threshold_tokens
         self.amnesia_guard = amnesia_guard
         self.max_consecutive_failures = max_consecutive_failures
+        self.max_chars_per_message = max_chars_per_message
         self.consecutive_failures = 0
 
     @property
     def is_circuit_open(self) -> bool:
-        """Check if circuit breaker is open (tripped)."""
         return self.consecutive_failures >= self.max_consecutive_failures
 
     def reset_circuit_breaker(self):
-        """Manually reset circuit breaker failure counter."""
         self.consecutive_failures = 0
 
     def get_token_count(self, messages: list) -> int:
         try:
             return self.llm.get_num_tokens_from_messages(messages)
         except Exception:
-            return sum(len(str(m.content)) for m in messages) // 4
+            return rough_token_count(messages)
 
     def _is_original_system_msg(self, msg) -> bool:
-        """Check if a SystemMessage is an original L1-L5 system prompt (not a pipeline artifact)."""
         if not isinstance(msg, SystemMessage):
             return False
-        content = str(msg.content)
-        for prefix in self._PIPELINE_PREFIXES:
-            if content.startswith(prefix):
-                return False
-        return True
+        return not str(msg.content).startswith(self._PIPELINE_PREFIXES)
 
     @staticmethod
     def has_completed_turns(messages: list) -> bool:
@@ -350,15 +889,12 @@ class AutoCompactor:
 
     @staticmethod
     def _split_dialogue_for_compaction(dialogue_messages: list) -> tuple[list, list]:
-        """대화 메시지를 압축 대상(과거 턴)과 보존 대상(현재 진행 중인 마지막 턴/페어)으로 안전하게 분리합니다."""
-        # 턴 경계는 실제 사용자 메시지만 (요약·복원 블록·StopHooks 피드백 HumanMessage는 경계가 아님)
+        """대화를 압축 대상(과거 턴)과 보존 대상(현재 진행 중인 마지막 턴)으로 나눕니다."""
         last_human_idx = last_user_turn_start(dialogue_messages)
-
-        # 마지막 유저 턴 이전에 과거 대화가 존재하면, 마지막 유저 턴부터 끝까지(진행 중인 tool loop 포함) 전부 보존
         if last_human_idx is not None and last_human_idx > 0:
             return dialogue_messages[:last_human_idx], dialogue_messages[last_human_idx:]
 
-        # 단일 턴 내 메시지인 경우: 마지막 메시지가 ToolMessage이면 직전 AIMessage(tool_calls)까지 함께 보존
+        # 단일 턴: 마지막이 ToolMessage면 그 도구를 부른 AIMessage까지 함께 보존
         if isinstance(dialogue_messages[-1], ToolMessage):
             idx = len(dialogue_messages) - 1
             while idx > 0 and isinstance(dialogue_messages[idx], ToolMessage):
@@ -368,52 +904,74 @@ class AutoCompactor:
 
         return dialogue_messages[:-1], [dialogue_messages[-1]]
 
-    @staticmethod
-    def _build_summary_prompt(to_compact: list, max_chars_per_message: int = 4000) -> str:
-        history_text = ""
-        for m in to_compact:
-            origin = message_origin(m)
-            if origin == ORIGIN_COMPACTION_SUMMARY:
-                role = "PREVIOUS_SUMMARY"
-            elif origin == ORIGIN_AMNESIA_RESTORE:
-                role = "RESTORED_CONTEXT"
-            elif isinstance(m, SystemMessage):
-                role = "SYSTEM_NOTE"
-            elif m.type == "ai":
-                role = "AI"
-            elif m.type == "human":
-                role = "User"
-            else:
-                role = m.type.upper()
-            content_str = str(m.content or "")
-            # 원본 state를 요약하므로 대형 도구 출력이 요약 프롬프트를 키우지 않도록 메시지당 길이를 제한
-            if len(content_str) > max_chars_per_message:
-                omitted = len(content_str) - max_chars_per_message
-                content_str = content_str[:max_chars_per_message] + f" ... [{omitted} chars omitted]"
-            if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-                tc_names = ", ".join(tc.get("name", "tool") for tc in m.tool_calls if isinstance(tc, dict))
-                if tc_names:
-                    content_str = f"{content_str} [ToolCalls: {tc_names}]".strip()
-            history_text += f"{role}: {content_str}\n"
+    def build_summary_request(self, to_compact: Sequence[Any]) -> str:
+        """요약 LLM에 보낼 프롬프트: 직렬화한 대화 뒤에 원본 요약 지시문을 붙입니다."""
+        history = _serialize_for_summary(to_compact, self.max_chars_per_message)
+        return f"<conversation>\n{history}\n</conversation>\n\n{get_compact_prompt()}"
 
-        return (
-            "You are a context compaction engine. Please summarize the following conversation history.\n"
-            "Structure your summary into 4 clear sections:\n"
-            "1. Primary Goal & Intent\n"
-            "2. Key Decisions & Architecture\n"
-            "3. Code Modifications & Workspace Delta\n"
-            "4. Current Task & Next Action\n\n"
-            f"Conversation History:\n{history_text}"
+    def _plan_compaction(self, messages: list, force: bool) -> Optional[tuple[list, list, list]]:
+        """압축이 필요하면 (원본 시스템 메시지, 압축 대상, 보존 대상)을, 아니면 None을 반환합니다."""
+        if self.is_circuit_open:
+            print(f"⚠️ [AutoCompactor Circuit Breaker ACTIVE] {self.consecutive_failures} consecutive failures. Skipping compaction.")
+            return None
+        if not force and self.get_token_count(messages) <= self.threshold_tokens:
+            return None
+
+        original_system_messages = [m for m in messages if self._is_original_system_msg(m)]
+        dialogue_messages = [m for m in messages if not self._is_original_system_msg(m)]
+        if len(dialogue_messages) <= 1:
+            return None
+
+        to_compact, tail_messages = self._split_dialogue_for_compaction(dialogue_messages)
+        if not to_compact:
+            return None
+        return original_system_messages, to_compact, tail_messages
+
+    def _summarize(self, to_compact: Sequence[Any]) -> str:
+        to_summarize = list(to_compact)
+        for attempt in range(MAX_PTL_RETRIES + 1):
+            try:
+                response = self.llm.invoke([HumanMessage(content=self.build_summary_request(to_summarize))])
+                return _content_text(getattr(response, "content", response))
+            except Exception as e:
+                truncated = (truncate_head_for_ptl_retry(to_summarize)
+                             if attempt < MAX_PTL_RETRIES and is_prompt_too_long_error(e) else None)
+                if truncated is None:
+                    raise
+                print(f"⚠️ [AutoCompactor] summary request too long, dropping oldest API rounds (retry {attempt + 1}/{MAX_PTL_RETRIES})")
+                to_summarize = truncated
+        raise RuntimeError("unreachable")
+
+    async def _asummarize(self, to_compact: Sequence[Any]) -> str:
+        to_summarize = list(to_compact)
+        for attempt in range(MAX_PTL_RETRIES + 1):
+            try:
+                request = [HumanMessage(content=self.build_summary_request(to_summarize))]
+                if hasattr(self.llm, "ainvoke"):
+                    response = await self.llm.ainvoke(request)
+                else:
+                    response = await asyncio.to_thread(self.llm.invoke, request)
+                return _content_text(getattr(response, "content", response))
+            except Exception as e:
+                truncated = (truncate_head_for_ptl_retry(to_summarize)
+                             if attempt < MAX_PTL_RETRIES and is_prompt_too_long_error(e) else None)
+                if truncated is None:
+                    raise
+                to_summarize = truncated
+        raise RuntimeError("unreachable")
+
+    def _record_failure(self, error: Exception) -> None:
+        self.consecutive_failures += 1
+        print(f"⚠️ [AutoCompactor Failure] summary failed ({self.consecutive_failures}/{self.max_consecutive_failures}): {error}")
+        if self.is_circuit_open:
+            print(f"🚨 [AutoCompactor Circuit Tripped] {self.max_consecutive_failures} consecutive failures. "
+                  "Auto-compaction is disabled for this session.")
+
+    def _finalize_compacted_messages(self, original_system_messages: list, summary_raw: str,
+                                     tail_messages: list) -> list:
+        summary_msg = build_compaction_summary_message(
+            get_compact_user_summary_message(summary_raw, recent_messages_preserved=bool(tail_messages))
         )
-
-    def _finalize_compacted_messages(
-        self,
-        original_system_messages: list,
-        summary_text: str,
-        tail_messages: list,
-    ) -> list:
-        summary_msg = build_compaction_summary_message(summary_text)
-
         recovery_attachments = []
         if self.amnesia_guard:
             for att in self.amnesia_guard.create_recovery_attachments():
@@ -422,31 +980,7 @@ class AutoCompactor:
                     ak.setdefault(key, value)
                 att.additional_kwargs = ak
                 recovery_attachments.append(att)
-
         return original_system_messages + [summary_msg] + recovery_attachments + list(tail_messages)
-
-    def _plan_compaction(self, messages: list, force: bool) -> Optional[tuple[list, list, list]]:
-        """압축이 필요하면 (원본 시스템 메시지, 압축 대상, 보존 대상)을, 아니면 None을 반환합니다."""
-        # 1. Circuit breaker check: halt repeated failing compactions
-        if self.is_circuit_open:
-            print(f"⚠️ [AutoCompactor Circuit Breaker ACTIVE] {self.consecutive_failures} consecutive failures. Skipping compaction to prevent infinite loop.")
-            return None
-
-        tokens = self.get_token_count(messages)
-        if not force and tokens <= self.threshold_tokens:
-            return None
-
-        # Separate only original L1-L5 system messages; everything else goes into dialogue
-        original_system_messages = [m for m in messages if self._is_original_system_msg(m)]
-        dialogue_messages = [m for m in messages if not self._is_original_system_msg(m)]
-
-        if len(dialogue_messages) <= 1:
-            return None
-
-        to_compact, tail_messages = self._split_dialogue_for_compaction(dialogue_messages)
-        if not to_compact:
-            return None
-        return original_system_messages, to_compact, tail_messages
 
     def compact_if_needed(self, messages: list, force: bool = False) -> tuple[list, bool]:
         compacted, was_compacted, _ = self.compact_with_details(messages, force=force)
@@ -462,26 +996,13 @@ class AutoCompactor:
         if plan is None:
             return messages, False, []
         original_system_messages, to_compact, tail_messages = plan
-
-        summary_prompt = self._build_summary_prompt(to_compact)
-
         try:
-            from app.utils.message_utils import normalize_content
-            summary_response = self.llm.invoke([HumanMessage(content=summary_prompt)])
-            summary_text = normalize_content(getattr(summary_response, "content", summary_response))
-            # Compaction succeeded -> reset circuit breaker
-            self.consecutive_failures = 0
+            summary_raw = self._summarize(to_compact)
         except Exception as e:
-            # Compaction failed -> increment circuit breaker
-            self.consecutive_failures += 1
-            print(f"⚠️ [AutoCompactor Failure] LLM summary invocation failed ({self.consecutive_failures}/{self.max_consecutive_failures}): {e}")
-            if self.is_circuit_open:
-                print(f"🚨 [AutoCompactor Circuit Tripped] Maximum consecutive failures ({self.max_consecutive_failures}) reached. Circuit opened.")
-            summary_text = f"Error generating summary: {e}. Raw message count: {len(to_compact)}"
-
-        compacted = self._finalize_compacted_messages(
-            original_system_messages, summary_text, tail_messages
-        )
+            self._record_failure(e)
+            return messages, False, []
+        self.consecutive_failures = 0
+        compacted = self._finalize_compacted_messages(original_system_messages, summary_raw, tail_messages)
         return compacted, True, to_compact
 
     async def acompact_with_details(self, messages: list, force: bool = False) -> tuple[list, bool, list]:
@@ -489,138 +1010,327 @@ class AutoCompactor:
         if plan is None:
             return messages, False, []
         original_system_messages, to_compact, tail_messages = plan
-
-        summary_prompt = self._build_summary_prompt(to_compact)
-
         try:
-            from app.utils.message_utils import normalize_content
-            if hasattr(self.llm, "ainvoke"):
-                summary_response = await self.llm.ainvoke([HumanMessage(content=summary_prompt)])
-            else:
-                summary_response = await asyncio.to_thread(
-                    self.llm.invoke, [HumanMessage(content=summary_prompt)]
-                )
-            summary_text = normalize_content(getattr(summary_response, "content", summary_response))
-            self.consecutive_failures = 0
+            summary_raw = await self._asummarize(to_compact)
         except Exception as e:
-            self.consecutive_failures += 1
-            print(f"⚠️ [AutoCompactor Failure] LLM summary invocation failed ({self.consecutive_failures}/{self.max_consecutive_failures}): {e}")
-            if self.is_circuit_open:
-                print(f"🚨 [AutoCompactor Circuit Tripped] Maximum consecutive failures ({self.max_consecutive_failures}) reached. Circuit opened.")
-            summary_text = f"Error generating summary: {e}. Raw message count: {len(to_compact)}"
-
-        compacted = self._finalize_compacted_messages(
-            original_system_messages, summary_text, tail_messages
-        )
+            self._record_failure(e)
+            return messages, False, []
+        self.consecutive_failures = 0
+        compacted = self._finalize_compacted_messages(original_system_messages, summary_raw, tail_messages)
         return compacted, True, to_compact
 
 
 # =============================================================================
-# 5. ReactiveCompactor (Turn-Boundary Slicing on 413 Error)
+# 5. ReactiveCompactor (reactiveCompact.ts — 빌드에서 빠짐) 🟡
 # =============================================================================
 class ReactiveCompactor:
-    """Emergency post-invocation firewall that catches 413 / overflow errors.
-    Slices oldest ~20% of dialogue at HumanMessage turn boundaries to preserve AI-Tool pairs."""
-    def __init__(self, slice_ratio: float = 0.20, amnesia_guard=None):
-        self.slice_ratio = slice_ratio
-        self.amnesia_guard = amnesia_guard
+    """API가 prompt_too_long(413)을 돌려주면 압축한 뒤 같은 요청을 한 번 다시 보냅니다.
 
-    def handle_overflow(self, messages: list) -> list:
-        system_messages = [m for m in messages if isinstance(m, SystemMessage)]
-        # 압축 요약은 잘라내지 않고 맨 앞에 고정 (복원 블록은 새로 만들 수 있으면 새 것으로 대체)
-        pinned_summaries = [m for m in messages if not isinstance(m, SystemMessage) and is_compaction_summary(m)]
-        pinned_restores = [m for m in messages
-                           if not isinstance(m, SystemMessage) and is_compaction_artifact(m) and not is_compaction_summary(m)]
-        dialogue_messages = [m for m in messages if not isinstance(m, SystemMessage) and not is_compaction_artifact(m)]
-
-        if len(dialogue_messages) <= 2:
-            if dialogue_messages:
-                last_msg = dialogue_messages[-1]
-                truncated_content = str(last_msg.content)[:1000] + "\n... [Reactive Compact: Truncated 413 payload]"
-                return system_messages + pinned_summaries + [HumanMessage(content=truncated_content)]
-            return messages
-
-        # 실제 사용자 턴 경계에서만 자름 (요약·복원 블록·StopHooks 피드백은 경계가 아님)
-        turn_boundaries = user_turn_starts(dialogue_messages)
-
-        if len(turn_boundaries) <= 1:
-            # Only one or no turn boundary — fall back to simple ratio-based slicing
-            slice_count = max(2, int(len(dialogue_messages) * self.slice_ratio))
-            sliced_dialogue = dialogue_messages[slice_count:]
-            actual_sliced_count = slice_count
-        else:
-            # Calculate how many turns to slice (at least 1 turn, ~20% of turns)
-            total_turns = len(turn_boundaries)
-            turns_to_slice = max(1, int(total_turns * self.slice_ratio))
-            if turns_to_slice >= total_turns:
-                turns_to_slice = total_turns - 1  # Keep at least the last turn
-
-            slice_at_idx = turn_boundaries[turns_to_slice]
-            sliced_dialogue = dialogue_messages[slice_at_idx:]
-            actual_sliced_count = slice_at_idx
-
-        reactive_summary = SystemMessage(
-            content=f"[Reactive Compact (Silent Withholding)]: Emergency sliced oldest {actual_sliced_count} dialogue messages after API 413 overflow."
-        )
-
-        recovery_attachments = []
-        if self.amnesia_guard:
-            recovery_attachments = self.amnesia_guard.create_recovery_attachments()
-        if not recovery_attachments:
-            recovery_attachments = pinned_restores
-
-        return system_messages + [reactive_summary] + pinned_summaries + recovery_attachments + sliced_dialogue
-
-
-# =============================================================================
-# 6. CompactorMiddleware (AgentMiddleware class with sync + async support)
-# =============================================================================
-class CompactorMiddleware(AgentMiddleware):
-    """LangChain AgentMiddleware implementing 5-Stage Compactor Pipeline.
-
-    - before_model / abefore_model:
-        Snip/Micro/Collapse 적용 후에도 토큰이 threshold_tokens를 초과하면
-        AutoCompactor를 실행하여 checkpointer state["messages"]를 압축 요약본으로 영구 교체합니다.
-        · 요약은 원본 state 기준으로 "이전 턴"만 대상으로 합니다. 현재 턴(질문·도구 호출·결과)은
-          원본 그대로 남기고, 이전 턴이 없으면(이미 요약 + 현재 턴뿐이면) 압축하지 않습니다.
-          → 같은 턴 안에서 요약이 반복되지 않습니다.
-        (전체 원문은 MemoryMiddleware가 transcript.db에 별도 보존합니다.)
-    - wrap_model_call / awrap_model_call:
-        매 모델 호출마다 비파괴적(ephemeral) Snip → Micro → Collapse를 사본에만 수행하고,
-        413/컨텍스트 초과 에러 발생 시 ReactiveCompactor로 즉시 슬라이싱 재시도합니다.
+    원본 흔적: query.ts가 413 응답을 사용자에게 바로 보여주지 않고 보류(withhold)한 뒤 복구를 시도합니다.
+    여기서는 이전 턴 요약(AutoCompactor)을 먼저 시도하고, 요약할 이전 턴이 없거나 요약이 실패하면
+    가장 오래된 API 라운드부터 버립니다 (원본 truncateHeadForPTLRetry와 같은 방식).
+    복구 결과는 이번 모델 호출의 입력에만 쓰입니다. state는 다음 before_model의 Auto-Compact가 정리합니다.
     """
 
+    def __init__(self, auto_compactor: Optional[AutoCompactor] = None, drop_ratio: float = 0.2):
+        self.auto_compactor = auto_compactor
+        self.drop_ratio = drop_ratio
+
+    def handle_overflow(self, messages: Sequence[Any]) -> List[Any]:
+        """LLM 없이 가장 오래된 API 라운드를 잘라냅니다. 시스템 메시지와 압축 요약·복원 블록은 맨 앞에 고정합니다."""
+        system = [m for m in messages if isinstance(m, SystemMessage)]
+        pinned = [m for m in messages if not isinstance(m, SystemMessage) and is_compaction_artifact(m)]
+        dialogue = [m for m in messages if not isinstance(m, SystemMessage) and not is_compaction_artifact(m)]
+
+        groups = group_messages_by_api_round(dialogue)
+        if len(groups) < 2:
+            if not dialogue:
+                return list(messages)
+            last = dialogue[-1]
+            truncated = _content_text(last.content)[:1000] + "\n... [Reactive Compact: truncated oversized message]"
+            return system + pinned + [HumanMessage(content=truncated)]
+
+        drop = min(max(1, int(len(groups) * self.drop_ratio)), len(groups) - 1)
+        dropped = sum(len(g) for g in groups[:drop])
+        marker = _marker_message(
+            f"[Reactive Compact] The oldest {dropped} message(s) were dropped after a prompt-too-long error.\n"
+            f"{AUTO_GENERATED_NOTE}"
+        )
+        return system + pinned + [marker] + [m for g in groups[drop:] for m in g]
+
+    def _can_summarize(self, messages: Sequence[Any]) -> bool:
+        ac = self.auto_compactor
+        return bool(ac) and not ac.is_circuit_open and ac.has_completed_turns(list(messages))
+
+    def recover(self, messages: Sequence[Any]) -> List[Any]:
+        if self._can_summarize(messages):
+            compacted, ok, _ = self.auto_compactor.compact_with_details(list(messages), force=True)
+            if ok:
+                return compacted
+        return self.handle_overflow(messages)
+
+    async def arecover(self, messages: Sequence[Any]) -> List[Any]:
+        if self._can_summarize(messages):
+            compacted, ok, _ = await self.auto_compactor.acompact_with_details(list(messages), force=True)
+            if ok:
+                return compacted
+        return self.handle_overflow(messages)
+
+
+# =============================================================================
+# 6. CompactorMiddleware
+# =============================================================================
+DEFAULT_COMPACTION_CONFIG: Dict[str, Dict[str, Any]] = {
+    "tool_result_budget": {
+        "enabled": True,
+        "max_result_chars": DEFAULT_MAX_RESULT_SIZE_CHARS,
+        "per_message_chars": MAX_TOOL_RESULTS_PER_MESSAGE_CHARS,
+        "preview_chars": PREVIEW_SIZE_CHARS,
+    },
+    "snip": {"enabled": True, "nudge_ratio": 0.7},
+    "micro": {"enabled": True, "gap_threshold_minutes": TIME_BASED_MC_GAP_MINUTES,
+              "keep_recent": TIME_BASED_MC_KEEP_RECENT},
+    "collapse": {"enabled": False, "commit_ratio": COLLAPSE_COMMIT_RATIO},
+    "auto": {"enabled": True},
+    "reactive": {"enabled": True},
+}
+
+
+def _merge_config(config: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    merged = {k: dict(v) for k, v in DEFAULT_COMPACTION_CONFIG.items()}
+    for key, value in (config or {}).items():
+        if key in merged and isinstance(value, dict):
+            merged[key].update(value)
+    return merged
+
+
+class CompactorMiddleware(AgentMiddleware):
+    """Claude Code 압축 파이프라인을 LangChain 미들웨어 훅에 나눠 붙입니다.
+
+    - wrap_tool_call   : [0] 도구별 결과 크기 상한 → 디스크 저장
+    - before_model     : [0] 라운드 합계 예산 → [2] time-based microcompact → [3] Collapse 커밋 → [4] Auto-Compact
+                         ([0][2]는 같은 id로 state의 ToolMessage를 교체, [4]는 state 전체를 요약본으로 교체)
+    - after_model      : [2]의 기준 시각(last_assistant_at) 기록
+    - wrap_model_call  : [1] Snip 투영·[id] 태그·권유 → [3] Collapse 투영 → 모델 호출 → 413이면 [5] Reactive
+                         (투영 결과는 이번 모델 입력 사본에만 쓰고 state에는 저장하지 않음)
+    - tools            : [1] snip 도구
+
+    원본 대화 전체는 MemoryMiddleware가 transcript.db에 따로 보존합니다.
+    """
+
+    state_schema = CompactionState
+
     def __init__(self, llm, threshold_tokens: int = 8000, amnesia_guard=None,
-                 swap_dir: str = "./.claude/swaps", max_consecutive_failures: int = 3,
-                 transcript_store: Optional[Any] = None):
-        self.snip_compactor = SnipCompactor(age_threshold=2)
-        self.micro_compactor = MicroCompactor(max_chars=5000, swap_dir=swap_dir)
-        self.context_collapse = ContextCollapse(min_consecutive=3, swap_dir=swap_dir)
+                 swap_dir: str = "./artifacts/tool-results",
+                 max_consecutive_failures: int = MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES,
+                 transcript_store: Optional[Any] = None,
+                 config: Optional[Dict[str, Any]] = None):
+        cfg = _merge_config(config)
+        self.config = cfg
+        budget_cfg, snip_cfg, micro_cfg = cfg["tool_result_budget"], cfg["snip"], cfg["micro"]
+        collapse_cfg = cfg["collapse"]
+
+        self.tool_result_budget = ToolResultBudget(
+            storage_dir=budget_cfg.get("storage_dir", swap_dir),
+            max_result_chars=budget_cfg["max_result_chars"],
+            per_message_chars=budget_cfg["per_message_chars"],
+            preview_chars=budget_cfg["preview_chars"],
+            tool_limits=budget_cfg.get("tool_limits"),
+        ) if budget_cfg["enabled"] else None
+        self.snip_compactor = SnipCompactor(nudge_ratio=snip_cfg["nudge_ratio"]) if snip_cfg["enabled"] else None
+        self.micro_compactor = MicroCompactor(
+            gap_threshold_minutes=micro_cfg["gap_threshold_minutes"],
+            keep_recent=micro_cfg["keep_recent"],
+        ) if micro_cfg["enabled"] else None
+        self.context_collapse = ContextCollapse(
+            llm=llm, commit_ratio=collapse_cfg["commit_ratio"],
+        ) if collapse_cfg["enabled"] else None
         self.auto_compactor = AutoCompactor(
             llm=llm,
             threshold_tokens=threshold_tokens,
             amnesia_guard=amnesia_guard,
-            max_consecutive_failures=max_consecutive_failures
+            max_consecutive_failures=max_consecutive_failures,
         )
-        self.reactive_compactor = ReactiveCompactor(slice_ratio=0.20, amnesia_guard=amnesia_guard)
+        self.auto_enabled = bool(cfg["auto"]["enabled"])
+        self.reactive_compactor = ReactiveCompactor(
+            auto_compactor=self.auto_compactor if self.auto_enabled else None,
+        ) if cfg["reactive"]["enabled"] else None
         self.transcript_store = transcript_store
+        self.tools = [self.snip_compactor.build_tool()] if self.snip_compactor else []
 
-    def _run_ephemeral_pipeline(self, messages: list) -> list:
-        """Execute non-destructive Stage 1~3 compaction: Snip → Micro → Collapse."""
-        msgs = list(messages)
-        msgs, _ = self.snip_compactor.compact(msgs)
-        msgs, _ = self.micro_compactor.compact(msgs)
-        msgs, _ = self.context_collapse.compact(msgs)
-        return msgs
+    # ── 모델 입력 뷰 ──
 
-    def _needs_auto_compact(self, messages: list) -> bool:
-        """모델이 실제로 보게 될 크기(Stage 1~3 적용 후)가 임계치를 넘고, 요약할 이전 턴이 있는지."""
-        if not messages or self.auto_compactor.is_circuit_open:
+    def project_view(self, messages: Sequence[Any], state: Optional[Dict[str, Any]] = None) -> List[Any]:
+        """state의 snip·collapse 기록을 적용한 모델 입력 뷰 (태그·권유 메시지 제외)."""
+        state = state or {}
+        view = list(messages)
+        if self.snip_compactor:
+            view = self.snip_compactor.project(view, state.get("snipped_message_ids") or [])
+        if self.context_collapse:
+            view = self.context_collapse.project(view, state.get("collapse_commits") or [])
+        return view
+
+    def _decorate_view(self, view: List[Any]) -> List[Any]:
+        if not self.snip_compactor:
+            return view
+        tagged = self.snip_compactor.tag_messages(view)
+        nudge = self.snip_compactor.nudge(rough_token_count(view), self.auto_compactor.threshold_tokens)
+        return tagged + [nudge] if nudge else tagged
+
+    # ── before_model ──
+
+    def _auto_compact_allowed(self) -> bool:
+        # 원본: Collapse가 켜져 있으면 Auto-Compact는 발동하지 않습니다 (413은 Reactive가 처리).
+        return self.auto_enabled and self.context_collapse is None
+
+    def _needs_auto_compact(self, view: list) -> bool:
+        """모델이 실제로 보게 될 크기가 임계치를 넘고, 요약할 이전 턴이 있는지."""
+        if not view or not self._auto_compact_allowed() or self.auto_compactor.is_circuit_open:
             return False
-        view = self._run_ephemeral_pipeline(messages)
         if self.auto_compactor.get_token_count(view) <= self.auto_compactor.threshold_tokens:
             return False
-        return self.auto_compactor.has_completed_turns(messages)
+        return self.auto_compactor.has_completed_turns(view)
+
+    def _collect_replacements(self, state: Dict[str, Any], messages: List[Any]) -> List[Any]:
+        replacements: List[Any] = []
+        if self.tool_result_budget:
+            replacements += self.tool_result_budget.enforce_round_budget(messages)
+        if self.micro_compactor:
+            gap = self.micro_compactor.evaluate_trigger(state.get("last_assistant_at"))
+            if gap is not None:
+                cleared, saved = self.micro_compactor.clear_old_results(_apply_replacements(messages, replacements))
+                if cleared:
+                    print(f"🧹 [Microcompact] {gap:.0f}min idle → cleared {len(cleared)} old tool results (~{saved:,} tokens)")
+                    replacements = list({m.id: m for m in replacements + cleared}.values())
+        return replacements
+
+    def _collapse_candidate(self, working: List[Any], state: Dict[str, Any],
+                            commits: List[Dict[str, Any]]) -> Optional[List[Any]]:
+        """Collapse 커밋이 필요하면 접을 구간을, 아니면 None을 반환합니다."""
+        if not self.context_collapse:
+            return None
+        snip_view = (self.snip_compactor.project(working, state.get("snipped_message_ids") or [])
+                     if self.snip_compactor else working)
+        view = self.context_collapse.project(snip_view, commits)
+        limit = self.auto_compactor.threshold_tokens * self.context_collapse.commit_ratio
+        if self.auto_compactor.get_token_count(view) < limit:
+            return None
+        return self.context_collapse.next_span(snip_view, commits)
+
+    def _compaction_update(self, runtime: Any, original: List[Any], compacted: List[Any]) -> Dict[str, Any]:
+        kept_ids = {m.id for m in compacted if getattr(m, "id", None)}
+        source = [m for m in original if getattr(m, "id", None) and m.id not in kept_ids
+                  and not isinstance(m, SystemMessage)]
+        self._record_compaction_to_transcript(runtime, compacted, len(original), source)
+        return {
+            "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *compacted],
+            "snipped_message_ids": [],
+            "collapse_commits": [],
+        }
+
+    def before_model(self, state: Dict[str, Any], runtime: Any = None) -> Optional[Dict[str, Any]]:
+        messages = list(state.get("messages", []))
+        if not messages:
+            return None
+        update: Dict[str, Any] = {}
+
+        replacements = self._collect_replacements(state, messages)
+        working = _apply_replacements(messages, replacements)
+        if replacements:
+            update["messages"] = replacements
+
+        commits = list(state.get("collapse_commits") or [])
+        span = self._collapse_candidate(working, state, commits)
+        if span:
+            commit = self.context_collapse.commit(span)
+            if commit:
+                commits.append(commit)
+                update["collapse_commits"] = commits
+
+        view = self.project_view(working, {**state, "collapse_commits": commits})
+        if self._needs_auto_compact(view):
+            compacted, ok, _ = self.auto_compactor.compact_with_details(view, force=True)
+            if ok:
+                return self._compaction_update(runtime, working, compacted)
+        return update or None
+
+    async def abefore_model(self, state: Dict[str, Any], runtime: Any = None) -> Optional[Dict[str, Any]]:
+        messages = list(state.get("messages", []))
+        if not messages:
+            return None
+        update: Dict[str, Any] = {}
+
+        replacements = await asyncio.to_thread(self._collect_replacements, state, messages)
+        working = _apply_replacements(messages, replacements)
+        if replacements:
+            update["messages"] = replacements
+
+        commits = list(state.get("collapse_commits") or [])
+        span = self._collapse_candidate(working, state, commits)
+        if span:
+            commit = await asyncio.to_thread(self.context_collapse.commit, span)
+            if commit:
+                commits.append(commit)
+                update["collapse_commits"] = commits
+
+        view = self.project_view(working, {**state, "collapse_commits": commits})
+        if self._needs_auto_compact(view):
+            compacted, ok, _ = await self.auto_compactor.acompact_with_details(view, force=True)
+            if ok:
+                return await asyncio.to_thread(self._compaction_update, runtime, working, compacted)
+        return update or None
+
+    # ── after_model ──
+
+    def after_model(self, state: Dict[str, Any], runtime: Any = None) -> Optional[Dict[str, Any]]:
+        return {"last_assistant_at": time.time()} if self.micro_compactor else None
+
+    async def aafter_model(self, state: Dict[str, Any], runtime: Any = None) -> Optional[Dict[str, Any]]:
+        return self.after_model(state, runtime)
+
+    # ── wrap_tool_call ──
+
+    def _apply_tool_budget(self, request, result):
+        if not self.tool_result_budget or not isinstance(result, ToolMessage):
+            return result
+        tool_name = (getattr(request, "tool_call", None) or {}).get("name")
+        return self.tool_result_budget.apply_to_tool_message(result, tool_name)
+
+    def wrap_tool_call(self, request, handler):
+        return self._apply_tool_budget(request, handler(request))
+
+    async def awrap_tool_call(self, request, handler):
+        return self._apply_tool_budget(request, await handler(request))
+
+    # ── wrap_model_call ──
+
+    def _prepare(self, request) -> Tuple[List[Any], List[Any]]:
+        view = self.project_view(request.messages, getattr(request, "state", None))
+        return view, self._decorate_view(view)
+
+    def wrap_model_call(self, request, handler):
+        view, model_input = self._prepare(request)
+        try:
+            return handler(request.override(messages=model_input))
+        except Exception as e:
+            if not (self.reactive_compactor and is_prompt_too_long_error(e)):
+                raise
+            print("\n⚡ [Reactive Compact] prompt too long — compacting and retrying once...")
+            recovered = self.reactive_compactor.recover(view)
+            return handler(request.override(messages=recovered))
+
+    async def awrap_model_call(self, request, handler):
+        view, model_input = self._prepare(request)
+        try:
+            return await handler(request.override(messages=model_input))
+        except Exception as e:
+            if not (self.reactive_compactor and is_prompt_too_long_error(e)):
+                raise
+            print("\n⚡ [Reactive Compact] prompt too long — compacting and retrying once...")
+            recovered = await self.reactive_compactor.arecover(view)
+            return await handler(request.override(messages=recovered))
+
+    # ── transcript.db 압축 이벤트 ──
 
     def _record_compaction_to_transcript(
         self, runtime: Any, compacted_msgs: list, replaced_count: int,
@@ -656,78 +1366,17 @@ class CompactorMiddleware(AgentMiddleware):
             except Exception:
                 pass
 
-    def before_model(self, state: Dict[str, Any], runtime: Any = None) -> Optional[Dict[str, Any]]:
-        """토큰 임계치 초과 시 이전 턴을 요약해 checkpointer state['messages']를 압축본으로 교체합니다."""
-        messages = list(state.get("messages", []))
-        if not self._needs_auto_compact(messages):
-            return None
-
-        # Stage 1~3은 모델 입력 사본용이므로, state 교체는 원본 메시지로 합니다 (현재 턴 원본 보존)
-        compacted_msgs, was_compacted, compacted_source = self.auto_compactor.compact_with_details(
-            messages, force=True
-        )
-        if not was_compacted:
-            return None
-
-        self._record_compaction_to_transcript(runtime, compacted_msgs, len(messages), compacted_source)
-        return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *compacted_msgs]}
-
-    async def abefore_model(self, state: Dict[str, Any], runtime: Any = None) -> Optional[Dict[str, Any]]:
-        """비동기 실행 경로용 AutoCompactor state 교체."""
-        messages = list(state.get("messages", []))
-        if not self._needs_auto_compact(messages):
-            return None
-
-        compacted_msgs, was_compacted, compacted_source = await self.auto_compactor.acompact_with_details(
-            messages, force=True
-        )
-        if not was_compacted:
-            return None
-
-        await asyncio.to_thread(
-            self._record_compaction_to_transcript, runtime, compacted_msgs, len(messages), compacted_source
-        )
-        return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *compacted_msgs]}
-
-    def _is_overflow_error(self, error: Exception) -> bool:
-        """Check if an exception is a context overflow / 413 error."""
-        err_str = str(error).lower()
-        return any(pattern in err_str for pattern in [
-            "413", "prompt_too_long", "context_length_exceeded", "too many tokens", "maximum context length"
-        ])
-
-    def wrap_model_call(self, request, handler):
-        msgs = self._run_ephemeral_pipeline(request.messages)
-        req = request.override(messages=msgs)
-        try:
-            return handler(req)
-        except Exception as e:
-            if self._is_overflow_error(e):
-                print("\n⚡ [Reactive Compact Triggered] Catching 413 API Error. Performing Turn-Boundary Slicing...")
-                reactive_msgs = self.reactive_compactor.handle_overflow(msgs)
-                retry_req = request.override(messages=reactive_msgs)
-                return handler(retry_req)
-            raise e
-
-    async def awrap_model_call(self, request, handler):
-        msgs = self._run_ephemeral_pipeline(request.messages)
-        req = request.override(messages=msgs)
-        try:
-            return await handler(req)
-        except Exception as e:
-            if self._is_overflow_error(e):
-                print("\n⚡ [Reactive Compact Triggered] Catching 413 API Error. Performing Turn-Boundary Slicing...")
-                reactive_msgs = self.reactive_compactor.handle_overflow(msgs)
-                retry_req = request.override(messages=reactive_msgs)
-                return await handler(retry_req)
-            raise e
-
 
 def create_compactor_middleware(llm, threshold_tokens: int = 8000, amnesia_guard=None,
-                                swap_dir: str = "./.claude/swaps", max_consecutive_failures: int = 3,
-                                transcript_store: Optional[Any] = None):
-    """Creates a CompactorMiddleware instance (AgentMiddleware subclass).
-    This is the recommended way to create the compactor middleware."""
+                                swap_dir: str = "./artifacts/tool-results",
+                                max_consecutive_failures: int = MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES,
+                                transcript_store: Optional[Any] = None,
+                                config: Optional[Dict[str, Any]] = None):
+    """CompactorMiddleware를 만듭니다.
+
+    config는 configs/compaction.config와 같은 구조의 dict입니다 (tool_result_budget / snip / micro /
+    collapse / auto / reactive). 빠진 항목은 DEFAULT_COMPACTION_CONFIG 값을 씁니다.
+    """
     return CompactorMiddleware(
         llm=llm,
         threshold_tokens=threshold_tokens,
@@ -735,4 +1384,5 @@ def create_compactor_middleware(llm, threshold_tokens: int = 8000, amnesia_guard
         swap_dir=swap_dir,
         max_consecutive_failures=max_consecutive_failures,
         transcript_store=transcript_store,
+        config=config,
     )
