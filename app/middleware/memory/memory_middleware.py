@@ -12,15 +12,18 @@ Source: frontier-agent-lab/modules/hermes/memory_middleware.py
 - 전체본 (L2 Episodic 원문): transcript.db — 이 미들웨어가 메시지가 생성되는 즉시 추가 기록
 - 색인 (L2 Episodic 요약): episodic.db — 대화가 멈춘 뒤 원문을 읽어 주제별 요약 생성
 - L3 Semantic: MEMORY.md / USER.md
+- Procedural: skills/<name>/SKILL.md — 반복 작업 유형의 절차 (ProceduralMemoryStore, 선택)
 
 Hooks:
 - before_agent / abefore_agent:
     새 턴 시작 → 유휴 리뷰 취소, 사용자 질문 원문 기록,
-    L3(시맨틱) 프리페치 + L2(에피소드 요약) 자동 인출 → recalled_memory 주입
-- wrap_model_call: 꺼진 메모리 도구 필터링 → 모델 응답(AI 메시지·도구 호출) 원문 기록
-- wrap_tool_call: 사용자 ContextVar 전파 + 꺼진 도구 차단 → 도구 결과 원문 기록
+    L3(시맨틱) + Procedural(스킬 카탈로그) 프리페치 + L2(에피소드 요약) 자동 인출 → recalled_memory 주입
+- wrap_model_call: 꺼진 메모리 도구 필터링 → 모델 응답(AI 메시지·도구 호출) 원문 기록,
+    도구를 호출한 응답이면 스킬 리뷰 카운터 +1
+- wrap_tool_call: 사용자 ContextVar 전파 + 꺼진 도구 차단 → 도구 결과 원문 기록,
+    skill_manage 직접 호출 시 스킬 리뷰 카운터 리셋
 - after_agent / aafter_agent: 누락분 보정 기록(가드레일 차단 턴은 kind=blocked),
-    Background Review 예약 (유휴 15초 / 최대 30분 후 실행)
+    Background Review 예약 (유휴 15초 / 최대 30분 후 실행). 카운터가 기준값 이상이면 스킬 리뷰 포함
 
 원문 기록 스위치는 메모리 학습/주입 스위치와 독립입니다:
 - memory.config의 transcript.enabled (배포 정책) + AgentContext.transcript_enabled (요청별)
@@ -31,11 +34,13 @@ Tool Factory:
 - self.tools: [memory(), session_recall()] 도구를 소유하며, create_agent()가 생성 시 자동으로 에이전트 도구로 주입
   - memory(): 에이전트가 직접 MEMORY.md / USER.md를 관리 (add/replace/remove)
   - session_recall(): Anchor 기반 과거 세션 원문 인출 (transcript.db)
+  - skill_view() / skill_manage(): procedural_store가 있을 때만 추가 (skill_tools.py)
   - session_search는 도구로 제공하지 않음 (before_agent가 자동 인출)
 
 Background Review (Hermes _spawn_background_review + review_idle_queue 패턴):
 - 메인 스레드를 블로킹하지 않음 (ThreadPoolExecutor + 세션별 cancel_event 취소 제어)
 - 별도 LLM 호출로 대화 리뷰 → memory(add/replace) 파싱 실행
+- 스킬 리뷰가 예약된 세션이면 스킬 도구만 가진 리뷰 에이전트 실행 (skill_review.py)
 - EpisodicStore에 세션 주제별 요약 저장
 ===============================================================================
 """
@@ -55,6 +60,9 @@ from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain.tools import tool as langchain_tool
 from app.utils.message_utils import normalize_content
 from app.middleware.memory.semantic_store import SemanticMemoryStore
+from app.middleware.memory.procedural_store import ProceduralMemoryStore
+from app.middleware.memory.skill_tools import SKILL_MANAGE_TOOL, SKILL_VIEW_TOOL, build_skill_tools
+from app.middleware.memory.skill_review import run_skill_review
 from app.middleware.memory.review_queue import IdleReviewQueue
 from app.utils.message_markers import last_user_turn_start
 from app.middleware.memory.transcript_store import (
@@ -167,23 +175,32 @@ class MemoryMiddleware(AgentMiddleware):
         transcript_enabled: bool = True,
         finalize_idle_settle_s: float = 15.0,
         finalize_max_age_s: float = 1800.0,
+        procedural_store: Optional[ProceduralMemoryStore] = None,
+        skill_nudge_interval: int = 10,
+        skill_review_max_iterations: int = 16,
     ):
         """
         Args:
             semantic_store: 기본 사용자(default)의 SemanticMemoryStore
             episodic_store: 공유 EpisodicStore (user_id 컬럼으로 사용자 격리)
-            review_llm: Background Review(시맨틱 갱신·세션 요약)에 사용할 LLM
+            review_llm: Background Review(시맨틱 갱신·세션 요약·스킬 리뷰)에 사용할 LLM
             top_k: 매 턴 Layer 4에 자동 주입할 과거 세션(Episodic) 요약 개수
             transcript_store: 원문 전체본 저장소 (TranscriptStore, 미지정 시 episodic_store.transcript 사용)
             transcript_enabled: 대화 원문(transcript.db) 자동 백업 활성화 여부 (메모리 학습 스위치와 독립)
             finalize_idle_settle_s: 유휴 지연 요약 대기 시간(초, 기본 15초)
             finalize_max_age_s: 연속 대화 시 최대 요약 보류 시간(초, 기본 1800초=30분)
+            procedural_store: 기본 사용자의 ProceduralMemoryStore (None이면 Procedural Memory 비활성)
+            skill_nudge_interval: 스킬 리뷰를 예약할 도구 호출 반복 횟수 (Hermes 기본 10, 0이면 끔)
+            skill_review_max_iterations: 스킬 리뷰 에이전트의 최대 모델 호출 횟수 (Hermes 기본 16)
         """
         self.semantic_store = semantic_store
         self.episodic_store = episodic_store
         self.review_llm = review_llm
         self.top_k = max(0, int(top_k))
         self.transcript_enabled = bool(transcript_enabled)
+        self.procedural_store = procedural_store
+        self.skill_nudge_interval = max(0, int(skill_nudge_interval))
+        self.skill_review_max_iterations = max(1, int(skill_review_max_iterations))
 
         if transcript_store is not None:
             self.transcript_store: Optional[TranscriptStore] = transcript_store
@@ -212,6 +229,22 @@ class MemoryMiddleware(AgentMiddleware):
         }
         self._loaded_session_by_user: Dict[str, str] = {}
 
+        # Procedural Memory: 사용자별 스킬 스토어 + 세션별 스킬 리뷰 트리거 상태
+        self._user_procedural_stores: Dict[str, ProceduralMemoryStore] = {}
+        self._loaded_skills_session_by_user: Dict[str, str] = {}
+        self._procedural_unified = False
+        if procedural_store is not None:
+            from app.utils.workspace import resolve_user_skills_dir
+            self._user_procedural_stores[_DEFAULT_USER_ID] = procedural_store
+            self._procedural_unified = (
+                Path(procedural_store.skills_dir).resolve()
+                == resolve_user_skills_dir(_DEFAULT_USER_ID).resolve()
+            )
+        self._skill_lock = threading.Lock()
+        self._skill_iters: Dict[str, int] = {}          # 세션별 도구 호출 반복 횟수
+        self._skill_review_pending: set = set()          # 스킬 리뷰가 예약됐지만 아직 완료되지 않은 세션
+        self.last_skill_reviews: Dict[str, Dict[str, Any]] = {}  # 세션별 마지막 스킬 리뷰 결과 (관찰용)
+
         # Background Review 제어 (유휴 큐 + 세션별 중복 실행 방지 & 취소 제어 + 스레드 풀 제한)
         self._review_meta_lock = threading.Lock()
         self._review_executor = concurrent.futures.ThreadPoolExecutor(
@@ -231,17 +264,22 @@ class MemoryMiddleware(AgentMiddleware):
         self._memory_tool = self._create_memory_tool()
         self._session_search_tool = self._create_session_search_tool()
         self._session_recall_tool = self._create_session_recall_tool()
+        # 포그라운드 스킬 도구 (review=None → 사용자 지시로 만든 스킬은 사용자 소유)
+        self._skill_tools = (
+            build_skill_tools(lambda: self._get_procedural_store(self._resolve_current_user_id()))
+            if procedural_store is not None else []
+        )
         # AgentMiddleware.tools — LangChain create_agent()가 생성 시 한 번 읽어 에이전트 도구로 자동 주입합니다
         # (langchain/agents/factory.py의 middleware_tools 수집 → tools=와 합쳐 등록).
-        self.tools = [self._memory_tool, self._session_recall_tool]
+        self.tools = [self._memory_tool, self._session_recall_tool, *self._skill_tools]
 
     def get_tools(self) -> list:
         """메모리 도구 목록 반환 (create_agent 사용 시에는 self.tools를 통해 자동 등록됨).
 
         Returns:
-            [memory_tool, session_search_tool, session_recall_tool]
+            [memory_tool, session_search_tool, session_recall_tool, (skill_view, skill_manage)]
         """
-        return [self._memory_tool, self._session_search_tool, self._session_recall_tool]
+        return [self._memory_tool, self._session_search_tool, self._session_recall_tool, *self._skill_tools]
 
     def _get_semantic_store(self, user_id: Optional[str] = None) -> SemanticMemoryStore:
         """user_id에 해당하는 SemanticMemoryStore를 반환합니다.
@@ -273,6 +311,32 @@ class MemoryMiddleware(AgentMiddleware):
     def _get_episodic_store(self, user_id: Optional[str] = None):
         """단일 EpisodicStore 인스턴스(app/database/episodic.db)를 반환합니다 (내부 user_id 컬럼으로 격리)."""
         return self.episodic_store
+
+    def _get_procedural_store(self, user_id: Optional[str] = None) -> Optional[ProceduralMemoryStore]:
+        """user_id에 해당하는 ProceduralMemoryStore를 반환합니다 (procedural_store 미지정 시 None).
+        - 통합 사용자 워크스페이스 모드: artifacts/users/{uid}/skills
+        - 테스트용 임시 디렉터리 주입: 'default'는 기본 스토어, 그 외는 {skills_root}/users/{uid}/skills
+        """
+        if self.procedural_store is None:
+            return None
+        from app.utils.workspace import resolve_user_skills_dir
+
+        uid = _sanitize_user_id(user_id or _memory_user_id_var.get())
+        with self._store_lock:
+            if uid in self._user_procedural_stores:
+                return self._user_procedural_stores[uid]
+            if self._procedural_unified:
+                skills_dir = resolve_user_skills_dir(uid, ensure_exists=True)
+            else:
+                skills_dir = self.procedural_store.skills_dir / "users" / uid / "skills"
+            store = ProceduralMemoryStore(
+                skills_dir=str(skills_dir),
+                max_skill_chars=self.procedural_store.max_skill_chars,
+                max_file_bytes=self.procedural_store.max_file_bytes,
+            )
+            store.load_from_disk()
+            self._user_procedural_stores[uid] = store
+            return store
 
     def _resolve_current_user_id(self, runtime: Any = None) -> str:
         """runtime.context 또는 runnable config 또는 ContextVar에서 현재 user_id를 추출합니다."""
@@ -331,6 +395,7 @@ class MemoryMiddleware(AgentMiddleware):
                 payload["episodic_learning"],
                 cancel_event,
                 payload.get("transcript_enabled", True),
+                payload.get("procedural_learning", False),
             )
             self._review_futures[session_id] = future
             future.add_done_callback(
@@ -578,7 +643,55 @@ class MemoryMiddleware(AgentMiddleware):
             disabled.add(self._memory_tool.name)
         if not getattr(ctx, "episodic_memory_enabled", True):
             disabled.add(self._session_recall_tool.name)
+        if not getattr(ctx, "procedural_memory_enabled", True):
+            disabled.update(t.name for t in self._skill_tools)
         return disabled
+
+    # ── Procedural Memory 트리거 (Hermes _iters_since_skill 패턴) ──
+
+    def _count_skill_iteration(self, runtime: Any, request: Any, out_msgs: List[BaseMessage]) -> None:
+        """도구를 호출한 모델 응답 1회 = 반복 1회. 병렬 도구 호출은 한 번으로 셉니다."""
+        if self.procedural_store is None or self.skill_nudge_interval <= 0:
+            return
+        if not any(isinstance(m, AIMessage) and getattr(m, "tool_calls", None) for m in out_msgs):
+            return
+        session_id = self._get_session_id(runtime, request)
+        if session_id == "unknown":
+            return
+        with self._skill_lock:
+            self._skill_iters[session_id] = self._skill_iters.get(session_id, 0) + 1
+
+    def _reset_skill_counter_on_manage(self, request: Any) -> None:
+        """에이전트가 스스로 skill_manage를 호출했다면 이미 학습한 것이므로 카운터를 리셋합니다."""
+        if request.tool_call.get("name") != SKILL_MANAGE_TOOL:
+            return
+        session_id = self._get_session_id(getattr(request, "runtime", None), request)
+        with self._skill_lock:
+            self._skill_iters[session_id] = 0
+
+    def _procedural_learning_due(self, ctx: Any, session_id: str, base_learning: bool) -> bool:
+        """이번 유휴 리뷰에 스킬 리뷰를 포함할지 결정합니다.
+
+        IdleReviewQueue는 세션당 최신 payload만 남기므로, 한 번 기준값에 도달한 세션은
+        스킬 리뷰가 실제로 완료될 때까지 pending으로 유지해 다음 payload에도 플래그가 실리게 합니다.
+        """
+        if self.procedural_store is None or not self.review_llm or self.skill_nudge_interval <= 0:
+            return False
+        if not (
+            getattr(ctx, "procedural_memory_enabled", True)
+            and getattr(ctx, "procedural_learning_enabled", base_learning)
+        ):
+            return False
+        with self._skill_lock:
+            if self._skill_iters.get(session_id, 0) >= self.skill_nudge_interval:
+                self._skill_review_pending.add(session_id)
+            return session_id in self._skill_review_pending
+
+    def _finish_skill_review(self, session_id: str) -> None:
+        """스킬 리뷰가 취소되지 않고 끝났을 때만 카운터를 리셋합니다 (취소되면 다음 리뷰로 이월)."""
+        with self._skill_lock:
+            self._skill_review_pending.discard(session_id)
+            self._skill_iters[session_id] = 0
 
     def _filter_tools(self, request):
         disabled = self._disabled_tool_names(request.runtime)
@@ -593,6 +706,7 @@ class MemoryMiddleware(AgentMiddleware):
         for m in out_msgs:
             ensure_message_id(m)
         runtime = getattr(request, "runtime", None)
+        self._count_skill_iteration(runtime, request, out_msgs)
         if out_msgs and self._is_transcript_enabled(runtime) and self.transcript_store is not None:
             session_id = self._get_session_id(runtime, request)
             if session_id != "unknown":
@@ -615,6 +729,7 @@ class MemoryMiddleware(AgentMiddleware):
         for m in out_msgs:
             ensure_message_id(m)
         runtime = getattr(request, "runtime", None)
+        self._count_skill_iteration(runtime, request, out_msgs)
         if out_msgs and self._is_transcript_enabled(runtime) and self.transcript_store is not None:
             session_id = self._get_session_id(runtime, request)
             if session_id != "unknown":
@@ -663,6 +778,7 @@ class MemoryMiddleware(AgentMiddleware):
                         pass
             return blocked
 
+        self._reset_skill_counter_on_manage(request)
         uid = self._resolve_current_user_id(runtime)
         tok = _memory_user_id_var.set(uid)
         try:
@@ -708,6 +824,7 @@ class MemoryMiddleware(AgentMiddleware):
                         pass
             return blocked
 
+        self._reset_skill_counter_on_manage(request)
         uid = self._resolve_current_user_id(runtime)
         tok = _memory_user_id_var.set(uid)
         try:
@@ -818,6 +935,22 @@ class MemoryMiddleware(AgentMiddleware):
                     "══════════════════════════════════════════════\n"
                     "(No entries recorded yet in USER.md for this user.)"
                 )
+
+        # Procedural: 학습 스킬 카탈로그 프리페치 (이름 + 설명만, 세션 단위 Frozen Snapshot)
+        if self.procedural_store is not None and getattr(ctx, "procedural_memory_enabled", True):
+            pstore = self._get_procedural_store(user_id)
+            with self._store_lock:
+                if self._loaded_skills_session_by_user.get(user_id) != session_id:
+                    pstore.load_from_disk()
+                    self._loaded_skills_session_by_user[user_id] = session_id
+                skills_block = pstore.format_for_prompt()
+            recalled_parts.append(skills_block or (
+                "══════════════════════════════════════════════\n"
+                "PROCEDURAL MEMORY (learned skills) [0 skills]\n"
+                "══════════════════════════════════════════════\n"
+                "(No learned skills yet. After a difficult, multi-step task, offer to save the approach "
+                "as a skill with skill_manage.)"
+            ))
 
         return ctx, session_id, user_id, recalled_parts
 
@@ -944,7 +1077,8 @@ class MemoryMiddleware(AgentMiddleware):
             getattr(ctx, "episodic_memory_enabled", True)
             and getattr(ctx, "episodic_learning_enabled", base_learning)
         )
-        if not (semantic_learning or episodic_learning):
+        procedural_learning = self._procedural_learning_due(ctx, session_id, base_learning)
+        if not (semantic_learning or episodic_learning or procedural_learning):
             return None
 
         # 대화 스냅샷 복제 (transcript.db 비활성화 시 폴백용)
@@ -962,6 +1096,7 @@ class MemoryMiddleware(AgentMiddleware):
                 "user_id": user_id,
                 "semantic_learning": semantic_learning,
                 "episodic_learning": episodic_learning,
+                "procedural_learning": procedural_learning,
                 # 원문 기록이 꺼진 턴이면 리뷰도 원문 저장소를 읽거나 쓰지 않고 스냅샷만 사용
                 "transcript_enabled": transcript_on,
             },
@@ -986,13 +1121,15 @@ class MemoryMiddleware(AgentMiddleware):
         episodic_learning: bool = True,
         cancel_event: Optional[threading.Event] = None,
         transcript_enabled: bool = True,
+        procedural_learning: bool = False,
     ) -> None:
         """Background Review 워커.
 
         1. 원문 기록이 켜져 있고 transcript.db에 원문이 있으면 세션 전체 원문을 로드(압축 손실 없음).
            꺼져 있으면 턴 종료 시점의 state 스냅샷만 사용하며, 원문 저장소에는 읽기/쓰기 모두 하지 않습니다.
         2. semantic_learning: LLM에게 대화 리뷰 요청 → memory() 호출 파싱 실행
-        3. episodic_learning: EpisodicStore에 세션 주제별 요약 저장
+        3. procedural_learning: 스킬 도구만 가진 리뷰 에이전트가 스킬 생성/패치 (skill_review.py)
+        4. episodic_learning: EpisodicStore에 세션 주제별 요약 저장
         진행 도중 같은 세션에서 새 턴이 시작되어 cancel_event가 설정되면 즉시 중단합니다.
         """
         if cancel_event is not None and cancel_event.is_set():
@@ -1029,7 +1166,15 @@ class MemoryMiddleware(AgentMiddleware):
                     full_messages, user_id=user_id, cancel_event=cancel_event, session_lock=session_lock
                 )
 
-            # 2. Episodic Memory 세션 요약 저장
+            # 2. Procedural Memory 스킬 리뷰 (도구 호출 반복 횟수가 기준값에 도달한 세션만)
+            if procedural_learning and self.review_llm:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                self._review_procedural_memory(
+                    full_messages, session_id, user_id=user_id, cancel_event=cancel_event
+                )
+
+            # 3. Episodic Memory 세션 요약 저장
             if episodic_learning:
                 if cancel_event is not None and cancel_event.is_set():
                     return
@@ -1102,11 +1247,56 @@ class MemoryMiddleware(AgentMiddleware):
         except Exception as e:
             logger.warning("[BG-Review] Semantic review LLM call failed: %s", e)
 
+    def _review_procedural_memory(
+        self,
+        messages: List[Dict[str, Any]],
+        session_id: str,
+        user_id: str = _DEFAULT_USER_ID,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """스킬 리뷰 에이전트를 실행합니다. 취소되지 않고 끝났을 때만 트리거 카운터를 리셋합니다."""
+        store = self._get_procedural_store(user_id)
+        if store is None:
+            return None
+        try:
+            result = run_skill_review(
+                self.review_llm,
+                store,
+                messages,
+                cancel_event=cancel_event,
+                max_iterations=self.skill_review_max_iterations,
+            )
+        except Exception as e:
+            logger.warning("[BG-Review] Skill review failed: %s", e)
+            return None
+        self.last_skill_reviews[session_id] = result
+        if not result.get("cancelled"):
+            self._finish_skill_review(session_id)
+        return result
+
     def _parse_and_execute_memory_ops(
         self, llm_response: str, store: Optional[SemanticMemoryStore] = None
     ) -> None:
-        """LLM 응답에서 memory() 또는 <call:memory ... /> 파싱하여 실행."""
+        """LLM 응답에서 memory 작업을 파싱하여 실행.
+
+        지원 형식 (모델마다 답하는 모양이 다름):
+        - 함수 호출 형태: memory(action="add", target="user", content="...")
+        - XML 태그 형태: <call:memory action="add" ... />
+        - JSON 형태: [{"action": "add", "target": "user", "content": "..."}] (```json 코드 펜스 포함)
+        """
         target_store = store or self.semantic_store
+
+        json_ops = self._parse_json_memory_ops(llm_response)
+        if json_ops is not None:
+            for op in json_ops:
+                self._apply_memory_op(
+                    target_store,
+                    action=str(op.get("action") or ""),
+                    target=str(op.get("target") or "memory"),
+                    content=str(op.get("content") or ""),
+                    old_text=str(op.get("old_text") or ""),
+                )
+            return
 
         patterns = [
             r'''memory\(((?:[^)"']|"[^"]*"|'[^']*')*)\)''',
@@ -1121,32 +1311,61 @@ class MemoryMiddleware(AgentMiddleware):
         for match in matches:
             try:
                 # 인자 파싱
-                action = self._extract_kwarg(match, "action")
-                target = self._extract_kwarg(match, "target") or "memory"
-                content = self._extract_kwarg(match, "content") or ""
-                old_text = self._extract_kwarg(match, "old_text") or ""
-
-                if not action:
-                    continue
-
-                if action == "add" and content:
-                    result = target_store.add(target, content)
-                elif action == "replace" and old_text and content:
-                    result = target_store.replace(target, old_text, content)
-                elif action == "remove" and old_text:
-                    result = target_store.remove(target, old_text)
-                else:
-                    continue
-
-                if result.get("success"):
-                    logger.info("[BG-Review] Memory %s: %s → %s",
-                                action, target, content[:50] if content else old_text[:50])
-                else:
-                    logger.warning("[BG-Review] Memory %s failed: %s",
-                                   action, result.get("error", "unknown"))
-
+                self._apply_memory_op(
+                    target_store,
+                    action=self._extract_kwarg(match, "action") or "",
+                    target=self._extract_kwarg(match, "target") or "memory",
+                    content=self._extract_kwarg(match, "content") or "",
+                    old_text=self._extract_kwarg(match, "old_text") or "",
+                )
             except Exception as e:
                 logger.warning("[BG-Review] Failed to parse memory op '%s': %s", match, e)
+
+    @staticmethod
+    def _parse_json_memory_ops(llm_response: str) -> Optional[List[Dict[str, Any]]]:
+        """JSON으로 답한 memory 작업 목록을 꺼냅니다. JSON 형태가 아니면 None.
+
+        코드 펜스(```json ... ```) 안의 JSON을 먼저 보고, 없으면 응답 전체를 JSON으로 읽어 봅니다.
+        배열, 단일 객체, {"operations": [...]} 모양을 모두 받습니다.
+        """
+        text = (llm_response or "").strip()
+        candidates = re.findall(r"```(?:json)?\s*(.*?)```", text, re.DOTALL) or [text]
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate.startswith(("[", "{")):
+                continue
+            try:
+                data = json.loads(candidate)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(data, dict):
+                data = data.get("operations", [data])
+            if isinstance(data, list):
+                ops = [op for op in data if isinstance(op, dict) and op.get("action")]
+                if ops or not data:
+                    return ops
+        return None
+
+    @staticmethod
+    def _apply_memory_op(
+        target_store: SemanticMemoryStore, action: str, target: str, content: str, old_text: str
+    ) -> None:
+        """파싱된 memory 작업 하나를 저장소에 반영합니다 (필수 인자가 빠진 작업은 건너뜀)."""
+        if action == "add" and content:
+            result = target_store.add(target, content)
+        elif action == "replace" and old_text and content:
+            result = target_store.replace(target, old_text, content)
+        elif action == "remove" and old_text:
+            result = target_store.remove(target, old_text)
+        else:
+            return
+
+        if result.get("success"):
+            logger.info("[BG-Review] Memory %s: %s → %s",
+                        action, target, content[:50] if content else old_text[:50])
+        else:
+            logger.warning("[BG-Review] Memory %s failed: %s",
+                           action, result.get("error", "unknown"))
 
     @staticmethod
     def _extract_kwarg(args_str: str, key: str) -> Optional[str]:

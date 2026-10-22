@@ -16,19 +16,21 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
    - L1 System Rules & Identity ← SUPERVISOR_SYSTEM_PROMPT (5-Phase 오케스트레이션 루프)
    - L2 Capabilities           ← 도구 스키마 + 스킬 실행 지침(skills/SKILL.md) + skills/ 카탈로그 (SkillPromptBuilder 자동 스캔)
    - L3 Dynamic Session Context ← CWD, Session ID, Session Workspace Root, Date, Host OS
-   - L4 Recalled Memory         ← Semantic 스냅샷 + Episodic 과거 세션 요약 힌트
+   - L4 Recalled Memory         ← Semantic 스냅샷 + 학습 스킬 카탈로그(Procedural) + Episodic 과거 세션 요약 힌트
    - L5 Project Rules            ← AGENT.md / CLAUDE.md (현재 미지정)
 3. 계층형 메모리 (Layered Memory & Dual-Tier Session Data):
    - L1 단기 기억  : AsyncSqliteSaver (세션별 체크포인터 — AutoCompactor가 압축 교체)
    - L2 에피소드 원문: TranscriptStore (transcript.db — 대화·도구 호출/결과 실시간 Append-only 백업)
    - L2 에피소드 색인: EpisodicStore (episodic.db — 다중 주제 요약·키워드 SQLite FTS5 + session_recall JIT 인출)
    - L3 시맨틱 기억 : SemanticMemoryStore (USER.md / MEMORY.md + memory 도구)
+   - 절차 기억      : ProceduralMemoryStore (skills/<name>/SKILL.md + skill_view / skill_manage 도구,
+                      도구 호출 10회마다 백그라운드 스킬 리뷰)
 4. Self-Recovery & Self-Correction 미들웨어:
    - ModelFallbackMiddleware    : LLM 장애 시 백업 모델로 failover (413 토큰 초과는 상위로 전파)
    - ToolErrorHandlerMiddleware : 도구 예외 시 ToolMessage(Observation)로 변환
    - ModelCallLimitMiddleware   : 무한 루프 차단 (run_limit=50)
    - StopHooksMiddleware        : 생성된 Python 코드블록 AST 구문 검증 및 자가 교정 루프
-5. 도구: tools_supervisor(15종) + memory_tools(2종) + custom_tools(2종) = 총 19종
+5. 도구: tools_supervisor(15종) + memory_tools(2종) + skill_tools(2종) + custom_tools(2종) = 총 21종
 
 [미들웨어 파이프라인 실행 순서]
    사용자 요청 →
@@ -66,6 +68,7 @@ from app.tools.custom_tools import roll_dice, convert_currency
 # Mission 03: 계층형 메모리 + 5계층 프롬프트 조립기
 from app.middleware.memory import (
     SemanticMemoryStore,
+    ProceduralMemoryStore,
     EpisodicStore,
     TranscriptStore,
     MemoryMiddleware,
@@ -137,7 +140,7 @@ async def create_agent_executor(checkpointer=None):
         checkpointer = AsyncSqliteSaver(conn)
         await checkpointer.setup()
 
-    # 4. 도구 바인딩 (Supervisor 15종 + Custom 2종 = 17종 / Memory 2종은 memory_mw가 create_agent에 자동 등록 → 총 19종)
+    # 4. 도구 바인딩 (Supervisor 15종 + Custom 2종 = 17종 / Memory 2종 + Skill 2종은 memory_mw가 create_agent에 자동 등록 → 총 21종)
     #    ※ PromptAssembler(tool_schemas=active_tools)에서 참조하므로 먼저 선언합니다.
     active_tools = list(tools_supervisor) + [roll_dice, convert_currency]
 
@@ -145,6 +148,7 @@ async def create_agent_executor(checkpointer=None):
     memory_cfg = _load_config("./configs/memory.config", {})
     sem_cfg = memory_cfg.get("semantic_memory", {})
     epi_cfg = memory_cfg.get("episodic_memory", {})
+    proc_cfg = memory_cfg.get("procedural_memory", {})
     tr_cfg = memory_cfg.get("transcript", {})
 
     # 4-2. L3 Semantic Memory Store 초기화 (USER.md, MEMORY.md)
@@ -157,6 +161,17 @@ async def create_agent_executor(checkpointer=None):
         user_char_limit=2000,
     )
     semantic_store.load_from_disk()
+
+    # 4-2-1. Procedural Memory Store 초기화 (학습된 스킬: skills/<name>/SKILL.md)
+    #    기본값 artifacts/users/default/skills → 사용자별 artifacts/users/{user_id}/skills/ 자동 격리
+    #    ※ 사람이 작성한 번들 스킬(main_agent/skills/)은 Layer 2.2 카탈로그로 따로 노출되며 수정 대상이 아닙니다.
+    procedural_store = None
+    if proc_cfg.get("enabled", True):
+        procedural_store = ProceduralMemoryStore(
+            skills_dir=proc_cfg.get("skills_dir", "./artifacts/users/default/skills"),
+            max_skill_chars=int(proc_cfg.get("max_skill_chars", 20000)),
+        )
+        procedural_store.load_from_disk()
 
     # 4-3. L2 원문 저장소(TranscriptStore) + 요약 색인(EpisodicStore) 초기화
     transcript_db_path = tr_cfg.get("db_path", os.path.join(db_dir, "transcript.db"))
@@ -185,6 +200,9 @@ async def create_agent_executor(checkpointer=None):
         transcript_enabled=tr_cfg.get("enabled", True),
         finalize_idle_settle_s=float(epi_cfg.get("finalize_idle_settle_s", 15.0)),
         finalize_max_age_s=float(epi_cfg.get("finalize_max_age_s", 1800.0)),
+        procedural_store=procedural_store,
+        skill_nudge_interval=int(proc_cfg.get("skill_nudge_interval", 10)),
+        skill_review_max_iterations=int(proc_cfg.get("review_max_iterations", 16)),
     )
 
     # 4-5. Claude Code 표준 16-Module 5-Layer Prompt Assembler 구성
@@ -326,6 +344,7 @@ async def create_agent_executor(checkpointer=None):
     main_agent.transcript_store = transcript_store
     main_agent.episodic_store = episodic_store
     main_agent.semantic_store = semantic_store
+    main_agent.procedural_store = procedural_store
     main_agent.assembler = assembler
     main_agent.memory_middleware = memory_mw
 

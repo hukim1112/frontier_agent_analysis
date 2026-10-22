@@ -69,6 +69,11 @@ artifacts/*.csv
 artifacts/*.xlsx
 artifacts/*.md
 artifacts/users/*/sessions/
+artifacts/users/*/skills/
+artifacts/users/temporary_user/
+artifacts/users/probe_user/
+artifacts/demo_compaction/
+.claude/swaps/
 
 # ── Preserved Seed Assets (교육생 실습용 스킬 풀 및 기본 유저 시드 메모리는 Git 추적 유지) ──
 !artifacts/skills_pool/

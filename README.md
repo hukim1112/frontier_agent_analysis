@@ -42,7 +42,7 @@ Claude Code(유출 소스 v2.1.88) `query.ts`의 실행 순서를 따릅니다. 
 - **L2 Episodic — 원문 저장소 (`transcript.db`, `TranscriptStore`)**: 모든 사용자·AI·도구 결과 원문 및 압축 이벤트를 실시간 Append-only로 기록하는 **전체본**. `episodic_memory_enabled` / `episodic_learning_enabled`와 독립된 `transcript.enabled` 스위치로 동작.
 - **L2 Episodic — 요약 색인 (`episodic.db`, `EpisodicStore` + `IdleReviewQueue`)**: 마지막 턴 후 15초 유휴 대기(최대 30분) 뒤 `transcript.db` 원문을 읽어 **다중 주제(Multi-Topic) 구조화 요약(`topics_json`, `tool_names`)** 및 SQLite FTS5 색인을 생성. `session_search`(색인 검색 + 원문 FTS 폴백) ➔ `session_recall`(`transcript.db` Anchor ±window 원문 인출) 2단계 인출 지원.
 - **L3 Semantic Memory (`MEMORY.md` / `USER.md`)**: 에이전트 팩트 및 사용자 프로필 관리. 유휴 큐 백그라운드 리뷰를 통한 스마트 마크다운 병합(`add`, `replace`, `remove`).
-- **L4 Procedural Memory**: 프롬프트 어셈블러 및 스킬 카탈로그(`SKILL.md`)와 연동된 절차 기억.
+- **L4 Procedural Memory (`artifacts/users/{user_id}/skills/`, `ProceduralMemoryStore`)**: 작업 유형별 절차를 `SKILL.md`로 학습하는 기억. 도구 호출이 10회 쌓인 세션은 유휴 리뷰에서 스킬 도구만 가진 리뷰 에이전트가 스킬을 생성·patch(`skill_review.py`). 카탈로그(이름+설명)만 L4에 세션 단위로 주입하고 본문은 `skill_view`로 열람. 백그라운드 쓰기는 에이전트 소유 스킬만, 이번 리뷰에서 읽은 파일만 허용. 사람이 작성한 번들 스킬(`main_agent/skills/`)은 Layer 2.2 카탈로그로 별도 노출.
 
 ---
 
@@ -51,14 +51,15 @@ Claude Code(유출 소스 v2.1.88) `query.ts`의 실행 순서를 따릅니다. 
 ```text
 frontier_agent_analysis/
 ├── app/                              # 🧠 메인 애플리케이션 및 하네스 모듈
-│   ├── agents/                       #   ├── main_agent.py (19종 도구 + 9단계 미들웨어 오케스트레이터)
+│   ├── agents/                       #   ├── main_agent.py (21종 도구 + 9단계 미들웨어 오케스트레이터)
 │   │                                 #   └── chatbot.py, analyst.py, scraper.py
 │   ├── middleware/                   #   📁 체계화된 하네스 미들웨어 패키지
 │   │   ├── prompt/                   #   │   └── prompt_assembler.py (16-Module 5-Layer 조립기)
 │   │   ├── compaction/               #   │   └── compactor.py (Claude Code 압축 파이프라인), amnesia_guard.py
 │   │   ├── error_control/            #   │   └── self_recovery.py, self_correction.py
 │   │   ├── guardrails.py             #   │   └── InputSafety & TopicAlignment (before_agent + jump_to end)
-│   │   ├── memory/                   #   │   └── transcript_store.py, episodic_store.py, review_queue.py, semantic_store.py, memory_middleware.py
+│   │   ├── memory/                   #   │   └── transcript_store.py, episodic_store.py, review_queue.py, semantic_store.py, memory_middleware.py,
+│   │                                 #   │       procedural_store.py, skill_tools.py, skill_review.py
 │   │   └── observability/            #   │   └── agent_log_tracer.py, visualizer.py
 │   ├── prompts/                      #   └── SUPERVISOR.py, CHATBOT.py, ANALYST.py, SCRAPER.py
 │   ├── tools/                        #   └── supervisor_tools.py, custom_tools.py, navigator.py, analyst.py
@@ -71,10 +72,11 @@ frontier_agent_analysis/
 │   ├── claude_code/                  #   └── prompt_assembler, compactor, amnesia_guard, self_correction
 │   └── common/                       #   └── agent_tracer.py (토큰/지연시간 정밀 감사 트레이서)
 │
-├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (3종)
+├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (4종)
 │   ├── 01_react_vs_frontier_agents.ipynb    # Step 1: ReAct vs 프론티어 에이전트 루프 & 관측성
 │   ├── 02_claude_code_harness.ipynb         # Step 2: 5계층 프롬프트, 5대 압축 파이프라인, Amnesia Guard
-│   └── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리(transcript.db + episodic.db) 및 FTS5 인출
+│   ├── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리(transcript.db + episodic.db) 및 FTS5 인출
+│   └── 04_hermes_procedural_memory.ipynb    # Step 4: Procedural Memory — 스킬 학습 루프, 전이 실험, Curator
 │
 ├── configs/                          # ⚙️ 런타임 제어 설정 파일
 │   ├── compaction.config             #   └── 압축 임계치 및 스왑 디렉터리 설정
@@ -139,7 +141,7 @@ chainlit run app/chainlit_ui.py -w --port 8080
 - **기본 로그인 계정**:
   - **ID**: `user`
   - **Password**: `1234`
-- 19종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
+- 21종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
 
 ### 2. 백엔드 FastAPI 서버 구동
 ```bash

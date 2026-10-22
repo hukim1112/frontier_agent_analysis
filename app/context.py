@@ -23,6 +23,8 @@ class AgentContext:
     semantic_learning_enabled: bool = True
     episodic_memory_enabled: bool = True
     episodic_learning_enabled: bool = True
+    procedural_memory_enabled: bool = True
+    procedural_learning_enabled: bool = True
     transcript_enabled: bool = True
 
     # ── 노트북(03_hermes_memory_architecture.ipynb) 하위 호환 필드 ──

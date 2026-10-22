@@ -10,7 +10,8 @@ artifacts/
         ├── memory/                                      # 유저 단위 영구 장기 기억 (마크다운)
         │   ├── USER.md
         │   └── MEMORY.md
-        └── sessions/                                    # 메인 대화(Supervisor) 단위 워크스페이스
+        ├── skills/                                      # 학습된 스킬 (Procedural Memory, SKILL.md + .usage.json)
+        └── sessions/                                   # 메인 대화(Supervisor) 단위 워크스페이스
             └── {session_id}/
                 ├── plan/                                # plan_state.json, task_state.json
                 ├── logs/                                # audit.jsonl (403 protected internal log)
@@ -144,6 +145,20 @@ def resolve_user_memory_dir(
             if not fpath.exists():
                 fpath.write_text("", encoding="utf-8")
     return mem_dir
+
+
+def resolve_user_skills_dir(
+    user_id: Optional[str] = "default",
+    base_dir: Optional[Path] = None,
+    ensure_exists: bool = False,
+) -> Path:
+    """사용자별 학습 스킬(Procedural Memory) 디렉터리(`artifacts/users/{user_id}/skills`)를 반환합니다."""
+    safe_uid = sanitize_path_segment(user_id, fallback="default")
+    root = base_dir if base_dir is not None else USERS_ROOT_DIR
+    skills_dir = root / safe_uid / "skills"
+    if ensure_exists:
+        skills_dir.mkdir(parents=True, exist_ok=True)
+    return skills_dir
 
 
 def resolve_session_workspace(
