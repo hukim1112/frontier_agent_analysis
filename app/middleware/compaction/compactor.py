@@ -146,6 +146,17 @@ def _content_text(content: Any) -> str:
     return str(content or "")
 
 
+def _hidden_from_stream(llm: Any) -> Any:
+    """요약용 LLM 호출에 exclude_from_stream 태그를 붙입니다.
+
+    압축 요약은 사용자 요청을 처리하는 도중(before_model) 실행되므로, 태그가 없으면 서버의
+    astream_events가 요약 토큰을 답변으로 사용자에게 흘려보냅니다. with_config가 없는
+    테스트용 가짜 모델은 그대로 돌려줍니다.
+    """
+    with_config = getattr(llm, "with_config", None)
+    return with_config(tags=["exclude_from_stream"]) if callable(with_config) else llm
+
+
 _SYSTEM_REMINDER_RE = re.compile(r"^\s*<system-reminder>[\s\S]*?</system-reminder>\s*")
 
 
@@ -645,7 +656,7 @@ class ContextCollapse:
 
     def commit(self, span: Sequence[Any]) -> Optional[Dict[str, Any]]:
         try:
-            response = self.llm.invoke([HumanMessage(content=self._summary_prompt(span))])
+            response = _hidden_from_stream(self.llm).invoke([HumanMessage(content=self._summary_prompt(span))])
         except Exception as e:
             print(f"⚠️ [ContextCollapse] summary failed, skipping commit: {e}")
             return None
@@ -931,7 +942,8 @@ class AutoCompactor:
         to_summarize = list(to_compact)
         for attempt in range(MAX_PTL_RETRIES + 1):
             try:
-                response = self.llm.invoke([HumanMessage(content=self.build_summary_request(to_summarize))])
+                response = _hidden_from_stream(self.llm).invoke(
+                    [HumanMessage(content=self.build_summary_request(to_summarize))])
                 return _content_text(getattr(response, "content", response))
             except Exception as e:
                 truncated = (truncate_head_for_ptl_retry(to_summarize)
@@ -947,10 +959,11 @@ class AutoCompactor:
         for attempt in range(MAX_PTL_RETRIES + 1):
             try:
                 request = [HumanMessage(content=self.build_summary_request(to_summarize))]
-                if hasattr(self.llm, "ainvoke"):
-                    response = await self.llm.ainvoke(request)
+                llm = _hidden_from_stream(self.llm)
+                if hasattr(llm, "ainvoke"):
+                    response = await llm.ainvoke(request)
                 else:
-                    response = await asyncio.to_thread(self.llm.invoke, request)
+                    response = await asyncio.to_thread(llm.invoke, request)
                 return _content_text(getattr(response, "content", response))
             except Exception as e:
                 truncated = (truncate_head_for_ptl_retry(to_summarize)

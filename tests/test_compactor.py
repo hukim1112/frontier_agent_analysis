@@ -4,6 +4,7 @@ Claude Code 압축 파이프라인 (app/middleware/compaction/compactor.py) 테�
 단계별 단위 테스트 + create_agent 그래프 통합 테스트 + modules 사본 동기화 확인.
 """
 
+import asyncio
 import os
 import pathlib
 import time
@@ -418,6 +419,30 @@ def test_middleware_persists_large_tool_result_in_state(tmp_path):
     result = next(m for m in out["messages"] if isinstance(m, ToolMessage))
     assert result.content.startswith(PERSISTED_OUTPUT_TAG) and len(result.content) < 3_000
     assert (tmp_path / "budget" / "w1.txt").read_text(encoding="utf-8").startswith("<html>")
+
+
+def test_auto_compact_summary_is_not_streamed_to_user(tmp_path):
+    """서버(app/server.py)는 astream_events의 모델 토큰 중 exclude_from_stream 태그가 없는 것을 답변으로 보냅니다.
+    before_model에서 만드는 압축 요약 토큰이 사용자 답변에 섞이면 안 됩니다."""
+    summary_llm = scripted("<analysis>INTERNAL-SUMMARY</analysis>\n<summary>\n1. Primary Request and Intent: x\n</summary>")
+    compactor = create_compactor_middleware(
+        llm=summary_llm, threshold_tokens=40, swap_dir=str(tmp_path), config={"snip": {"enabled": False}},
+    )
+    agent = _agent(scripted("첫 답변 " * 30, "둘째 답변"), [compactor])
+    cfg = {"configurable": {"thread_id": "stream-tag"}}
+    agent.invoke({"messages": [HumanMessage(content="첫 질문 " * 30)]}, cfg)
+
+    async def streamed_to_user():
+        tokens = []
+        async for ev in agent.astream_events({"messages": [HumanMessage(content="둘째 질문")]}, cfg, version="v2"):
+            if ev["event"] == "on_chat_model_stream" and "exclude_from_stream" not in ev.get("tags", []):
+                tokens.append(str(ev["data"]["chunk"].content))
+        return "".join(tokens)
+
+    streamed = asyncio.run(streamed_to_user())
+    assert any(is_compaction_summary(m) for m in agent.get_state(cfg).values["messages"]), "압축이 실제로 일어나야 함"
+    assert "INTERNAL-SUMMARY" not in streamed
+    assert "둘째 답변" in streamed
 
 
 # =============================================================================
