@@ -111,7 +111,7 @@ cp .env.example .env
 
 ### 1. Chainlit 채팅 UI 구동 (권장)
 ```bash
-chainlit run app/chainlit_ui.py -w --port 8080
+chainlit run app/chainlit_ui.py --port 8080
 ```
 - 브라우저에서 `http://localhost:8080` 접속
 - **기본 로그인 계정**:
