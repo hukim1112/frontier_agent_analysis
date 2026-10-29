@@ -51,7 +51,7 @@ frontier_agent_analysis/
 │   ├── 02_claude_code_harness.ipynb         # Step 2: 5계층 프롬프트, 5대 압축 파이프라인, Amnesia Guard
 │   ├── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리(transcript.db + episodic.db) 및 FTS5 인출
 │   ├── 04_hermes_procedural_memory.ipynb    # Step 4: Procedural Memory — 스킬 학습 루프, 전이 실험, Curator
-│   └── (optional)_agent_guardrails.ipynb    # (Optional) 도구 실행 직전 안전장치(ToolGuard) & 간접 인젝션 방어
+│   └── optional_agent_guardrails.ipynb      # (Optional) 도구 실행 직전 안전장치(ToolGuard) & 간접 인젝션 방어
 │
 ├── configs/                          # ⚙️ 런타임 제어 설정 파일
 │   ├── compaction.config             #   └── 압축 임계치 및 스왑 디렉터리 설정
