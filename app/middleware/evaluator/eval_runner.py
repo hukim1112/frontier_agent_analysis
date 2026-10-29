@@ -80,7 +80,10 @@ class EvalRunner:
                 print(f"❌ Error during execution: {error}")
 
             # Retrieve logs from tracer
-            run_info = self.tracer._active_runs.get(sc_id, {})
+            run_info = (
+                self.tracer._active_runs.get(sc_id)
+                or self.tracer._active_runs.get(self.tracer._last_session_id, {})
+            )
             events = run_info.get("events", [])
             final_response = run_info.get("final_response", "")
 

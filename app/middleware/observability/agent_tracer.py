@@ -45,7 +45,16 @@ class AgentTracer(AgentMiddleware):
 
     def _get_session_id(self, runtime, request=None) -> str:
         """Identify the priority session_id (thread_id) based on thread and context."""
-        # 1. From get_config_from_context
+        # 1. From langgraph.config.get_config / get_config_from_context
+        try:
+            from langgraph.config import get_config
+            cfg = get_config()
+            if cfg:
+                tid = cfg.get("configurable", {}).get("thread_id")
+                if tid:
+                    return str(tid)
+        except Exception:
+            pass
         try:
             from langchain_core.runnables.config import get_config_from_context
             config = get_config_from_context()
