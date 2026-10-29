@@ -47,7 +47,7 @@ frontier_agent_analysis/
 │   └── streamlit_ui.py               #   └── Streamlit 보조 UI
 │
 ├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (필수 4종 + 참고 1종)
-│   ├── 01_react_vs_frontier_agents.ipynb    # Step 1: ReAct vs 프론티어 에이전트 루프 & 관측성
+│   ├── 01_react_vs_frontier_agents.ipynb    # Step 1: ReAct 루프, Runtime Context, Middleware & 관측성
 │   ├── 02_claude_code_harness.ipynb         # Step 2: 5계층 프롬프트, 5대 압축 파이프라인, Amnesia Guard
 │   ├── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리(transcript.db + episodic.db) 및 FTS5 인출
 │   ├── 04_hermes_procedural_memory.ipynb    # Step 4: Procedural Memory — 스킬 학습 루프, 전이 실험, Curator
