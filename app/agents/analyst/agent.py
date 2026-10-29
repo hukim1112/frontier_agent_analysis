@@ -10,7 +10,7 @@
    ├── agent.py       (에이전트 조립 및 서브에이전트 맞춤 미들웨어 파이프라인)
    ├── prompt.py      (ANALYST_SYSTEM_PROMPT — PromptAssembler의 Layer 1)
    ├── tools.py       (분석 3종 + 출력 3종 + 공통 6종 = 12종 도구 바인딩)
-   └── skills/        (애널리스트 전용 스킬 문서 — Layer 2.2 카탈로그로 노출)
+   └── skills/        (애널리스트 전용 스킬 문서 — Layer 2 카탈로그로 노출)
 ===============================================================================
 """
 
@@ -78,8 +78,8 @@ async def create_agent_executor(checkpointer=None):
         checkpointer = AsyncSqliteSaver(conn)
         await checkpointer.setup()
 
-    # 3. 5-Layer Prompt Assembler (Analyst 내재화 skills/ 카탈로그 + L3 Session Workspace Root 동적 주입)
-    #    skills/SKILL.md(가이드 허브)는 Layer 2.2 카탈로그 상단에만 주입 (L5 중복 주입 안 함)
+    # 3. 5-Layer Prompt Assembler (Analyst 내재화 skills/ 카탈로그 + L4 Session Workspace Root 동적 주입)
+    #    skills/SKILL.md(가이드 허브)는 Layer 2 카탈로그 상단에만 주입 (L5 중복 주입 안 함)
     skill_guidelines = str(SKILLS_DIR / "SKILL.md") if (SKILLS_DIR / "SKILL.md").exists() else None
     skill_builder = SkillPromptBuilder(
         skills_dirs=[str(SKILLS_DIR)],
@@ -87,7 +87,6 @@ async def create_agent_executor(checkpointer=None):
     )
     assembler = PromptAssembler(
         system_rules=ANALYST_SYSTEM_PROMPT,
-        tool_schemas=list(tools_analyst),
         skill_catalog=skill_builder.assemble,
     )
     prompt_mw = create_prompt_assembler_middleware(assembler, merge_system=True)

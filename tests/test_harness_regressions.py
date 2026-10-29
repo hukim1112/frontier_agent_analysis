@@ -26,24 +26,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from app.middleware.error_control.self_correction import stop_hooks as app_stop_hooks
 from app.middleware.compaction import amnesia_guard as app_amnesia_guard
 from app.middleware.compaction import compactor as app_compactor
-from modules.claude_code import self_correction as mod_self_correction
-from modules.claude_code import amnesia_guard as mod_amnesia_guard
-from modules.claude_code import compactor as mod_compactor
 from app.utils.message_markers import is_compaction_summary, is_user_turn_start, last_user_turn_start
 
 
-STOP_HOOK_IMPLS = [
-    pytest.param(app_stop_hooks.StopHooksMiddleware, id="app"),
-    pytest.param(mod_self_correction.StopHooksMiddleware, id="modules"),
-]
-GUARD_IMPLS = [
-    pytest.param(app_amnesia_guard.AmnesiaGuardMiddleware, id="app"),
-    pytest.param(mod_amnesia_guard.AmnesiaGuardMiddleware, id="modules"),
-]
-COLLAPSE_IMPLS = [
-    pytest.param(app_compactor.ContextCollapse, id="app"),
-    pytest.param(mod_compactor.ContextCollapse, id="modules"),
-]
+STOP_HOOK_IMPLS = [pytest.param(app_stop_hooks.StopHooksMiddleware, id="app")]
+GUARD_IMPLS = [pytest.param(app_amnesia_guard.AmnesiaGuardMiddleware, id="app")]
+COLLAPSE_IMPLS = [pytest.param(app_compactor.ContextCollapse, id="app")]
 
 BAD = "고친 코드입니다:\n```python\ndef f(:\n    pass\n```"
 GOOD = "고친 코드입니다:\n```python\ndef f():\n    pass\n```"
@@ -328,7 +316,7 @@ def test_dual_tier_transcript_and_episodic_summary(tmp_path):
         ],
         "keywords": ["config", "port", "8080", "file_writer"],
     })
-    review_llm = scripted("Nothing to save.", topic_summary_json)
+    review_llm = scripted(topic_summary_json)
 
     memory_mw = MemoryMiddleware(
         semantic_store=sem_store,
@@ -336,6 +324,7 @@ def test_dual_tier_transcript_and_episodic_summary(tmp_path):
         transcript_store=tr_store,
         review_llm=review_llm,
         finalize_idle_settle_s=60.0,  # 긴 유휴 시간 설정 → wait_for_reviews()가 즉시 flush하는지 함께 검증
+        memory_nudge_interval=0,      # Semantic 리뷰 끔 → review_llm 응답은 에피소드 추출만 사용
     )
 
     model = scripted(
@@ -365,7 +354,7 @@ def test_dual_tier_transcript_and_episodic_summary(tmp_path):
     assert raw_rows[2]["tool_name"] == "file_writer"
     assert raw_rows[2]["content"] == "ok"
 
-    # 2) 유휴 리뷰 큐에 예약되어 아직 실행 전이지만, wait_for_reviews()가 즉시 flush하여 요약 완료
+    # 2) 에피소드 추출은 세션 종료 조건까지 대기 중이지만, wait_for_reviews()가 즉시 flush하여 요약 완료
     assert memory_mw._review_queue.pending("sess_dual_1") is True
     memory_mw.wait_for_reviews(timeout=5.0)
     assert memory_mw._review_queue.pending("sess_dual_1") is False
@@ -543,7 +532,7 @@ def test_compactor_before_model_replaces_state_while_transcript_keeps_full_histo
         swap_dir=str(tmp_path / "swaps"),
         transcript_store=tr_store,
     )
-    assembler = PromptAssembler(system_rules="Core Rules", tool_schemas=[])
+    assembler = PromptAssembler(system_rules="Core Rules")
     prompt_mw = create_prompt_assembler_middleware(assembler, merge_system=True)
 
     seen_model_messages = []
@@ -787,7 +776,10 @@ def test_hitl_interrupt_still_records_question_and_tool_call(tmp_path):
 
 def test_auto_compact_runs_once_per_turn_and_keeps_current_turn_originals(tmp_path):
     """도구 3회 호출 턴에서도 요약 LLM은 1회만 호출되고, state의 현재 턴은 원본(스왑 스텁 아님)으로 남으며,
-    transcript.db에는 중복 없이 원문과 압축 이벤트가 기록되어야 합니다. 압축된 구간은 회상 가능해야 합니다."""
+    transcript.db에는 중복 없이 원문과 압축 이벤트가 기록되어야 합니다. 압축된 구간은 회상 가능해야 합니다.
+
+    크기 설정: 첫 턴(약 2,000토큰) + 현재 턴(도구 결과 3개, 약 7,200토큰)은 임계치 8,000을 넘지만 현재 턴만으로는
+    넘지 않습니다. 그래서 이전 턴만 요약됩니다 (현재 턴만으로 넘으면 현재 턴까지 요약하는 것이 정상 동작)."""
     import json
     from app.context import AgentContext
     from app.middleware.memory import MemoryMiddleware
@@ -801,11 +793,11 @@ def test_auto_compact_runs_once_per_turn_and_keeps_current_turn_originals(tmp_pa
     memory_mw = MemoryMiddleware(sem, epi, transcript_store=tr)
     summary_llm = CountingLLM("1. Goal\n2. Decisions\n3. Delta\n4. Next")
     compactor_mw = app_compactor.create_compactor_middleware(
-        llm=summary_llm, threshold_tokens=60, swap_dir=str(tmp_path / "swaps"), transcript_store=tr,
+        llm=summary_llm, threshold_tokens=8000, swap_dir=str(tmp_path / "swaps"), transcript_store=tr,
     )
     agent = create_agent(
         model=scripted(
-            "첫 턴 답변: 코드네임 ZEPHYR42 확인했습니다. " * 4,
+            "첫 턴 답변: 코드네임 ZEPHYR42 확인했습니다. " * 200,
             _tool_call_msg("big_reader", {"path": "a.log"}, "c1"),
             _tool_call_msg("big_reader", {"path": "b.log"}, "c2"),
             _tool_call_msg("big_reader", {"path": "c.log"}, "c3"),

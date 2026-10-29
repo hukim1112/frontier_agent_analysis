@@ -3,7 +3,7 @@ import time
 import json
 from typing import Any, Dict, List, Callable
 from langchain.agents.middleware import AgentMiddleware, ModelResponse
-from modules.common.viz import render_timeline_html, render_tool_summary_html
+from .viz import render_timeline_html, render_tool_summary_html
 
 try:
     from IPython.display import display, HTML

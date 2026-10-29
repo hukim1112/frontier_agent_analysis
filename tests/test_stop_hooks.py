@@ -1,10 +1,10 @@
-import pytest
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
-from modules.claude_code.self_correction import (
+from types import SimpleNamespace
+
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from app.middleware.error_control import (
     StopHooksMiddleware,
-    ModelErrorHandlerMiddleware,
-    AbortStreamingHandler,
-    AbortToolsHandler
+    AbortStreamingMiddleware,
+    AbortToolsMiddleware,
 )
 
 def test_stop_hook_blocking_triggers_on_syntax_error():
@@ -36,15 +36,19 @@ def test_stop_hook_passes_on_valid_code():
     assert result is None
 
 def test_aborted_streaming():
-    handler = AbortStreamingHandler()
-    msgs = [HumanMessage(content="작업 진행해줘")]
-    updated = handler.handle_abort(msgs)
-    assert len(updated) == 2
-    assert "aborted_streaming" in updated[-1].content
+    def interrupted(request):
+        raise KeyboardInterrupt("Ctrl+C")
+
+    response = AbortStreamingMiddleware().wrap_model_call(None, interrupted)
+    assert isinstance(response.result[-1], AIMessage)
+    assert "aborted_streaming" in response.result[-1].content
 
 def test_aborted_tools():
-    handler = AbortToolsHandler()
-    msgs = [HumanMessage(content="터미널 스크립트 실행해줘")]
-    updated = handler.handle_tool_abort(msgs, active_tool_name="bash_command")
-    assert len(updated) == 2
-    assert "aborted_tools" in updated[-1].content
+    def interrupted(request):
+        raise KeyboardInterrupt("Ctrl+C")
+
+    request = SimpleNamespace(tool_call={"name": "bash_command", "args": {}, "id": "call_1"})
+    result = AbortToolsMiddleware().wrap_tool_call(request, interrupted)
+    assert isinstance(result, ToolMessage)
+    assert result.tool_call_id == "call_1"
+    assert "aborted_tools" in result.content

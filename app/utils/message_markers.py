@@ -18,10 +18,12 @@
    PromptAssembler가 넣는 메시지:
    - user_context       : CLAUDE.md + 세션 시작 날짜 (모델 입력 사본의 맨 앞, state에는 저장 안 함)
    - date_change        : 자정이 지나 날짜가 바뀌었다는 알림 (state 끝에 저장)
+   - skill_listing      : 사용 가능한 스킬 목록 알림. 처음엔 전체, 이후엔 새 스킬만 (state 끝에 저장)
+   - mcp_instructions_delta : MCP 서버 사용 지침 알림. 새로 연결된 서버 지침 / 끊긴 서버 이름 (state 끝에 저장)
+   skill_listing, mcp_instructions_delta는 원본 utils/attachments.ts의 attachment 메시지에 해당합니다.
+   한 번 넣은 알림은 고치지 않으며, 이미 알린 목록은 대화에 남은 알림 메시지에서 다시 계산합니다.
 2. 사용자 턴의 시작 = 출처 표식이 없는 HumanMessage.
 3. 표식이 없는 구버전 메시지(체크포인터에 남은 이전 버전 state)는 내용 머리말로 판별합니다.
-
-이 파일은 modules/claude_code/message_markers.py와 내용이 같아야 합니다.
 """
 
 from typing import Any, Dict, List, Optional, Sequence
@@ -38,7 +40,12 @@ ORIGIN_SNIP_BOUNDARY = "snip_boundary"
 ORIGIN_CONTEXT_EFFICIENCY = "context_efficiency"
 ORIGIN_COMPACTION_MARKER = "compaction_marker"
 ORIGIN_USER_CONTEXT = "user_context"
+ORIGIN_EPISODIC_MEMORY = "episodic_memory"
 ORIGIN_DATE_CHANGE = "date_change"
+ORIGIN_SKILL_LISTING = "skill_listing"
+ORIGIN_MCP_INSTRUCTIONS_DELTA = "mcp_instructions_delta"
+# 대화에 저장되는 알림(attachment) 메시지: 사용자 발화가 아니며, 압축 후에는 다시 계산해 새로 알립니다.
+ATTACHMENT_ORIGINS = frozenset({ORIGIN_SKILL_LISTING, ORIGIN_MCP_INSTRUCTIONS_DELTA})
 
 # 원문 저장소(transcript.db)에 기록하지 않을 메시지 표식 (압축 요약은 record_compaction()으로 따로 기록)
 TRANSCRIPT_SKIP_KEY = "transcript_skip"
@@ -62,7 +69,7 @@ _LEGACY_SUMMARY_PREFIX = "Previous Conversation Summary:"
 def origin_kwargs(origin: str) -> Dict[str, Any]:
     """하네스 생성 메시지에 붙일 additional_kwargs를 만듭니다."""
     kwargs: Dict[str, Any] = {ORIGIN_KEY: origin}
-    if origin in COMPACTION_ORIGINS:
+    if origin in COMPACTION_ORIGINS or origin in ATTACHMENT_ORIGINS:
         kwargs[TRANSCRIPT_SKIP_KEY] = True
     return kwargs
 
@@ -123,6 +130,11 @@ def is_compaction_artifact(msg: Any) -> bool:
 
 def is_compaction_summary(msg: Any) -> bool:
     return message_origin(msg) == ORIGIN_COMPACTION_SUMMARY
+
+
+def is_attachment(msg: Any) -> bool:
+    """대화에 저장되는 알림 메시지(스킬 목록 · MCP 지침)인지."""
+    return message_origin(msg) in ATTACHMENT_ORIGINS
 
 
 def is_stop_hook_feedback(msg: Any) -> bool:

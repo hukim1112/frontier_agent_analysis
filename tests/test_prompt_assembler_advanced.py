@@ -27,6 +27,7 @@ from app.middleware.prompt.prompt_assembler import (
     get_simple_tone_and_style_section,
     get_output_efficiency_section,
     get_session_guidance_section,
+    get_memory_section,
     get_memory_index_section,
     get_env_info_section,
     get_language_section,
@@ -35,10 +36,15 @@ from app.middleware.prompt.prompt_assembler import (
     get_scratchpad_section,
     get_frc_section,
     get_summarize_tool_results_section,
-    # Bypass & Delta
+    # Bypass & Attachments
     get_frozen_git_snapshot,
     prepend_user_context,
-    attach_mcp_delta_if_needed,
+    append_episodic_memory,
+    split_recalled_memory,
+    get_skill_listing_delta,
+    get_mcp_instructions_delta,
+    announced_skill_names,
+    announced_mcp_servers,
     create_session_scratchpad,
     sort_tools_for_cache,
     # Constants
@@ -47,7 +53,11 @@ from app.middleware.prompt.prompt_assembler import (
 )
 from app.utils.message_markers import (
     ORIGIN_DATE_CHANGE,
+    ORIGIN_EPISODIC_MEMORY,
+    ORIGIN_MCP_INSTRUCTIONS_DELTA,
+    ORIGIN_SKILL_LISTING,
     ORIGIN_USER_CONTEXT,
+    TRANSCRIPT_SKIP_KEY,
     is_user_turn_start,
     last_user_turn_start,
     message_origin,
@@ -65,6 +75,13 @@ class TestModuleFactories:
         result = get_simple_intro_section()
         assert "interactive" in result.lower() or "agent" in result.lower()
         assert "URL" in result
+
+    def test_module_0_identity_replaces_default(self):
+        """에이전트 역할 지침이 있으면 기본 코딩 에이전트 정체성을 대신하고, URL 금지 문장은 남습니다."""
+        result = get_simple_intro_section("You are The Analyst.")
+        assert result.startswith("You are The Analyst.")
+        assert "CLI-based coding agent" not in result
+        assert "NEVER make up URLs" in result
 
     def test_module_1_system(self):
         result = get_simple_system_section()
@@ -98,6 +115,13 @@ class TestModuleFactories:
     def test_module_8_session_guidance(self):
         result = get_session_guidance_section()
         assert "!" in result or "slash" in result.lower()
+
+    def test_module_9_memory_rules(self):
+        result = get_memory_section()
+        assert "# auto memory" in result
+        assert "USER.md" in result and "MEMORY.md" in result
+        assert "skill_view" in result and "skill_manage" in result
+        assert "session_recall" in result
 
     def test_module_9_memory_index_with_content(self):
         result = get_memory_index_section("Some memory content here")
@@ -168,19 +192,19 @@ class TestPromptAssemblerModules:
     def test_static_content_includes_all_l1_modules(self):
         assembler = PromptAssembler(
             system_rules="Custom project rules.",
-            tool_schemas=[{"name": "read_file", "description": "Reads a file"}],
             claude_code_modules=True,
         )
         static = assembler.build_static_content()
 
         # L1 모듈들이 포함되었는지 확인
         assert "Global Constitution" in static
-        assert "interactive" in static.lower() or "agent" in static.lower()  # Module 0
+        assert "NEVER make up URLs" in static  # Module 0
         assert "IMPORTANT" in static  # Module 2 or 3
-        assert "Custom project rules." in static  # 사용자 규칙 합성
+        assert "Custom project rules." in static  # 에이전트 역할 지침이 Module 0의 정체성 자리에 들어감
+        assert "CLI-based coding agent" not in static, "정체성 문장은 하나만"
+        assert "Project-Specific System Rules" not in static
 
         # L2: 도구 사용 원칙(Module 4)만 들어가고, 도구 정의는 원본처럼 API tools 필드로 보냅니다.
-        assert "read_file" not in static
         assert "Anti-Raw Bash" in static or "FileRead" in static  # Module 4
 
         # 경계선
@@ -189,7 +213,6 @@ class TestPromptAssemblerModules:
     def test_dynamic_content_includes_l3_l4_l5_modules(self):
         assembler = PromptAssembler(
             system_rules="Rules",
-            tool_schemas=[],
             claude_code_modules=True,
             language="Korean",
             output_style="Concise",
@@ -205,12 +228,13 @@ class TestPromptAssemblerModules:
         # L3: Session Guidance
         assert "Session Interaction" in dynamic
 
-        # L4: Environment + Memory
+        # L4: Environment + Memory Rules (메모리 데이터는 Message 3으로 가고, L4에는 규칙만 고정)
         assert "/project" in dynamic
         assert "sess-001" in dynamic
         assert "Korean" in dynamic
         assert "Concise" in dynamic
-        assert "Previous task: implement auth module" in dynamic
+        assert "# auto memory" in dynamic
+        assert "Previous task: implement auth module" not in dynamic
 
         # L5: FRC + Summarize
         assert "cleared" in dynamic.lower() or "context" in dynamic.lower()
@@ -220,22 +244,44 @@ class TestPromptAssemblerModules:
         """assemble(): SystemMessage x2 + 사용자 컨텍스트 메시지 + 사용자 질문."""
         assembler = PromptAssembler(
             system_rules="Test rules",
-            tool_schemas=[{"name": "z_tool", "description": "Z"}, {"name": "a_tool", "description": "A"}],
             claude_code_modules=True,
         )
         messages = assembler.assemble(
             user_input="Hello",
-            session_context={"cwd": "/workspace", "session_id": "test", "current_date": "2026-10-23"},
+            session_context={
+                "cwd": "/workspace",
+                "session_id": "test",
+                "current_date": "2026-10-23",
+                "memory_snapshot": "MEMORY: Use ruff.",
+                "episodic_context": "EPISODIC: Past session summary.",
+            },
             claude_md_content="Use pytest.",
         )
-        assert len(messages) == 4
+        assert len(messages) == 5
         assert isinstance(messages[0], SystemMessage)  # Static (L1+L2+Boundary)
         assert isinstance(messages[1], SystemMessage)  # Dynamic (L3+L4+L5)
         assert message_origin(messages[2]) == ORIGIN_USER_CONTEXT
         assert "# claudeMd\nUse pytest." in messages[2].content
+        assert "# memorySnapshot\nMEMORY: Use ruff." in messages[2].content
         assert "Today's date is 2026-10-23." in messages[2].content
         assert messages[3].content == "Hello"
+        assert message_origin(messages[4]) == ORIGIN_EPISODIC_MEMORY
+        assert "# episodicMemory\nEPISODIC: Past session summary." in messages[4].content
         assert SYSTEM_PROMPT_DYNAMIC_BOUNDARY in messages[0].content
+
+    def test_session_workspace_is_in_env_info(self):
+        """에이전트 역할 지침이 가리키는 세션 작업 폴더가 Claude Code 모드의 환경 정보에도 들어갑니다."""
+        assembler = PromptAssembler(claude_code_modules=True)
+        dynamic = assembler.build_dynamic_content(
+            {"session_id": "s1", "workspace_dir": "artifacts/users/u/s1", "outputs_dir": "artifacts/users/u/s1/outputs"}
+        )
+        assert "Session Workspace Root: artifacts/users/u/s1" in dynamic
+        assert "Outputs Dir (data/charts/reports): artifacts/users/u/s1/outputs" in dynamic
+        assert "Plan Dir (plan_state/extraction_plan): artifacts/users/u/s1/plan" in dynamic
+
+    def test_default_identity_without_system_rules(self):
+        static = PromptAssembler(claude_code_modules=True).build_static_content()
+        assert "CLI-based coding agent" in static
 
     def test_date_and_git_are_not_in_system_env(self):
         """원본 env_info에는 날짜·git 상태가 없습니다. git은 시스템 프롬프트 맨 끝(gitStatus)으로 갑니다."""
@@ -257,11 +303,21 @@ class TestPromptAssemblerModules:
         assembler.clear_session_sections("s1")
         assert "/b" in assembler.build_dynamic_content({"session_id": "s1", "cwd": "/b"})
 
-    def test_memory_section_is_recomputed_every_call(self):
-        """recalled_memory는 턴마다 바뀌므로(에피소드 검색) 캐시하지 않습니다."""
+    def test_memory_data_goes_to_user_messages_not_l4(self):
+        """recalled_memory가 바뀌어도 L4(Message 2)는 불변이고, 스냅샷은 Message 3에, 에피소드는 끝에 붙습니다."""
         assembler = PromptAssembler(system_rules="", claude_code_modules=True)
-        assert "first recall" in assembler.build_dynamic_content({"session_id": "s1", "recalled_memory": "first recall"})
-        assert "second recall" in assembler.build_dynamic_content({"session_id": "s1", "recalled_memory": "second recall"})
+        dyn1 = assembler.build_dynamic_content({"session_id": "s1", "recalled_memory": "first recall"})
+        dyn2 = assembler.build_dynamic_content({"session_id": "s1", "recalled_memory": "second recall"})
+        assert dyn1 == dyn2
+        assert "first recall" not in dyn1 and "# auto memory" in dyn1
+
+    def test_no_legacy_placeholders_in_claude_code_mode(self):
+        """claude_code_modules=True일 때 구형 플레이스홀더('No dynamic memory...', 'No local project rules...')를 출력하지 않습니다."""
+        assembler = PromptAssembler(claude_code_modules=True)
+        dynamic = assembler.build_dynamic_content({"session_id": "s1", "cwd": "/workspace"})
+        assert "No dynamic memory or session documents active." not in dynamic
+        assert "No local project rules (AGENT.md/CLAUDE.md) provided." not in dynamic
+        assert "=== Layer 5: Resource Control ===" in dynamic
 
     def test_session_date_is_fixed_within_session(self):
         assembler = PromptAssembler(system_rules="", claude_code_modules=True)
@@ -277,22 +333,11 @@ class TestPromptAssemblerModules:
 # =============================================================================
 
 class TestAlphabeticalToolSort:
-    """도구 스키마가 알파벳 사전순으로 정렬되는지 검증."""
+    """API tools 필드로 보낼 도구 정의가 이름순으로 정렬되는지 검증."""
 
     def test_tool_sort_order(self):
-        tools = [
-            {"name": "z_write", "description": "Writes"},
-            {"name": "a_read", "description": "Reads"},
-            {"name": "m_search", "description": "Searches"},
-        ]
-        assembler = PromptAssembler(system_rules="", tool_schemas=tools)
-        formatted = assembler.format_tool_capabilities()
-
-        # a_read가 z_write보다 먼저 나와야 함
-        idx_a = formatted.index("a_read")
-        idx_m = formatted.index("m_search")
-        idx_z = formatted.index("z_write")
-        assert idx_a < idx_m < idx_z
+        tools = [{"name": "z_write"}, {"name": "a_read"}, {"name": "m_search"}]
+        assert [t["name"] for t in sort_tools_for_cache(tools)] == ["a_read", "m_search", "z_write"]
 
     def test_sort_tools_for_cache_keeps_mcp_after_builtins(self):
         tools = [{"name": "mcp__db__query"}, {"name": "z_write"}, {"name": "mcp__a__x"}, {"name": "a_read"}]
@@ -300,16 +345,34 @@ class TestAlphabeticalToolSort:
             "a_read", "z_write", "mcp__a__x", "mcp__db__query"]
 
     def test_tool_sort_determinism(self):
-        """동일한 도구 집합은 항상 동일한 출력을 생성해야 함 (캐시 일관성)."""
-        tools = [
-            {"name": "c_tool", "description": "C"},
-            {"name": "a_tool", "description": "A"},
-            {"name": "b_tool", "description": "B"},
-        ]
-        assembler1 = PromptAssembler(system_rules="", tool_schemas=tools)
-        assembler2 = PromptAssembler(system_rules="", tool_schemas=list(reversed(tools)))
+        """동일한 도구 집합은 등록 순서와 무관하게 항상 같은 순서가 되어야 함 (캐시 일관성)."""
+        tools = [{"name": "c_tool"}, {"name": "a_tool"}, {"name": "b_tool"}]
+        assert sort_tools_for_cache(tools) == sort_tools_for_cache(list(reversed(tools)))
 
-        assert assembler1.format_tool_capabilities() == assembler2.format_tool_capabilities()
+
+class TestToolDefinitionsStayOutOfSystemPrompt:
+    """원본처럼 도구 정의는 API tools 필드로만 보내고, 시스템 프롬프트에는 넣지 않습니다."""
+
+    @pytest.mark.parametrize("claude_code_modules", [True, False])
+    @pytest.mark.parametrize("merge_system", [True, False])
+    def test_request_tools_are_not_rendered_into_system_prompt(self, claude_code_modules, merge_system):
+        from langchain.agents.middleware import ModelRequest
+
+        assembler = PromptAssembler(system_rules="Rules", claude_code_modules=claude_code_modules)
+        middleware = create_prompt_assembler_middleware(assembler, merge_system=merge_system)
+        tools = [{"name": "zz_unique_tool", "description": "UNIQUE_TOOL_DESCRIPTION",
+                  "parameters": {"properties": {"unique_param": {"type": "string"}}}}]
+        request = ModelRequest(
+            messages=[HumanMessage(content="hi")], model="mock-model", tools=tools, tool_choice="auto",
+            model_settings={}, state={"messages": []},
+            runtime=MagicMock(context=None, config=None, execution_info=None),
+        )
+        out = middleware.wrap_model_call(request, lambda req: req)
+
+        system_text = "\n".join(m.content for m in out.messages if isinstance(m, SystemMessage))
+        for needle in ("zz_unique_tool", "UNIQUE_TOOL_DESCRIPTION", "unique_param"):
+            assert needle not in system_text
+        assert [t["name"] for t in out.tools] == ["zz_unique_tool"], "도구 정의는 tools 필드로 그대로 전달"
 
 
 # =============================================================================
@@ -445,35 +508,140 @@ class TestGitSnapshotFreezing:
 
 
 # =============================================================================
-# Test: MCP Attachments Delta
+# Test: ⑦ Attachments — 스킬 목록 · MCP 지침 (대화에 저장되는 알림)
 # =============================================================================
 
-class TestMCPDelta:
-    """MCP Delta가 마지막 HumanMessage 꼬리에 첨부되는지 검증."""
+SKILLS = [
+    {"name": "pdf", "description": "Extract text from PDFs", "path": "skills/pdf/SKILL.md"},
+    {"name": "yfinance", "description": "Market data", "path": "skills/yfinance/SKILL.md"},
+]
 
-    def test_mcp_delta_attachment(self):
-        messages = [
-            SystemMessage(content="System"),
-            HumanMessage(content="What databases are available?"),
-        ]
-        result = attach_mcp_delta_if_needed(
-            messages,
-            new_mcp_instructions="PostgreSQL MCP: Use pg_query tool for SQL queries.",
+
+class TestSkillListingAttachment:
+    """원본 getSkillListingAttachments: 첫 알림은 전체, 이후 새 스킬만."""
+
+    def test_first_listing_contains_all_skills(self):
+        msg = get_skill_listing_delta([HumanMessage(content="hi")], SKILLS)
+        assert message_origin(msg) == ORIGIN_SKILL_LISTING
+        assert msg.content.startswith("<system-reminder>\n")
+        assert "- pdf: Extract text from PDFs (skills/pdf/SKILL.md)" in msg.content
+        assert "- yfinance: Market data" in msg.content
+        assert not is_user_turn_start(msg), "알림은 사용자 턴이 아닙니다"
+        assert msg.additional_kwargs.get(TRANSCRIPT_SKIP_KEY), "원문 저장소에 사용자 발화로 기록하지 않습니다"
+
+    def test_nothing_new_returns_none(self):
+        first = get_skill_listing_delta([], SKILLS)
+        assert get_skill_listing_delta([HumanMessage(content="hi"), first], SKILLS) is None
+
+    def test_only_new_skill_is_announced(self):
+        first = get_skill_listing_delta([], SKILLS)
+        more = SKILLS + [{"name": "new-skill", "description": "Installed mid-session", "path": "p"}]
+        delta = get_skill_listing_delta([first], more)
+        assert "new-skill" in delta.content
+        assert "pdf" not in delta.content
+        assert announced_skill_names([first, delta]) == {"pdf", "yfinance", "new-skill"}
+
+    def test_long_description_is_truncated(self):
+        msg = get_skill_listing_delta([], [{"name": "x", "description": "a" * 1000, "path": ""}])
+        assert len(msg.content) < 500
+
+
+class TestMCPInstructionsDelta:
+    """원본 getMcpInstructionsDelta: 이름 기준 diff, 알린 상태는 대화에서 다시 계산."""
+
+    def test_first_connect_announces_server_blocks(self):
+        msg = get_mcp_instructions_delta([], {"wikipedia": "Use search first.", "db": "Use pg_query."})
+        assert message_origin(msg) == ORIGIN_MCP_INSTRUCTIONS_DELTA
+        assert "# MCP Server Instructions" in msg.content
+        assert "## db\nUse pg_query." in msg.content
+        assert msg.content.index("## db") < msg.content.index("## wikipedia"), "서버 이름순"
+
+    def test_no_change_returns_none(self):
+        first = get_mcp_instructions_delta([], {"wikipedia": "Use search first."})
+        assert get_mcp_instructions_delta([first], {"wikipedia": "Use search first."}) is None
+
+    def test_connect_and_disconnect(self):
+        first = get_mcp_instructions_delta([], {"wikipedia": "W", "github": "G"})
+        delta = get_mcp_instructions_delta([first], {"wikipedia": "W", "slack": "S"})
+        assert "## slack\nS" in delta.content
+        assert "## wikipedia" not in delta.content, "이미 알린 서버는 다시 알리지 않습니다"
+        assert "have disconnected" in delta.content and "github" in delta.content
+        assert announced_mcp_servers([first, delta]) == {"wikipedia", "slack"}
+
+    def test_server_without_instructions_is_ignored(self):
+        assert get_mcp_instructions_delta([], {"silent": ""}) is None
+
+    def test_announced_message_is_never_modified(self):
+        """한 번 넣은 알림은 그대로 두고 다음 알림만 추가 → 앞부분 캐시가 깨지지 않습니다."""
+        user1 = HumanMessage(content="질문1")
+        first = get_mcp_instructions_delta([user1], {"wikipedia": "W"})
+        history = [user1, first, AIMessage(content="답1"), HumanMessage(content="질문2")]
+        snapshot = [m.content for m in history]
+        assert get_mcp_instructions_delta(history, {"wikipedia": "W"}) is None
+        assert [m.content for m in history] == snapshot
+
+
+class TestAssemblerAttachments:
+    def _assembler(self, **kw):
+        return PromptAssembler(
+            system_rules="Rules", claude_code_modules=True,
+            skill_guidelines="Read SKILL.md before using a skill.",
+            skill_provider=lambda: list(SKILLS),
+            mcp_instructions=lambda: {"wikipedia": "Use search first."},
+            mcp_delta_enabled=True, **kw,
         )
-        assert "<attachment type='mcp_instructions_delta'>" in result[1].content
-        assert "PostgreSQL" in result[1].content
-        assert result[0].content == "System"  # SystemMessage 변경 없음
 
-    def test_mcp_delta_empty_instructions(self):
-        messages = [HumanMessage(content="Hello")]
-        result = attach_mcp_delta_if_needed(messages, new_mcp_instructions="")
-        assert result[0].content == "Hello"
+    def test_static_prompt_has_guidelines_but_no_skill_list(self):
+        static = self._assembler().build_static_content()
+        assert "Read SKILL.md before using a skill." in static
+        assert "yfinance" not in static, "스킬 목록은 정적 영역에 넣지 않습니다"
 
-    def test_mcp_delta_no_human_message(self):
-        messages = [SystemMessage(content="System only")]
-        result = attach_mcp_delta_if_needed(messages, new_mcp_instructions="New MCP tool")
-        assert len(result) == 1
-        assert result[0].content == "System only"
+    def test_static_prompt_is_independent_of_installed_skills(self):
+        skills = list(SKILLS)
+        assembler = PromptAssembler(system_rules="", claude_code_modules=True,
+                                    skill_guidelines="Policy", skill_provider=lambda: skills)
+        before = assembler.build_static_content()
+        skills.append({"name": "late", "description": "d", "path": "p"})
+        assert assembler.build_static_content() == before
+
+    def test_dynamic_prompt_has_no_mcp_instructions_in_delta_mode(self):
+        dynamic = self._assembler().build_dynamic_content({"session_id": "s1"})
+        assert "Use search first." not in dynamic
+
+    def test_mcp_dict_goes_to_system_prompt_when_delta_disabled(self):
+        assembler = PromptAssembler(system_rules="", claude_code_modules=True,
+                                    mcp_instructions=lambda: {"wikipedia": "Use search first."})
+        dynamic = assembler.build_dynamic_content({"session_id": "s1"})
+        assert "# MCP Server Instructions" in dynamic and "## wikipedia\nUse search first." in dynamic
+
+    def test_collect_attachments_then_nothing_more(self):
+        assembler = self._assembler()
+        history = [HumanMessage(content="hi")]
+        first = assembler.collect_attachments(history)
+        assert [message_origin(m) for m in first] == [ORIGIN_SKILL_LISTING, ORIGIN_MCP_INSTRUCTIONS_DELTA]
+        assert assembler.collect_attachments(history + first) == []
+
+    def test_assemble_appends_attachments_after_user_input(self):
+        messages = self._assembler().assemble("질문", {"session_id": "s1", "current_date": "2026-10-23"})
+        origins = [message_origin(m) for m in messages]
+        assert origins == [None, None, ORIGIN_USER_CONTEXT, None, ORIGIN_SKILL_LISTING, ORIGIN_MCP_INSTRUCTIONS_DELTA]
+        assert messages[3].content == "질문"
+
+    def test_legacy_skill_catalog_still_static(self):
+        assembler = PromptAssembler(system_rules="", skill_catalog=lambda: "Catalog: pdf")
+        assert "Catalog: pdf" in assembler.build_static_content()
+        assert assembler.collect_attachments([HumanMessage(content="hi")]) == []
+
+    def test_static_content_is_built_once(self):
+        calls = []
+        assembler = PromptAssembler(system_rules="", claude_code_modules=True,
+                                    skill_guidelines=lambda: calls.append(1) or "Policy")
+        assembler.build_static_content()
+        assembler.build_static_content()
+        assert len(calls) == 1
+        assembler.clear_static_cache()
+        assembler.build_static_content()
+        assert len(calls) == 2
 
 
 # =============================================================================
@@ -500,12 +668,19 @@ class TestScratchpad:
     def test_assembler_scratchpad_lazy_init(self):
         assembler = PromptAssembler(
             system_rules="",
-            tool_schemas=[],
             claude_code_modules=True,
         )
         dir1 = assembler.get_scratchpad_dir(session_id="lazy-001")
         dir2 = assembler.get_scratchpad_dir(session_id="lazy-001")
         assert dir1 == dir2  # Lazy init: 같은 디렉터리 반환
+
+    def test_scratchpad_is_separate_per_session(self):
+        assembler = PromptAssembler(system_rules="", claude_code_modules=True)
+        assert assembler.get_scratchpad_dir("sess-a") != assembler.get_scratchpad_dir("sess-b")
+        dyn_a = assembler.build_dynamic_content({"session_id": "sess-a"})
+        dyn_b = assembler.build_dynamic_content({"session_id": "sess-b"})
+        assert assembler.get_scratchpad_dir("sess-a") in dyn_a
+        assert assembler.get_scratchpad_dir("sess-b") in dyn_b
 
 
 # =============================================================================
@@ -519,7 +694,6 @@ class TestBackwardCompatibility:
         """기존 시그니처 그대로 동작해야 함."""
         assembler = PromptAssembler(
             system_rules="Core Rules: No emojis.",
-            tool_schemas=[{"name": "test_tool", "description": "some tool"}],
         )
         messages = assembler.assemble(
             user_input="Hello",
@@ -541,7 +715,6 @@ class TestBackwardCompatibility:
         try:
             assembler = PromptAssembler(
                 system_rules="Rules",
-                tool_schemas=[],
                 memory_path=tmp_name,
             )
             messages = assembler.assemble(
@@ -556,7 +729,6 @@ class TestBackwardCompatibility:
         """l4_docs, l5_docs dict 파라미터 지원."""
         assembler = PromptAssembler(
             system_rules="Rules",
-            tool_schemas=[],
             l4_docs={"MCP.md": "MCP server instructions here."},
             l5_docs={"AGENT.md": "Agent rules: be concise."},
         )
@@ -568,7 +740,6 @@ class TestBackwardCompatibility:
         """skill_catalog callable 지원."""
         assembler = PromptAssembler(
             system_rules="Rules",
-            tool_schemas=[],
             skill_catalog=lambda: "Available skills: search, code_review",
         )
         static = assembler.build_static_content()
@@ -577,7 +748,7 @@ class TestBackwardCompatibility:
 
     def test_create_middleware_factory_signature(self):
         """create_prompt_assembler_middleware 기존 시그니처 호환."""
-        assembler = PromptAssembler(system_rules="Rules", tool_schemas=[])
+        assembler = PromptAssembler(system_rules="Rules")
         middleware = create_prompt_assembler_middleware(assembler, merge_system=True)
         assert isinstance(middleware, PromptAssemblerMiddleware)
         assert middleware.merge_system is True
@@ -586,10 +757,6 @@ class TestBackwardCompatibility:
         """main_agent.py의 실제 호출 패턴 재현."""
         assembler = PromptAssembler(
             system_rules="SUPERVISOR_SYSTEM_PROMPT content here",
-            tool_schemas=[
-                {"name": "supervisor_delegate", "description": "Delegates tasks"},
-                {"name": "human_escalation", "description": "Escalates to human"},
-            ],
             skill_catalog=lambda: "Skill 1: Search\nSkill 2: Code Review",
             l4_docs={},
             agent_rules_path=None,
@@ -612,7 +779,6 @@ class TestMiddlewareBypass:
 
         assembler = PromptAssembler(
             system_rules="Core Rules.",
-            tool_schemas=[],
             claude_code_modules=True,
         )
 
@@ -715,7 +881,6 @@ class TestDateChange:
 
         assembler = PromptAssembler(
             system_rules="Core Rules.",
-            tool_schemas=[],
         )
 
         class DummyContext:
@@ -749,3 +914,129 @@ class TestDateChange:
         # HumanMessage에 <system-reminder> 없음
         assert "<system-reminder>" not in modified_req.messages[2].content
 
+
+
+# =============================================================================
+# Test: Middleware — 알림 저장 · 압축 후 재알림 · 세션별 준비값
+# =============================================================================
+
+class TestMiddlewareAttachments:
+    def _mw(self, skills=None, servers=None, **kw):
+        skills = SKILLS if skills is None else skills
+        servers = {"wikipedia": "Use search first."} if servers is None else servers
+        assembler = PromptAssembler(
+            system_rules="", claude_code_modules=True,
+            skill_guidelines="Policy", skill_provider=lambda: list(skills),
+            mcp_instructions=lambda: dict(servers), mcp_delta_enabled=True,
+        )
+        return create_prompt_assembler_middleware(assembler, **kw)
+
+    def _state(self, messages):
+        return {"messages": messages, "session_start_date": "2026-10-23", "last_emitted_date": "2026-10-23"}
+
+    def test_before_model_saves_attachments_once(self):
+        mw = self._mw()
+        history = [HumanMessage(content="질문1", id="u1")]
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            update = mw.before_model(self._state(history))
+            origins = [message_origin(m) for m in update["messages"]]
+            assert origins == [ORIGIN_SKILL_LISTING, ORIGIN_MCP_INSTRUCTIONS_DELTA]
+            # 다음 모델 호출: state에 알림이 저장되어 있으므로 아무것도 추가하지 않습니다.
+            assert mw.before_model(self._state(history + update["messages"])) is None
+
+    def test_newly_installed_skill_is_appended_at_the_end(self):
+        skills = list(SKILLS)
+        mw = self._mw(skills=skills)
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            first = mw.before_model(self._state([HumanMessage(content="q")]))["messages"]
+            skills.append({"name": "late-skill", "description": "d", "path": "p"})
+            later = mw.before_model(self._state([HumanMessage(content="q"), *first, AIMessage(content="a")]))
+        assert len(later["messages"]) == 1 and "late-skill" in later["messages"][0].content
+
+    def test_wrap_model_call_keeps_saved_attachments_in_place(self):
+        from langchain.agents.middleware import ModelRequest
+
+        mw = self._mw(bypass_user_context=True, claude_md_content="Use pytest.")
+        user = HumanMessage(content="질문1")
+        attachments = mw.assembler.collect_attachments([user])
+        msgs = [user, *attachments]
+        request = ModelRequest(messages=msgs, model="mock-model", tools=[], tool_choice="auto",
+                               model_settings={}, state={"messages": msgs, "session_start_date": "2026-10-23"},
+                               runtime=MagicMock(context=None, config=None, execution_info=None))
+        with patch("app.middleware.prompt.prompt_assembler.get_frozen_git_snapshot", return_value=""):
+            out = mw.wrap_model_call(request, lambda req: req)
+        origins = [message_origin(m) for m in out.messages]
+        assert origins == [None, None, ORIGIN_USER_CONTEXT, None, ORIGIN_SKILL_LISTING, ORIGIN_MCP_INSTRUCTIONS_DELTA]
+        assert out.messages[3].content == "질문1", "사용자 메시지는 고치지 않습니다"
+
+    def test_compaction_clears_session_sections_and_reannounces(self):
+        from app.utils.message_markers import origin_kwargs, ORIGIN_COMPACTION_SUMMARY
+
+        mw = self._mw()
+        mw.assembler.build_dynamic_content({"session_id": "unknown", "cwd": "/old"})
+        summary = HumanMessage(content="[Compaction Summary: Previous Conversation]\n...", id="sum1",
+                               additional_kwargs=origin_kwargs(ORIGIN_COMPACTION_SUMMARY))
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            update = mw.before_model(self._state([summary, HumanMessage(content="q")]))
+        assert update["prompt_compaction_marker"] == "sum1"
+        assert "/new" in mw.assembler.build_dynamic_content({"session_id": "unknown", "cwd": "/new"})
+        # 요약으로 이전 알림이 사라졌으므로 스킬·MCP 알림을 다시 저장합니다.
+        assert [message_origin(m) for m in update["messages"]] == [ORIGIN_SKILL_LISTING, ORIGIN_MCP_INSTRUCTIONS_DELTA]
+
+    def test_legacy_mcp_delta_instructions_is_announced_once(self):
+        mw = create_prompt_assembler_middleware(
+            PromptAssembler(system_rules="", claude_code_modules=True),
+            mcp_delta_instructions="PostgreSQL MCP: Use pg_query.",
+        )
+        user = HumanMessage(content="DB 목록?")
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            update = mw.before_model(self._state([user]))
+        notice = update["messages"][0]
+        assert message_origin(notice) == ORIGIN_MCP_INSTRUCTIONS_DELTA
+        assert "PostgreSQL MCP: Use pg_query." in notice.content
+        assert user.content == "DB 목록?", "사용자 메시지에 덧붙이지 않습니다"
+
+    def test_git_snapshot_is_collected_once_per_session(self):
+        from langchain.agents.middleware import ModelRequest
+
+        mw = create_prompt_assembler_middleware(PromptAssembler(system_rules="", claude_code_modules=True),
+                                                bypass_user_context=True)
+
+        def request_for(thread_id):
+            msgs = [HumanMessage(content="hi")]
+            return ModelRequest(messages=msgs, model="mock-model", tools=[], tool_choice="auto",
+                                model_settings={}, state={"messages": msgs},
+                                runtime=MagicMock(context=None, execution_info=None,
+                                                  config={"configurable": {"thread_id": thread_id}}))
+
+        with patch("app.middleware.prompt.prompt_assembler.get_frozen_git_snapshot",
+                   side_effect=lambda cwd, session_id: f"snapshot-{session_id}") as snap:
+            a1 = mw.wrap_model_call(request_for("A"), lambda r: r)
+            a2 = mw.wrap_model_call(request_for("A"), lambda r: r)
+            b1 = mw.wrap_model_call(request_for("B"), lambda r: r)
+        assert snap.call_count == 2, "세션당 1회만 수집"
+        assert "snapshot-A" in a1.messages[1].content and a1.messages[1].content == a2.messages[1].content
+        assert "snapshot-B" in b1.messages[1].content
+
+
+# =============================================================================
+# Test: SkillPromptBuilder.list_skills
+# =============================================================================
+
+class TestSkillBuilderListSkills:
+    def _write(self, root, name, desc):
+        os.makedirs(os.path.join(root, name), exist_ok=True)
+        with open(os.path.join(root, name, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(f"---\nname: {name}\ndescription: {desc}\n---\n# body\n")
+
+    def test_lists_sorted_skills_and_detects_new_ones(self):
+        from app.middleware.prompt.skill_builder import SkillPromptBuilder
+
+        with tempfile.TemporaryDirectory() as root:
+            self._write(root, "zeta", "Z skill")
+            self._write(root, "alpha", "A skill")
+            builder = SkillPromptBuilder(skills_dirs=[root], guidelines_path=None)
+            assert [s["name"] for s in builder.list_skills()] == ["alpha", "zeta"]
+            self._write(root, "beta", "B skill")
+            assert [s["name"] for s in builder.list_skills()] == ["alpha", "beta", "zeta"]
+            assert "Z skill" in builder.build_catalog()

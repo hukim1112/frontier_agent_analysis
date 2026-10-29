@@ -8,16 +8,19 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
    ├── agent.py       (에이전트 조립 및 9단계 미들웨어 파이프라인)
    ├── prompt.py      (SUPERVISOR_SYSTEM_PROMPT — PromptAssembler의 Layer 1)
    ├── tools.py       (계획 5종 + 오케스트레이션 3종 + 공통 7종 = 15종 도구 바인딩)
-   └── skills/        (에이전트 내재화 스킬 — Layer 2.2 카탈로그로 노출)
+   └── skills/        (에이전트 내재화 스킬 — 대화 속 skill_listing 알림으로 노출)
 
 [하네스 구성 요소]
 1. 에이전트 프로필 (AGENT_METADATA)
 2. 5-Layer 프롬프트 스택 (Claude Code 표준):
-   - L1 System Rules & Identity ← SUPERVISOR_SYSTEM_PROMPT (5-Phase 오케스트레이션 루프)
-   - L2 Capabilities           ← 도구 스키마 + 스킬 실행 지침(skills/SKILL.md) + skills/ 카탈로그 (SkillPromptBuilder 자동 스캔)
-   - L3 Dynamic Session Context ← CWD, Session ID, Session Workspace Root, Date, Host OS
-   - L4 Recalled Memory         ← Semantic 스냅샷 + 학습 스킬 카탈로그(Procedural) + Episodic 과거 세션 요약 힌트
-   - L5 Project Rules            ← AGENT.md / CLAUDE.md (현재 미지정)
+   - L1 Global Constitution    ← Claude Code 기본 모듈. 정체성(Module 0)은 SUPERVISOR_SYSTEM_PROMPT로 대체
+   - L2 Capabilities           ← 도구 사용 원칙 + 스킬 실행 지침(skills/SKILL.md)
+                                  (도구 정의는 API tools 칸, 스킬 목록·MCP 지침은 대화 속 알림)
+   - L3 Session Guidance       ← 세션 안내 (Module 8)
+   - L4 Environment & Memory   ← CWD, Host OS, Session ID, Session Workspace Root + 메모리 사용 규칙(Module 9)
+   - L5 Resource Control       ← scratchpad, 도구 결과 정리 공지 (MCP 지침은 대화 속 알림)
+   - 사용자 컨텍스트 메시지(M3) ← CLAUDE.md + 장기기억 동결 스냅샷(MEMORY.md / USER.md / PROCEDURAL 스킬 카탈로그) + 세션 시작 날짜
+   - 대화 끝 에피소드 알림      ← 현재 턴 질문으로 회상된 EPISODIC MEMORY (<system-reminder>)
 3. 계층형 메모리 (Layered Memory & Dual-Tier Session Data):
    - L1 단기 기억  : AsyncSqliteSaver (세션별 체크포인터 — AutoCompactor가 압축 교체)
    - L2 에피소드 원문: TranscriptStore (transcript.db — 대화·도구 호출/결과 실시간 Append-only 백업)
@@ -31,6 +34,7 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
    - ModelCallLimitMiddleware   : 무한 루프 차단 (run_limit=50)
    - StopHooksMiddleware        : 생성된 Python 코드블록 AST 구문 검증 및 자가 교정 루프
 5. 도구: tools_supervisor(15종) + memory_tools(2종) + skill_tools(2종) + custom_tools(2종) = 총 21종
+   + MCP 도구 (configs/mcp.config, 예: mcp__wikipedia__search / mcp__wikipedia__readArticle)
 
 [미들웨어 파이프라인 실행 순서]
    사용자 요청 →
@@ -73,7 +77,12 @@ from app.middleware.memory import (
     TranscriptStore,
     MemoryMiddleware,
 )
-from app.middleware.prompt import PromptAssembler, SkillPromptBuilder, create_prompt_assembler_middleware
+from app.middleware.prompt import (
+    PromptAssembler,
+    SkillPromptBuilder,
+    MCPServerRegistry,
+    create_prompt_assembler_middleware,
+)
 
 # Mission 02: Self-Recovery & Self-Correction 미들웨어
 from app.middleware.error_control.self_recovery import (
@@ -141,8 +150,13 @@ async def create_agent_executor(checkpointer=None):
         await checkpointer.setup()
 
     # 4. 도구 바인딩 (Supervisor 15종 + Custom 2종 = 17종 / Memory 2종 + Skill 2종은 memory_mw가 create_agent에 자동 등록 → 총 21종)
-    #    ※ PromptAssembler(tool_schemas=active_tools)에서 참조하므로 먼저 선언합니다.
+    #    ※ 도구 정의는 create_agent(tools=...)를 거쳐 API tools 필드로만 전달합니다 (시스템 프롬프트에는 넣지 않음).
     active_tools = list(tools_supervisor) + [roll_dice, convert_currency]
+
+    # 4-0. MCP 서버 연결 (configs/mcp.config) — 원본처럼 MCP 도구를 API tools 칸에 올립니다.
+    #      도구 이름은 mcp__{서버}__{도구}. 연결에 실패한 서버는 건너뜁니다 (에이전트 생성은 계속).
+    mcp_registry = await MCPServerRegistry.from_config("./configs/mcp.config").connect()
+    active_tools += mcp_registry.tools
 
     # 4-1. 메모리 설정 로드 (configs/memory.config)
     memory_cfg = _load_config("./configs/memory.config", {})
@@ -164,7 +178,7 @@ async def create_agent_executor(checkpointer=None):
 
     # 4-2-1. Procedural Memory Store 초기화 (학습된 스킬: skills/<name>/SKILL.md)
     #    기본값 artifacts/users/default/skills → 사용자별 artifacts/users/{user_id}/skills/ 자동 격리
-    #    ※ 사람이 작성한 번들 스킬(main_agent/skills/)은 Layer 2.2 카탈로그로 따로 노출되며 수정 대상이 아닙니다.
+    #    ※ 사람이 작성한 번들 스킬(main_agent/skills/)은 대화 속 skill_listing 알림으로 따로 노출되며 수정 대상이 아닙니다.
     procedural_store = None
     if proc_cfg.get("enabled", True):
         procedural_store = ProceduralMemoryStore(
@@ -203,24 +217,27 @@ async def create_agent_executor(checkpointer=None):
         procedural_store=procedural_store,
         skill_nudge_interval=int(proc_cfg.get("skill_nudge_interval", 10)),
         skill_review_max_iterations=int(proc_cfg.get("review_max_iterations", 16)),
+        memory_nudge_interval=int(sem_cfg.get("memory_nudge_interval", 1)),   # 교육용: 매 턴 (Hermes 기본 10)
     )
 
     # 4-5. Claude Code 표준 16-Module 5-Layer Prompt Assembler 구성
-    #    - 스킬: 에이전트 내장 skills/ 만 스캔 (Mission 04 금융 스킬도 이 폴더에 설치)
-    #    - skills/SKILL.md(스킬 실행 지침)는 Layer 2.2 카탈로그 상단에만 주입 (L5 중복 주입 안 함)
+    #    원본 Claude Code와 같은 자리에 넣습니다:
+    #    - 스킬 실행 지침(skills/SKILL.md)  → Layer 2 정적 영역 (스킬 "사용법"만, 거의 안 바뀜)
+    #    - 스킬 목록(skills/*/SKILL.md 프론트매터) → 대화 속 skill_listing 알림
+    #      (첫 턴에 전체, 이후 새로 설치된 스킬만. 정적 영역은 스킬 구성과 무관하게 고정)
+    #    - MCP 도구(configs/mcp.config)   → API tools 칸 (mcp__서버__도구, 내장 도구 뒤에 정렬)
+    #    - MCP 서버 지침                   → 대화 속 mcp_instructions_delta 알림 (mcp_delta_enabled=True)
     #    - claude_code_modules=True: 16대 표준 모듈 + Static/Dynamic 캐시 경계 분리 (동적 섹션은 세션당 1회 계산)
     #    - bypass_user_context=True: 원본 Claude Code처럼
     #      · git 스냅샷(브랜치·status·최근 커밋)은 시스템 프롬프트 맨 끝에 gitStatus로
-    #      · CLAUDE.md(또는 AGENT.md) + 세션 시작 날짜는 대화 맨 앞 별도 <system-reminder> 메시지로
+    #      · CLAUDE.md + 장기기억 동결 스냅샷(MEMORY.md / USER.md / PROCEDURAL) + 세션 시작 날짜는 대화 맨 앞 별도 <system-reminder> 메시지로
+    #      · 턴별 EPISODIC MEMORY 검색 결과는 대화 맨 끝 <system-reminder> 알림으로 부착
     #      (자정이 지나면 before_model이 대화 끝에 date_change 알림을 추가)
     skill_guidelines = str(SKILLS_DIR / "SKILL.md") if (SKILLS_DIR / "SKILL.md").exists() else None
     skill_builder = SkillPromptBuilder(
         skills_dirs=[str(SKILLS_DIR)],
         guidelines_path=skill_guidelines,
     )
-
-    mcp_md_path = Path("./app/prompts/MCP.md")
-    mcp_instructions_text = mcp_md_path.read_text(encoding="utf-8").strip() if mcp_md_path.exists() else None
 
     claude_md_text = ""
     for candidate_md in (Path("./CLAUDE.md"), Path("./app/prompts/AGENT.md")):
@@ -230,11 +247,11 @@ async def create_agent_executor(checkpointer=None):
 
     assembler = PromptAssembler(
         system_rules=SUPERVISOR_SYSTEM_PROMPT,
-        tool_schemas=active_tools,
-        skill_catalog=skill_builder.assemble,
+        skill_guidelines=skill_builder.load_guidelines(),
+        skill_provider=skill_builder.list_skills,
         l4_docs={},
         claude_code_modules=True,
-        mcp_instructions=mcp_instructions_text,
+        mcp_instructions=mcp_registry.instruction_blocks,
         mcp_delta_enabled=True,
     )
     prompt_mw = create_prompt_assembler_middleware(
@@ -346,6 +363,7 @@ async def create_agent_executor(checkpointer=None):
     main_agent.semantic_store = semantic_store
     main_agent.procedural_store = procedural_store
     main_agent.assembler = assembler
+    main_agent.mcp_registry = mcp_registry
     main_agent.memory_middleware = memory_mw
 
     return main_agent

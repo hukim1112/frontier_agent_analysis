@@ -238,22 +238,26 @@ def test_skill_tools_registered_and_catalog_injected(tmp_path):
     assert "PROCEDURAL MEMORY (learned skills) [0 skills]" in ctx.recalled_memory
 
 
-def test_tool_iterations_trigger_pending_review_and_it_sticks(tmp_path):
+def test_tool_iterations_reach_nudge_and_review_runs_at_turn_end(tmp_path):
+    """도구 호출 응답이 기준값(2)에 닿은 턴이 끝나면 바로 스킬 리뷰가 돌고, 끝나면 카운터가 0으로."""
     mw = _middleware(tmp_path, interval=2)
     model = scripted(
         call("lookup", {"query": "a"}, "c1"),
         call("lookup", {"query": "b"}, "c2"),
         "done",
-        "plain answer without tools",
     )
     _run(mw, model, "sess")
-    assert mw._skill_iters["sess"] == 2
-    assert "sess" in mw._skill_review_pending
+    mw.wait_for_reviews(timeout=5.0)
+    assert mw.last_skill_reviews["sess"]["reply"] == "Nothing to save."
+    assert mw._skill_iters["sess"] == 0 and "sess" not in mw._skill_review_pending
 
-    # 다음 턴은 도구를 쓰지 않았지만, 리뷰가 끝나기 전까지 플래그가 유지되어야 함 (큐는 최신 payload만 남김)
-    _run(mw, model, "sess", text="next")
-    slot = mw._review_queue._slots["sess"]
-    assert slot.payload["procedural_learning"] is True
+
+def test_pending_skill_review_sticks_until_completed(tmp_path):
+    """기준값 도달 후 리뷰가 새 턴 때문에 취소된 세션은, 카운터가 0이어도 다음 턴 종료 때 다시 리뷰합니다."""
+    mw = _middleware(tmp_path, interval=2)
+    mw._skill_review_pending.add("sess")
+    assert mw._skill_nudge_reached("sess")
+    assert mw._background_review_due(_ctx("sess"), "sess", True)["procedural"] is True
 
 
 def test_parallel_tool_calls_count_as_one_iteration(tmp_path):
@@ -296,7 +300,7 @@ def test_procedural_switch_off_hides_tools_and_skips_review(tmp_path):
     runtime = type("R", (), {"context": ctx})()
     assert {"skill_view", "skill_manage"} <= mw._disabled_tool_names(runtime)
     mw._skill_iters["off"] = 5
-    assert mw._procedural_learning_due(ctx, "off", True) is False
+    assert mw._background_review_due(ctx, "off", True)["procedural"] is False
 
 
 # =============================================================================

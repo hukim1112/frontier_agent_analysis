@@ -25,14 +25,13 @@ Claude Code(유출 소스 v2.1.88)의 query.ts가 매 모델 호출 직전에 �
 - Cached microcompact(서버 캐시를 cache_edits로 편집)는 Anthropic 내부 전용 API라 구현하지 않았습니다.
 - 원본 Auto-Compact는 캐시를 공유하는 fork 에이전트에게 대화를 그대로 넘깁니다. 여기서는 모델 제공사와
   무관하게 동작하도록 대화를 텍스트로 직렬화해 요약 LLM에 넘깁니다.
-- 원본 Auto-Compact는 대화 전체를 요약합니다. 여기서는 현재 사용자 턴을 원본 그대로 남기고 이전 턴만 요약합니다.
+- 원본 Auto-Compact는 대화 전체를 요약합니다. 여기서는 이전 턴이 있으면 현재 사용자 턴을 원본 그대로 남기고
+  이전 턴만 요약합니다. 요약할 이전 턴이 없거나 현재 턴만으로 임계치를 넘으면 원본처럼 현재 턴까지 요약합니다.
 - 압축 임계치는 원본 공식(컨텍스트 윈도우 - 20K - 13K) 대신 threshold_tokens로 직접 지정합니다.
   원본 공식은 claude_code_autocompact_threshold()로 계산할 수 있습니다.
 
 요약·접기·표시 메시지는 HumanMessage로 넣고 additional_kwargs["harness_origin"]과 첫 줄 머리말로
 "하네스가 만든 메시지"임을 표시합니다. 턴 경계는 message_markers 모듈의 규칙으로 판별합니다.
-
-modules/claude_code/compactor.py는 이 파일의 사본입니다 (message_markers import 경로만 다름).
 ===============================================================================
 """
 
@@ -69,6 +68,7 @@ from app.utils.message_markers import (
     ORIGIN_CONTEXT_EFFICIENCY,
     ORIGIN_SNIP_BOUNDARY,
     SNIP_BOUNDARY_HEADER,
+    is_attachment,
     is_compaction_artifact,
     is_compaction_summary,
     is_user_turn_start,
@@ -98,6 +98,8 @@ AUTOCOMPACT_BUFFER_TOKENS = 13_000              # services/compact/autoCompact.t
 MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3        # services/compact/autoCompact.ts
 MAX_PTL_RETRIES = 3                             # services/compact/compact.ts
 PTL_RETRY_MARKER = "[earlier conversation truncated for compaction retry]"   # services/compact/compact.ts
+ERROR_MESSAGE_NO_SUMMARY = ("Failed to generate conversation summary - "
+                            "response did not contain valid text content")   # services/compact/compact.ts
 
 COLLAPSE_COMMIT_RATIO = 0.9                     # autoCompact.ts 주석: "90% commit / 95% blocking-spawn"
 
@@ -249,6 +251,9 @@ def _serialize_for_summary(messages: Sequence[Any], max_chars_per_message: int) 
     lines = []
     for m in messages:
         origin = message_origin(m)
+        if is_attachment(m):
+            # 스킬 목록·MCP 지침 알림은 요약하지 않습니다. 압축 뒤 PromptAssembler가 다시 계산해 새로 알립니다.
+            continue
         if origin in (ORIGIN_SNIP_BOUNDARY, ORIGIN_CONTEXT_EFFICIENCY, ORIGIN_COMPACTION_MARKER):
             role = "HARNESS_NOTE"
         elif origin in role_by_origin:
@@ -841,8 +846,12 @@ def build_compaction_summary_message(summary_text: str) -> HumanMessage:
 
 
 class AutoCompactor:
-    """토큰이 임계치를 넘으면 이전 턴을 원본의 9개 섹션 형식으로 요약해 대화를 교체합니다.
+    """토큰이 임계치를 넘으면 대화를 원본의 9개 섹션 형식으로 요약해 교체합니다.
 
+    - 이전 턴이 있으면 이전 턴만 요약하고 현재 사용자 턴은 원본으로 남깁니다. 이전 턴이 없거나(한 요청으로
+      이어지는 긴 작업, 압축 직후 다시 길어진 턴) 현재 턴만으로 임계치를 넘으면 원본 compactConversation처럼
+      현재 턴까지 요약합니다. 사용자 요청은 요약의 "All user messages" 섹션에 남습니다.
+    - 요약 응답에 텍스트가 없으면 실패로 처리합니다 (빈 요약으로 대화를 덮어쓰지 않음).
     - 요약에 실패하면 압축하지 않고 실패 횟수만 늘립니다. 3회 연속 실패하면 이 세션에서는 더 시도하지
       않습니다 (원본 circuit breaker: MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3).
     - 요약 호출 자체가 prompt_too_long이면 가장 오래된 API 라운드부터 버리고 최대 3회 다시 시도합니다.
@@ -890,30 +899,20 @@ class AutoCompactor:
         return not str(msg.content).startswith(self._PIPELINE_PREFIXES)
 
     @staticmethod
-    def has_completed_turns(messages: list) -> bool:
-        """현재 사용자 턴 앞에 요약할 이전 턴(압축 산출물이 아닌 메시지)이 있는지 확인합니다."""
-        dialogue = [m for m in messages if not isinstance(m, SystemMessage)]
-        idx = last_user_turn_start(dialogue)
-        if not idx:
-            return False
-        return any(not is_compaction_artifact(m) for m in dialogue[:idx])
+    def has_new_dialogue(messages: list) -> bool:
+        """요약할 대화(압축 산출물이 아닌 메시지)가 있는지. 압축 직후 요약·복원 블록만 남았으면 다시 압축하지 않습니다."""
+        return any(not isinstance(m, SystemMessage) and not is_compaction_artifact(m) for m in messages)
 
     @staticmethod
     def _split_dialogue_for_compaction(dialogue_messages: list) -> tuple[list, list]:
-        """대화를 압축 대상(과거 턴)과 보존 대상(현재 진행 중인 마지막 턴)으로 나눕니다."""
-        last_human_idx = last_user_turn_start(dialogue_messages)
-        if last_human_idx is not None and last_human_idx > 0:
-            return dialogue_messages[:last_human_idx], dialogue_messages[last_human_idx:]
+        """대화를 압축 대상과 보존 대상으로 나눕니다.
 
-        # 단일 턴: 마지막이 ToolMessage면 그 도구를 부른 AIMessage까지 함께 보존
-        if isinstance(dialogue_messages[-1], ToolMessage):
-            idx = len(dialogue_messages) - 1
-            while idx > 0 and isinstance(dialogue_messages[idx], ToolMessage):
-                idx -= 1
-            if idx > 0 and isinstance(dialogue_messages[idx], AIMessage):
-                return dialogue_messages[:idx], dialogue_messages[idx:]
-
-        return dialogue_messages[:-1], [dialogue_messages[-1]]
+        현재 사용자 턴 앞에 이전 턴이 있으면 (이전 턴, 현재 턴)으로 나누고, 없으면 현재 턴까지 전부 압축 대상입니다.
+        """
+        idx = last_user_turn_start(dialogue_messages)
+        if idx and any(not is_compaction_artifact(m) for m in dialogue_messages[:idx]):
+            return dialogue_messages[:idx], dialogue_messages[idx:]
+        return list(dialogue_messages), []
 
     def build_summary_request(self, to_compact: Sequence[Any]) -> str:
         """요약 LLM에 보낼 프롬프트: 직렬화한 대화 뒤에 원본 요약 지시문을 붙입니다."""
@@ -930,13 +929,22 @@ class AutoCompactor:
 
         original_system_messages = [m for m in messages if self._is_original_system_msg(m)]
         dialogue_messages = [m for m in messages if not self._is_original_system_msg(m)]
-        if len(dialogue_messages) <= 1:
+        if not self.has_new_dialogue(dialogue_messages):
             return None
 
         to_compact, tail_messages = self._split_dialogue_for_compaction(dialogue_messages)
-        if not to_compact:
-            return None
+        if tail_messages and self.get_token_count(tail_messages) > self.threshold_tokens:
+            # 현재 턴만으로 임계치를 넘으면 이전 턴만 요약해도 곧바로 다시 압축하게 되므로 현재 턴까지 요약합니다.
+            to_compact, tail_messages = list(dialogue_messages), []
         return original_system_messages, to_compact, tail_messages
+
+    @staticmethod
+    def _summary_text(response: Any) -> str:
+        """요약 응답의 텍스트. 비어 있으면(예: thinking 블록만 온 응답) 원본처럼 실패로 처리합니다."""
+        text = _content_text(getattr(response, "content", response))
+        if not text.strip():
+            raise ValueError(ERROR_MESSAGE_NO_SUMMARY)
+        return text
 
     def _summarize(self, to_compact: Sequence[Any]) -> str:
         to_summarize = list(to_compact)
@@ -944,7 +952,7 @@ class AutoCompactor:
             try:
                 response = _hidden_from_stream(self.llm).invoke(
                     [HumanMessage(content=self.build_summary_request(to_summarize))])
-                return _content_text(getattr(response, "content", response))
+                return self._summary_text(response)
             except Exception as e:
                 truncated = (truncate_head_for_ptl_retry(to_summarize)
                              if attempt < MAX_PTL_RETRIES and is_prompt_too_long_error(e) else None)
@@ -964,7 +972,7 @@ class AutoCompactor:
                     response = await llm.ainvoke(request)
                 else:
                     response = await asyncio.to_thread(llm.invoke, request)
-                return _content_text(getattr(response, "content", response))
+                return self._summary_text(response)
             except Exception as e:
                 truncated = (truncate_head_for_ptl_retry(to_summarize)
                              if attempt < MAX_PTL_RETRIES and is_prompt_too_long_error(e) else None)
@@ -1040,8 +1048,10 @@ class ReactiveCompactor:
     """API가 prompt_too_long(413)을 돌려주면 압축한 뒤 같은 요청을 한 번 다시 보냅니다.
 
     원본 흔적: query.ts가 413 응답을 사용자에게 바로 보여주지 않고 보류(withhold)한 뒤 복구를 시도합니다.
-    여기서는 이전 턴 요약(AutoCompactor)을 먼저 시도하고, 요약할 이전 턴이 없거나 요약이 실패하면
-    가장 오래된 API 라운드부터 버립니다 (원본 truncateHeadForPTLRetry와 같은 방식).
+    여기서는 요약(AutoCompactor, 필요하면 현재 턴까지)을 먼저 시도하고, 요약이 실패하거나 차단기가 열려 있으면
+    가장 오래된 API 라운드부터 버립니다 (원본 truncateHeadForPTLRetry와 같은 방식). 이때 현재 사용자 요청은
+    버리지 않습니다. 원본 truncateHeadForPTLRetry는 요약 LLM 입력을 줄이는 용도라 요청이 빠져도 되지만,
+    여기서는 본 모델 입력이라 요청이 빠지면 모델이 할 일을 잃습니다.
     복구 결과는 이번 모델 호출의 입력에만 쓰입니다. state는 다음 before_model의 Auto-Compact가 정리합니다.
     """
 
@@ -1050,7 +1060,11 @@ class ReactiveCompactor:
         self.drop_ratio = drop_ratio
 
     def handle_overflow(self, messages: Sequence[Any]) -> List[Any]:
-        """LLM 없이 가장 오래된 API 라운드를 잘라냅니다. 시스템 메시지와 압축 요약·복원 블록은 맨 앞에 고정합니다."""
+        """LLM 없이 가장 오래된 API 라운드를 잘라냅니다.
+
+        시스템 메시지와 압축 요약·복원 블록은 맨 앞에 고정하고, 현재 사용자 요청은 잘라낸 구간에 들어가도
+        표시 메시지 바로 뒤에 남깁니다 (잘라낸 구간은 항상 앞부분이므로 남은 메시지는 모두 요청보다 뒤입니다).
+        """
         system = [m for m in messages if isinstance(m, SystemMessage)]
         pinned = [m for m in messages if not isinstance(m, SystemMessage) and is_compaction_artifact(m)]
         dialogue = [m for m in messages if not isinstance(m, SystemMessage) and not is_compaction_artifact(m)]
@@ -1065,15 +1079,17 @@ class ReactiveCompactor:
 
         drop = min(max(1, int(len(groups) * self.drop_ratio)), len(groups) - 1)
         dropped = sum(len(g) for g in groups[:drop])
+        request_idx = last_user_turn_start(dialogue)
+        kept_request = [dialogue[request_idx]] if request_idx is not None and request_idx < dropped else []
         marker = _marker_message(
-            f"[Reactive Compact] The oldest {dropped} message(s) were dropped after a prompt-too-long error.\n"
-            f"{AUTO_GENERATED_NOTE}"
+            f"[Reactive Compact] The oldest {dropped - len(kept_request)} message(s) were dropped "
+            f"after a prompt-too-long error.\n{AUTO_GENERATED_NOTE}"
         )
-        return system + pinned + [marker] + [m for g in groups[drop:] for m in g]
+        return system + pinned + [marker] + kept_request + [m for g in groups[drop:] for m in g]
 
     def _can_summarize(self, messages: Sequence[Any]) -> bool:
         ac = self.auto_compactor
-        return bool(ac) and not ac.is_circuit_open and ac.has_completed_turns(list(messages))
+        return bool(ac) and not ac.is_circuit_open and ac.has_new_dialogue(list(messages))
 
     def recover(self, messages: Sequence[Any]) -> List[Any]:
         if self._can_summarize(messages):
@@ -1197,12 +1213,12 @@ class CompactorMiddleware(AgentMiddleware):
         return self.auto_enabled and self.context_collapse is None
 
     def _needs_auto_compact(self, view: list) -> bool:
-        """모델이 실제로 보게 될 크기가 임계치를 넘고, 요약할 이전 턴이 있는지."""
+        """모델이 실제로 보게 될 크기가 임계치를 넘고, 지난 압축 이후 요약할 대화가 있는지."""
         if not view or not self._auto_compact_allowed() or self.auto_compactor.is_circuit_open:
             return False
         if self.auto_compactor.get_token_count(view) <= self.auto_compactor.threshold_tokens:
             return False
-        return self.auto_compactor.has_completed_turns(view)
+        return self.auto_compactor.has_new_dialogue(view)
 
     def _collect_replacements(self, state: Dict[str, Any], messages: List[Any]) -> List[Any]:
         replacements: List[Any] = []
@@ -1235,6 +1251,12 @@ class CompactorMiddleware(AgentMiddleware):
         source = [m for m in original if getattr(m, "id", None) and m.id not in kept_ids
                   and not isinstance(m, SystemMessage)]
         self._record_compaction_to_transcript(runtime, compacted, len(original), source)
+        after = self.auto_compactor.get_token_count(compacted)
+        if after > self.auto_compactor.threshold_tokens:
+            # 요약·복원 블록만으로 임계치를 넘으면 이후 모델 호출마다 다시 압축하게 됩니다.
+            print(f"⚠️ [AutoCompactor] post-compact context (~{after:,} tokens) is still above the threshold "
+                  f"({self.auto_compactor.threshold_tokens:,}). Raise auto.threshold_tokens or lower "
+                  "amnesia_guard.max_restore_files.")
         return {
             "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *compacted],
             "snipped_message_ids": [],

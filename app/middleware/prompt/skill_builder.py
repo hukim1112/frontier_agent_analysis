@@ -60,16 +60,9 @@ class SkillPromptBuilder:
         except Exception:
             return {}
 
-    def build_catalog(self) -> str:
-        """설치된 모든 스킬 디렉토리(폴더형 SKILL.md 및 낱개 .md 스킬 문서)를 스캔하여 <skills> 카탈로그 텍스트 생성"""
-        catalog_entries = []
-        seen_paths = set()
-        guidelines_abs = (
-            os.path.normcase(os.path.abspath(self.guidelines_path))
-            if self.guidelines_path and os.path.exists(self.guidelines_path)
-            else None
-        )
-
+    def _scan_candidates(self) -> List[Tuple[str, str]]:
+        """스킬 디렉토리에서 (기본 이름, SKILL.md 경로) 후보를 찾습니다 (폴더형 SKILL.md + 낱개 .md)."""
+        candidates: List[Tuple[str, str]] = []  # (default_name, file_path)
         for base_dir in self.skills_dirs:
             if not os.path.exists(base_dir):
                 continue
@@ -78,8 +71,6 @@ class SkillPromptBuilder:
                 entries = sorted(os.listdir(base_dir))
             except Exception:
                 continue
-
-            candidates: List[Tuple[str, str]] = []  # (default_name, file_path)
 
             # 1. 낱개 마크다운 스킬 파일 (예: app/agents/analyst/skills/chart_patterns.md)
             for item_name in entries:
@@ -102,30 +93,83 @@ class SkillPromptBuilder:
                     if os.path.exists(candidate):
                         candidates.append((folder_name, candidate))
                         break
+        return candidates
 
-            for default_name, skill_file in candidates:
-                abs_key = os.path.normcase(os.path.abspath(skill_file))
-                if abs_key == guidelines_abs or abs_key in seen_paths:
-                    continue
+    def _scan_signature(self) -> Tuple:
+        """스킬 디렉토리의 변경 여부를 싸게 판단하기 위한 서명 (디렉토리·SKILL.md의 수정 시각)."""
+        sig = []
+        for base_dir in self.skills_dirs:
+            try:
+                sig.append((base_dir, os.stat(base_dir).st_mtime_ns))
+                with os.scandir(base_dir) as it:
+                    for entry in it:
+                        if entry.is_dir():
+                            for fname in ("SKILL.md", "Skill.md", "skill.md"):
+                                p = os.path.join(entry.path, fname)
+                                if os.path.exists(p):
+                                    sig.append((p, os.stat(p).st_mtime_ns))
+                                    break
+                        elif entry.name.lower().endswith(".md"):
+                            sig.append((entry.path, entry.stat().st_mtime_ns))
+            except OSError:
+                sig.append((base_dir, None))
+        return tuple(sorted(sig, key=lambda x: x[0]))
 
-                meta = self._extract_frontmatter(skill_file)
-                if not meta:
-                    continue
+    def list_skills(self) -> List[Dict[str, str]]:
+        """설치된 스킬을 [{"name", "description", "path"}] 목록으로 반환합니다 (이름순).
 
-                seen_paths.add(abs_key)
-                name = meta.get("name", default_name)
-                desc = " ".join(meta.get("description", "No description provided.").split())
-                rel_path = os.path.relpath(skill_file).replace("\\", "/")
+        스킬 목록 알림(skill_listing)용 구조화 데이터입니다. 디렉토리 서명이 바뀌지 않았으면
+        SKILL.md를 다시 읽지 않고 이전 결과를 돌려줍니다 (매 모델 호출마다 불려도 가볍게).
+        """
+        signature = self._scan_signature()
+        if getattr(self, "_list_cache", None) and self._list_cache[0] == signature:
+            return list(self._list_cache[1])
 
-                catalog_entries.append(f"- **{name}** (`{rel_path}`):\n    {desc}")
+        skills: List[Dict[str, str]] = []
+        seen_paths = set()
+        seen_names = set()
+        guidelines_abs = (
+            os.path.normcase(os.path.abspath(self.guidelines_path))
+            if self.guidelines_path and os.path.exists(self.guidelines_path)
+            else None
+        )
+        for default_name, skill_file in self._scan_candidates():
+            abs_key = os.path.normcase(os.path.abspath(skill_file))
+            if abs_key == guidelines_abs or abs_key in seen_paths:
+                continue
+
+            meta = self._extract_frontmatter(skill_file)
+            if not meta:
+                continue
+
+            name = meta.get("name", default_name)
+            if name in seen_names:  # 같은 이름은 먼저 찾은 디렉토리가 우선 (원본 uniqBy)
+                continue
+            seen_paths.add(abs_key)
+            seen_names.add(name)
+            skills.append({
+                "name": name,
+                "description": " ".join(meta.get("description", "No description provided.").split()),
+                "path": os.path.relpath(skill_file).replace("\\", "/"),
+            })
+
+        skills.sort(key=lambda s: s["name"])
+        self._list_cache = (signature, skills)
+        return list(skills)
+
+    def build_catalog(self) -> str:
+        """설치된 모든 스킬 디렉토리(폴더형 SKILL.md 및 낱개 .md 스킬 문서)를 스캔하여 <skills> 카탈로그 텍스트 생성"""
+        catalog_entries = [
+            f"- **{s['name']}** (`{s['path']}`):\n    {s['description']}" for s in self.list_skills()
+        ]
 
         if not catalog_entries:
             return "No custom skills currently registered in local `skills/` directory."
 
         return "<skills>\n" + "\n".join(catalog_entries) + "\n</skills>"
 
-    def assemble(self) -> str:
-        """가이드라인 + 카탈로그를 하나로 조립하여 Layer 2 주입용 문자열 반환"""
+    def load_guidelines(self) -> str:
+        """스킬 실행 지침(guidelines_path 파일, 없으면 기본 지침)만 반환합니다. 카탈로그는 포함하지 않습니다."""
         guidelines = self.DEFAULT_GUIDELINES
         if self.guidelines_path and os.path.exists(self.guidelines_path):
             try:
@@ -133,6 +177,10 @@ class SkillPromptBuilder:
                     guidelines = f.read().strip()
             except Exception:
                 pass
+        return guidelines
 
+    def assemble(self) -> str:
+        """가이드라인 + 카탈로그를 하나로 조립하여 Layer 2 주입용 문자열 반환 (정적 카탈로그 방식)"""
+        guidelines = self.load_guidelines()
         catalog = self.build_catalog()
         return f"{guidelines}\n\n### 📦 Available Skills Catalog (Indexed from Frontmatter)\n{catalog}"

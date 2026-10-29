@@ -13,7 +13,9 @@ class AgentContext:
     parent_session_id: str = ""
     user_id: str = "default"
     workspace_dir: str = ""
-    recalled_memory: str = ""
+    recalled_memory: str = ""          # 전체 회상 메모리 합본 (단독 @dynamic_prompt 및 하위 호환용)
+    memory_snapshot: str = ""          # 세션 시작 시 동결된 장기기억 스냅샷 (MEMORY.md + USER.md + PROCEDURAL → Message 3)
+    episodic_context: str = ""         # 현재 턴 질문으로 검색된 에피소드 기억 (EPISODIC MEMORY → 대화 끝 <system-reminder>)
 
     # ── HITL 제어 ──
     hitl_enabled: bool = False

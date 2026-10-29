@@ -5,5 +5,6 @@
 # ===============================================================================
 
 from .evaluator import EvaluatorHarness, JudgeVerdict
+from .eval_runner import EvalRunner
 
-__all__ = ["EvaluatorHarness", "JudgeVerdict"]
+__all__ = ["EvaluatorHarness", "JudgeVerdict", "EvalRunner"]

@@ -1,11 +1,17 @@
 """
 ===============================================================================
-Idle Review Queue — 대화가 멈춘 뒤 백그라운드 리뷰 실행 (Hermes review_idle_queue 패턴)
+Idle Review Queue — 세션 종료 감지 후 에피소드 추출 실행
 ===============================================================================
-세션 종료 후 요약(finalize_session)과 Semantic 리뷰는 LLM 비용이 큰 작업입니다.
-매 턴 끝나자마자 실행하면, 사용자가 곧바로 다음 질문을 할 때 결과가 버려집니다.
+채팅 세션에는 명시적인 종료가 없으므로 "대화가 멈춘 시점"을 세션 종료로 봅니다.
+세션 종료 조건은 session_end_reason() 한 곳에서 판단하고, 조건을 만족한 세션의
+에피소드 추출(finalize_session)을 실행합니다.
 
-규칙 (Hermes 기본값: settle 15초 / max age 30분):
+Hermes 대응: 외부 메모리 provider의 on_session_end는 /new·종료·압축 같은 명시적 경계와
+게이트웨이 1시간 유휴(gateway/run_agent_cache.py _AGENT_CACHE_IDLE_TTL_SECS)에서 호출됩니다.
+이 저장소는 결과를 바로 확인할 수 있도록 유휴 기준을 짧게(기본 15초) 둔 교육용 설정입니다.
+(메모리·스킬 리뷰는 이 큐가 아니라 턴 종료 시 nudge 조건으로 실행됩니다 — MemoryMiddleware 참고)
+
+규칙 (기본값: settle 15초 / max age 30분):
 - 세션당 대기 슬롯 1개. 새로 예약하면 최신 예약만 남깁니다 (원문 전체를 다시 읽으므로 손실 없음).
 - 마지막 턴 종료 후 settle_s 동안 새 입력이 없으면 실행합니다.
 - 대화가 계속 이어져도 최초 예약 후 max_age_s가 지나면 실행합니다.
@@ -44,7 +50,7 @@ class _Running:
 
 
 class IdleReviewQueue:
-    """세션별 백그라운드 리뷰를 유휴 시점까지 미뤘다가 실행하는 큐.
+    """세션별 에피소드 추출을 세션 종료 조건(session_end_reason)이 될 때까지 미뤘다가 실행하는 큐.
 
     Args:
         dispatch: (session_id, payload, reason) -> cancel 함수. 실제 리뷰를 스레드 풀에 제출합니다.
@@ -174,14 +180,25 @@ class IdleReviewQueue:
             self._thread = threading.Thread(target=self._loop, name="memory-idle-review", daemon=True)
             self._thread.start()
 
+    def session_end_reason(self, slot: _Slot, now: float) -> Optional[str]:
+        """세션 종료 조건: 세션이 끝난 것으로 볼 이유("idle" / "max_age"), 아니면 None.
+
+        - idle: 마지막 턴 종료 후 settle_s 동안 새 입력이 없음
+        - max_age: 대화가 계속 이어져도 최초 예약 후 max_age_s가 지남 (긴 세션도 주기적으로 추출)
+        """
+        if now - slot.first_at >= self.max_age_s:
+            return "max_age"
+        if not slot.busy and now - slot.last_activity >= self.settle_s:
+            return "idle"
+        return None
+
     def _collect_due(self) -> list:
         now = time.monotonic()
         due = []
         for sid, slot in list(self._slots.items()):
-            if now - slot.first_at >= self.max_age_s:
-                due.append((sid, slot, "max_age"))
-            elif not slot.busy and now - slot.last_activity >= self.settle_s:
-                due.append((sid, slot, "idle"))
+            reason = self.session_end_reason(slot, now)
+            if reason:
+                due.append((sid, slot, reason))
         for sid, _, _ in due:
             self._slots.pop(sid, None)
         return due

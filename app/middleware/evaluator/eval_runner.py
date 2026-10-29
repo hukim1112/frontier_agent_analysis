@@ -2,7 +2,7 @@ import json
 import time
 from typing import Any, Dict, List
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from modules.common.agent_tracer import AgentTracer
+from app.middleware.observability.agent_tracer import AgentTracer
 
 try:
     from IPython.display import display, HTML

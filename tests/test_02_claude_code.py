@@ -3,10 +3,10 @@ import tempfile
 import pytest
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.tools import tool
-from modules.claude_code.prompt_assembler import PromptAssembler
-from modules.claude_code.compactor import AutoCompactor
-from modules.claude_code.self_correction import StopHooksMiddleware, extract_code_blocks
-from modules.claude_code.amnesia_guard import AmnesiaGuardMiddleware
+from app.middleware.prompt.prompt_assembler import PromptAssembler, create_prompt_assembler_middleware
+from app.middleware.compaction.compactor import AutoCompactor
+from app.middleware.error_control.self_correction.stop_hooks import StopHooksMiddleware, extract_code_blocks
+from app.middleware.compaction.amnesia_guard import AmnesiaGuardMiddleware
 
 # Mock LLM for unit tests
 class MockLLM:
@@ -29,7 +29,6 @@ def test_prompt_assembler():
     try:
         assembler = PromptAssembler(
             system_rules="Core Rules: No emojis.",
-            tool_schemas=[{"name": "test_tool", "description": "some tool"}],
             memory_path=tmp_name
         )
         
@@ -54,7 +53,6 @@ def test_prompt_assembler():
 def test_prompt_assembler_with_history():
     assembler = PromptAssembler(
         system_rules="Core Rules.",
-        tool_schemas=[],
         memory_path=None
     )
     history = [
@@ -82,7 +80,6 @@ def test_prompt_assembler_truncation():
     try:
         assembler = PromptAssembler(
             system_rules="Rules",
-            tool_schemas=[],
             memory_path=tmp_name
         )
         messages = assembler.assemble(user_input="Hello", session_context={})
@@ -107,7 +104,8 @@ def test_auto_compactor():
     compactor_small = AutoCompactor(llm=llm, threshold_tokens=2)
     compacted_small, is_compacted_small = compactor_small.compact_if_needed(messages)
     assert is_compacted_small
-    assert len(compacted_small) == 3  # SystemMessage + SummaryMessage + Last HumanMessage
+    # 요약할 이전 턴이 없으므로 원본 compactConversation처럼 현재 턴까지 요약: SystemMessage + SummaryMessage
+    assert len(compacted_small) == 2
     assert "Summarized conversation history." in compacted_small[1].content
 
 def test_extract_code_blocks():
@@ -169,13 +167,11 @@ def test_amnesia_guard():
 
 
 def test_prompt_assembler_middleware():
-    from modules.claude_code.prompt_assembler import create_prompt_assembler_middleware, PromptAssembler
     from langchain.agents.middleware import ModelRequest
     from langchain_core.messages import SystemMessage
 
     assembler = PromptAssembler(
         system_rules="Core Rules.",
-        tool_schemas=[],
         memory_path=None
     )
 

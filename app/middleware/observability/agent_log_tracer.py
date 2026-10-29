@@ -9,7 +9,8 @@
 - 백그라운드 스레드 큐 기반 논블로킹 비동기 파일 저장 (_AsyncLogWorker)
 - 세션별 분할(.jsonl) 및 단일 통합 파일(log_path) 모드 지원
 - IPython/Jupyter 인터랙티브 HTML 시각화 대시보드 (Timeline, Tool Summary)
-- AgentTracer, LoggingMiddleware 하위 호환 Alias 완벽 제공
+- LoggingMiddleware 하위 호환 Alias 제공
+  (AgentTracer는 노트북용 경량 트레이서 agent_tracer.py의 클래스 이름입니다)
 ===============================================================================
 """
 
@@ -760,7 +761,6 @@ class AgentLogTracer(AgentMiddleware):
 # =============================================================================
 # 하위 호환 및 용어 표준화를 위한 Aliases
 # =============================================================================
-AgentTracer = AgentLogTracer
 LoggingMiddleware = AgentLogTracer
 
-__all__ = ["AgentLogTracer", "AgentTracer", "LoggingMiddleware"]
+__all__ = ["AgentLogTracer", "LoggingMiddleware"]

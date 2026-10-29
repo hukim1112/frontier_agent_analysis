@@ -22,6 +22,8 @@ from typing import Any, Optional
 from langchain_core.messages import AIMessage
 from langchain.agents.middleware import AgentMiddleware, ModelResponse
 
+from app.middleware.compaction.compactor import is_prompt_too_long_error
+
 
 # =============================================================================
 # Retryable Error Detection
@@ -45,20 +47,11 @@ RETRYABLE_STATUS_KEYWORDS = (
     "resource_exhausted", "resource exhausted",
 )
 
-CONTEXT_OVERFLOW_KEYWORDS = (
-    "413",
-    "prompt_too_long",
-    "context_length_exceeded",
-    "too many tokens",
-    "maximum context length",
-)
-
-
 def _is_context_overflow(error: Exception) -> bool:
-    """에러가 컨텍스트 길이 초과(413 / context_length_exceeded) 에러인지 판별합니다.
-    이 에러는 백업 모델 전환이나 안전 메시지로 삼키지 않고 상위의 CompactorMiddleware(ReactiveCompactor)로 전파합니다."""
-    error_str = str(error).lower()
-    return any(kw in error_str for kw in CONTEXT_OVERFLOW_KEYWORDS)
+    """에러가 컨텍스트 길이 초과(413 / prompt is too long / context_length_exceeded) 에러인지 판별합니다.
+    이 에러는 백업 모델 전환이나 안전 메시지로 삼키지 않고 상위의 CompactorMiddleware(ReactiveCompactor)로 전파합니다.
+    판별 기준이 어긋나면 Reactive Compact가 오류를 받지 못하므로 Compactor의 판별 함수를 그대로 씁니다."""
+    return is_prompt_too_long_error(error)
 
 
 def _is_retryable(error: Exception) -> bool:

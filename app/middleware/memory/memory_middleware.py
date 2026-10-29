@@ -16,14 +16,21 @@ Source: frontier-agent-lab/modules/hermes/memory_middleware.py
 
 Hooks:
 - before_agent / abefore_agent:
-    새 턴 시작 → 유휴 리뷰 취소, 사용자 질문 원문 기록,
-    L3(시맨틱) + Procedural(스킬 카탈로그) 프리페치 + L2(에피소드 요약) 자동 인출 → recalled_memory 주입
+    새 턴 시작 → 실행 중인 백그라운드 리뷰 취소 + 에피소드 추출 대기 보류, 사용자 질문 원문 기록,
+    메모리 리뷰 턴 카운터 +1, L3(시맨틱) + Procedural(스킬 카탈로그) 프리페치(세션별 Frozen Snapshot → memory_snapshot)
+    + L2(에피소드 요약) 자동 인출(→ episodic_context, 및 하위 호환 합본 recalled_memory) 주입
 - wrap_model_call: 꺼진 메모리 도구 필터링 → 모델 응답(AI 메시지·도구 호출) 원문 기록,
     도구를 호출한 응답이면 스킬 리뷰 카운터 +1
 - wrap_tool_call: 사용자 ContextVar 전파 + 꺼진 도구 차단 → 도구 결과 원문 기록,
-    skill_manage 직접 호출 시 스킬 리뷰 카운터 리셋
-- after_agent / aafter_agent: 누락분 보정 기록(가드레일 차단 턴은 kind=blocked),
-    Background Review 예약 (유휴 15초 / 최대 30분 후 실행). 카운터가 기준값 이상이면 스킬 리뷰 포함
+    memory / skill_manage 직접 호출 시 해당 리뷰 카운터 리셋
+- after_agent / aafter_agent: 누락분 보정 기록(가드레일 차단 턴은 kind=blocked), 그리고 두 작업을 따로 판단:
+    ① Background Review (메모리·스킬 리뷰) — nudge 조건(_background_review_due)을 만족하면 즉시 실행
+    ② 에피소드 추출 (finalize_session) — 세션 종료 조건(IdleReviewQueue.session_end_reason)까지 대기 후 실행
+
+Hermes 대응 (두 작업은 별개의 경로):
+- Background Review = agent/background_review.py: 턴 종료 시 nudge 조건(사용자 턴 / 도구 호출 응답 10회)
+- 에피소드 추출 = 외부 메모리 provider의 on_session_end: 세션 경계(/new·종료·압축·게이트웨이 1시간 유휴)
+교육용 설정(configs/memory.config): memory_nudge_interval=1(매 턴), 세션 종료 유휴 15초
 
 원문 기록 스위치는 메모리 학습/주입 스위치와 독립입니다:
 - memory.config의 transcript.enabled (배포 정책) + AgentContext.transcript_enabled (요청별)
@@ -37,11 +44,15 @@ Tool Factory:
   - skill_view() / skill_manage(): procedural_store가 있을 때만 추가 (skill_tools.py)
   - session_search는 도구로 제공하지 않음 (before_agent가 자동 인출)
 
-Background Review (Hermes _spawn_background_review + review_idle_queue 패턴):
-- 메인 스레드를 블로킹하지 않음 (ThreadPoolExecutor + 세션별 cancel_event 취소 제어)
-- 별도 LLM 호출로 대화 리뷰 → memory(add/replace) 파싱 실행
-- 스킬 리뷰가 예약된 세션이면 스킬 도구만 가진 리뷰 에이전트 실행 (skill_review.py)
-- EpisodicStore에 세션 주제별 요약 저장
+Background Review (Hermes _spawn_background_review 패턴):
+- 메인 스레드를 블로킹하지 않음 (ThreadPoolExecutor + 세션별 cancel_event, 새 턴이 오면 취소)
+- Semantic: 별도 LLM 호출로 대화 리뷰 → memory() 파싱 실행. add만 바로 반영하고 replace/remove는
+  pending.json에 제안으로만 남김 (Hermes _background_delete_gate — 사용자 없이 기억을 지우지 않음)
+- Procedural: 스킬 도구만 가진 리뷰 에이전트 실행 (skill_review.py)
+
+에피소드 추출 (Hermes MemoryProvider.on_session_end 대응):
+- 세션 종료로 판단되면 원문을 LLM으로 주제별 요약 → EpisodicStore(episodic.db) 색인
+- 같은 세션이 다시 이어지면 다음 세션 종료 때 원문 전체를 다시 요약해 같은 행을 갱신
 ===============================================================================
 """
 
@@ -52,6 +63,7 @@ import logging
 import asyncio
 import threading
 import concurrent.futures
+from collections import OrderedDict
 from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
@@ -93,10 +105,13 @@ If so, save them using: memory(action="add", target="memory", content="...")
 Write entries in concise English. Keep each entry to 1-2 sentences.
 
 IMPORTANT:
-- Only save genuinely NEW or UPDATED information. Check existing entries first.
+- Only save genuinely NEW information. Check existing entries first and do not add duplicates.
 - Do NOT save task-specific data, logs, conversation summaries, or temporary state.
 - If nothing is worth saving, respond with "Nothing to save."
-- Merge overlapping entries using memory(action="replace", target=..., old_text=..., content=...).
+- This review runs without the user present, so it may only ADD entries. If an existing entry is now
+  wrong or duplicated, you may propose memory(action="replace", target=..., old_text=..., content=...)
+  or memory(action="remove", target=..., old_text=...); those proposals are staged for the user's
+  approval and are NOT applied.
 
 Current MEMORY.md entries:
 {memory_entries}
@@ -178,20 +193,22 @@ class MemoryMiddleware(AgentMiddleware):
         procedural_store: Optional[ProceduralMemoryStore] = None,
         skill_nudge_interval: int = 10,
         skill_review_max_iterations: int = 16,
+        memory_nudge_interval: int = 10,
     ):
         """
         Args:
             semantic_store: 기본 사용자(default)의 SemanticMemoryStore
             episodic_store: 공유 EpisodicStore (user_id 컬럼으로 사용자 격리)
             review_llm: Background Review(시맨틱 갱신·세션 요약·스킬 리뷰)에 사용할 LLM
-            top_k: 매 턴 Layer 4에 자동 주입할 과거 세션(Episodic) 요약 개수
+            top_k: 매 턴 자동 인출(episodic_context)할 과거 세션(Episodic) 요약 개수
             transcript_store: 원문 전체본 저장소 (TranscriptStore, 미지정 시 episodic_store.transcript 사용)
             transcript_enabled: 대화 원문(transcript.db) 자동 백업 활성화 여부 (메모리 학습 스위치와 독립)
-            finalize_idle_settle_s: 유휴 지연 요약 대기 시간(초, 기본 15초)
-            finalize_max_age_s: 연속 대화 시 최대 요약 보류 시간(초, 기본 1800초=30분)
+            finalize_idle_settle_s: 세션 종료로 볼 유휴 시간(초, 기본 15초) — 에피소드 추출 시점
+            finalize_max_age_s: 연속 대화 시 에피소드 추출을 미룰 최대 시간(초, 기본 1800초=30분)
             procedural_store: 기본 사용자의 ProceduralMemoryStore (None이면 Procedural Memory 비활성)
             skill_nudge_interval: 스킬 리뷰를 예약할 도구 호출 반복 횟수 (Hermes 기본 10, 0이면 끔)
             skill_review_max_iterations: 스킬 리뷰 에이전트의 최대 모델 호출 횟수 (Hermes 기본 16)
+            memory_nudge_interval: Semantic 리뷰를 실행할 사용자 턴 수 (Hermes 기본 10, 교육용 config는 1, 0이면 끔)
         """
         self.semantic_store = semantic_store
         self.episodic_store = episodic_store
@@ -201,6 +218,7 @@ class MemoryMiddleware(AgentMiddleware):
         self.procedural_store = procedural_store
         self.skill_nudge_interval = max(0, int(skill_nudge_interval))
         self.skill_review_max_iterations = max(1, int(skill_review_max_iterations))
+        self.memory_nudge_interval = max(0, int(memory_nudge_interval))
 
         if transcript_store is not None:
             self.transcript_store: Optional[TranscriptStore] = transcript_store
@@ -221,17 +239,24 @@ class MemoryMiddleware(AgentMiddleware):
             or base_sem_dir == USERS_BASE_DIR.resolve()
         )
 
-        # 사용자(user_id)별 SemanticMemoryStore 및 마지막 로드된 세션 ID 캐시
+        # 사용자(user_id)별 SemanticMemoryStore 캐시 (실시간 쓰기용, 사용자당 1개)
         # (EpisodicStore는 app/database/episodic.db 단일 DB를 공유하며 user_id 컬럼으로 격리)
         self._store_lock = threading.RLock()
         self._user_semantic_stores: Dict[str, SemanticMemoryStore] = {
             _DEFAULT_USER_ID: semantic_store
         }
-        self._loaded_session_by_user: Dict[str, str] = {}
+        # 세션별 Frozen Snapshot: (user_id, session_id) → 그 세션 첫 턴에 렌더링한 프롬프트 블록
+        # 같은 사용자가 세션을 오가도 각 세션의 L4 메모리 텍스트는 세션 내내 그대로입니다 (LRU로 개수 제한).
+        self._prompt_snapshots: "OrderedDict[tuple, Dict[str, Any]]" = OrderedDict()
+        self._max_prompt_snapshots = 256
+
+        # Semantic Memory 리뷰 트리거 (Hermes _turns_since_memory 패턴)
+        self._memory_lock = threading.Lock()
+        self._memory_turns: Dict[str, int] = {}          # 세션별 사용자 턴 수
+        self._memory_review_pending: set = set()          # Semantic 리뷰가 예약됐지만 아직 완료되지 않은 세션
 
         # Procedural Memory: 사용자별 스킬 스토어 + 세션별 스킬 리뷰 트리거 상태
         self._user_procedural_stores: Dict[str, ProceduralMemoryStore] = {}
-        self._loaded_skills_session_by_user: Dict[str, str] = {}
         self._procedural_unified = False
         if procedural_store is not None:
             from app.utils.workspace import resolve_user_skills_dir
@@ -245,16 +270,19 @@ class MemoryMiddleware(AgentMiddleware):
         self._skill_review_pending: set = set()          # 스킬 리뷰가 예약됐지만 아직 완료되지 않은 세션
         self.last_skill_reviews: Dict[str, Dict[str, Any]] = {}  # 세션별 마지막 스킬 리뷰 결과 (관찰용)
 
-        # Background Review 제어 (유휴 큐 + 세션별 중복 실행 방지 & 취소 제어 + 스레드 풀 제한)
+        # 백그라운드 작업 공용 스레드 풀 + 세션별 락 (Semantic 반영과 에피소드 저장이 같은 세션에서 겹치지 않도록)
         self._review_meta_lock = threading.Lock()
         self._review_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="memory-bg-review"
         )
+        self._session_review_locks: Dict[str, threading.Lock] = {}
+        # ① Background Review (메모리·스킬): 턴 종료 시 즉시 실행, 새 턴이 오면 cancel_event로 취소
         self._review_cancel_events: Dict[str, threading.Event] = {}
         self._review_futures: Dict[str, concurrent.futures.Future] = {}
-        self._session_review_locks: Dict[str, threading.Lock] = {}
+        # ② 에피소드 추출: 세션 종료 조건까지 대기하는 큐 (취소 이벤트는 큐가 관리)
+        self._episode_futures: Dict[str, concurrent.futures.Future] = {}
         self._review_queue = IdleReviewQueue(
-            dispatch_fn=self._dispatch_review_from_queue,
+            dispatch_fn=self._dispatch_episode_from_queue,
             settle_s=finalize_idle_settle_s,
             max_age_s=finalize_max_age_s,
         )
@@ -367,46 +395,72 @@ class MemoryMiddleware(AgentMiddleware):
         return True
 
     def _cancel_active_review(self, session_id: str) -> None:
-        """새 턴 시작: 대기 중인 리뷰를 보류하고, 유휴 시간 만료로 실행 중이던 리뷰는 취소합니다.
+        """새 턴 시작: 실행 중인 Background Review를 취소하고, 에피소드 추출 대기를 보류합니다.
 
-        취소 판단은 IdleReviewQueue가 담당합니다 (max_age로 실행된 리뷰는 끝까지 진행해 30분 보장 유지).
+        - Background Review: 사용자가 다시 말을 걸면 진행 중인 리뷰를 멈춥니다
+          (Hermes cancel_background_review_for_live_turn). 기준값 도달 표시는 남아 다음 턴 종료 때 다시 실행됩니다.
+        - 에피소드 추출: 세션이 아직 끝나지 않았으므로 대기 슬롯을 "사용 중"으로 돌립니다. 유휴로 실행 중이던
+          추출은 취소하고, max_age로 실행된 추출은 끝까지 진행합니다 (판단은 IdleReviewQueue).
         """
         if not session_id or session_id == "unknown":
             return
+        with self._review_meta_lock:
+            cancel_event = self._review_cancel_events.get(session_id)
+        if cancel_event is not None:
+            cancel_event.set()
         self._review_queue.mark_active(session_id)
 
-    def _dispatch_review_from_queue(
-        self, payload: Dict[str, Any], cancel_event: threading.Event
-    ) -> None:
-        """IdleReviewQueue 타이머(또는 flush) 만료 시 스레드 풀로 Background Review를 디스패치합니다."""
+    def _spawn_background_review(self, payload: Dict[str, Any]) -> None:
+        """nudge 조건을 만족한 턴이 끝나면 즉시 스레드 풀로 Background Review(메모리·스킬)를 실행합니다."""
         session_id = payload["session_id"]
+        cancel_event = threading.Event()
         with self._review_meta_lock:
-            prev_event = self._review_cancel_events.pop(session_id, None)
-            if prev_event is not None and prev_event is not cancel_event:
-                prev_event.set()
+            prev_event = self._review_cancel_events.get(session_id)
+            if prev_event is not None:
+                prev_event.set()   # 같은 세션의 이전 리뷰는 더 최신 대화를 보는 이번 리뷰가 대체
             self._review_cancel_events[session_id] = cancel_event
             self._session_review_locks.setdefault(session_id, threading.Lock())
-            future = self._review_executor.submit(
+            self._review_futures[session_id] = self._review_executor.submit(
                 self._background_review,
                 payload["messages_snapshot"],
                 session_id,
                 payload["user_id"],
                 payload["semantic_learning"],
-                payload["episodic_learning"],
+                payload["procedural_learning"],
                 cancel_event,
-                payload.get("transcript_enabled", True),
-                payload.get("procedural_learning", False),
+                payload["transcript_enabled"],
             )
-            self._review_futures[session_id] = future
+        logger.info(
+            "[BG-Review] Started for session %s (semantic=%s, procedural=%s)",
+            session_id, payload["semantic_learning"], payload["procedural_learning"],
+        )
+
+    def _dispatch_episode_from_queue(
+        self, payload: Dict[str, Any], cancel_event: threading.Event
+    ) -> None:
+        """세션 종료 조건을 만족하면(IdleReviewQueue 타이머 또는 flush) 스레드 풀로 에피소드 추출을 실행합니다."""
+        session_id = payload["session_id"]
+        with self._review_meta_lock:
+            self._session_review_locks.setdefault(session_id, threading.Lock())
+            future = self._review_executor.submit(
+                self._extract_episode,
+                payload["messages_snapshot"],
+                session_id,
+                payload["user_id"],
+                cancel_event,
+                payload["transcript_enabled"],
+            )
+            self._episode_futures[session_id] = future
             future.add_done_callback(
                 lambda _f, sid=session_id, ce=cancel_event: self._review_queue.finished(sid, ce)
             )
 
     def wait_for_reviews(self, timeout: float = 10.0) -> None:
-        """유휴 대기 중인 슬롯을 즉시 디스패치(flush)하고 실행 중인 모든 Background Review 완료를 대기합니다."""
+        """대기 중인 에피소드 추출을 즉시 실행(flush)하고, 실행 중인 Background Review와 에피소드 추출이
+        모두 끝날 때까지 기다립니다 (노트북·테스트·서버 종료용)."""
         self._review_queue.flush()
         with self._review_meta_lock:
-            futures = list(self._review_futures.values())
+            futures = [*self._review_futures.values(), *self._episode_futures.values()]
         if futures:
             concurrent.futures.wait(futures, timeout=timeout)
 
@@ -440,7 +494,7 @@ class MemoryMiddleware(AgentMiddleware):
             - Write entries in English for search efficiency.
             - Keep entries short (1-2 sentences). Merge overlapping facts.
             - Do NOT store task-specific data, logs, or temporary state.
-            - Current MEMORY.md and USER.md contents for the active user are ALREADY preloaded in Layer 4 (Recalled Memory) of your system prompt. Do NOT use file_read, glob_search, or bash_command to search for USER.md or MEMORY.md on disk.
+            - Current MEMORY.md and USER.md contents for the active user are ALREADY preloaded in your session memory snapshot (`# memorySnapshot` in `<system-reminder>`). Do NOT use file_read, glob_search, or bash_command to search for USER.md or MEMORY.md on disk.
 
             Args:
                 action: "add" | "replace" | "remove"
@@ -589,7 +643,7 @@ class MemoryMiddleware(AgentMiddleware):
 
             If anchor_message is empty, returns the last `window` messages of the session.
 
-            Use this tool after seeing a relevant session hint in Recalled Episodic Memory (Layer 4).
+            Use this tool after seeing a relevant session hint in EPISODIC MEMORY (`# episodicMemory` in `<system-reminder>`).
 
             Args:
                 session_id: The session ID to recall messages from
@@ -647,6 +701,42 @@ class MemoryMiddleware(AgentMiddleware):
             disabled.update(t.name for t in self._skill_tools)
         return disabled
 
+    # ── Semantic Memory 트리거 (Hermes _turns_since_memory 패턴) ──
+
+    def _count_memory_turn(self, session_id: str, messages: List[Any]) -> None:
+        """사용자 턴 1회 = 1. 처음 보는 세션(서버 재시작 등)은 이전 사용자 턴 수 % 기준값에서 시작합니다."""
+        if self.memory_nudge_interval <= 0 or session_id == "unknown":
+            return
+        with self._memory_lock:
+            if session_id not in self._memory_turns:
+                prior = sum(1 for m in messages if getattr(m, "type", None) == "human") - 1
+                self._memory_turns[session_id] = max(0, prior) % self.memory_nudge_interval
+            self._memory_turns[session_id] += 1
+
+    def _memory_nudge_reached(self, session_id: str) -> bool:
+        """nudge 조건 (Semantic): 사용자 턴 카운터가 기준값에 닿았거나, 닿은 뒤 리뷰가 아직 끝나지 않았는가."""
+        if self.memory_nudge_interval <= 0:
+            return False
+        with self._memory_lock:
+            return (
+                self._memory_turns.get(session_id, 0) >= self.memory_nudge_interval
+                or session_id in self._memory_review_pending
+            )
+
+    def _finish_memory_review(self, session_id: str) -> None:
+        """Semantic 리뷰가 취소되지 않고 끝났을 때만 카운터를 리셋합니다 (취소되면 다음 리뷰로 이월)."""
+        with self._memory_lock:
+            self._memory_review_pending.discard(session_id)
+            self._memory_turns[session_id] = 0
+
+    def _reset_memory_counter_on_tool(self, request: Any) -> None:
+        """에이전트가 대화 중 memory 도구를 직접 호출했다면 이미 기록한 것이므로 카운터를 리셋합니다."""
+        if request.tool_call.get("name") != self._memory_tool.name:
+            return
+        session_id = self._get_session_id(getattr(request, "runtime", None), request)
+        with self._memory_lock:
+            self._memory_turns[session_id] = 0
+
     # ── Procedural Memory 트리거 (Hermes _iters_since_skill 패턴) ──
 
     def _count_skill_iteration(self, runtime: Any, request: Any, out_msgs: List[BaseMessage]) -> None:
@@ -669,23 +759,48 @@ class MemoryMiddleware(AgentMiddleware):
         with self._skill_lock:
             self._skill_iters[session_id] = 0
 
-    def _procedural_learning_due(self, ctx: Any, session_id: str, base_learning: bool) -> bool:
-        """이번 유휴 리뷰에 스킬 리뷰를 포함할지 결정합니다.
-
-        IdleReviewQueue는 세션당 최신 payload만 남기므로, 한 번 기준값에 도달한 세션은
-        스킬 리뷰가 실제로 완료될 때까지 pending으로 유지해 다음 payload에도 플래그가 실리게 합니다.
-        """
-        if self.procedural_store is None or not self.review_llm or self.skill_nudge_interval <= 0:
-            return False
-        if not (
-            getattr(ctx, "procedural_memory_enabled", True)
-            and getattr(ctx, "procedural_learning_enabled", base_learning)
-        ):
+    def _skill_nudge_reached(self, session_id: str) -> bool:
+        """nudge 조건 (Procedural): 도구 호출 응답 카운터가 기준값에 닿았거나, 닿은 뒤 리뷰가 아직 끝나지 않았는가."""
+        if self.procedural_store is None or self.skill_nudge_interval <= 0:
             return False
         with self._skill_lock:
-            if self._skill_iters.get(session_id, 0) >= self.skill_nudge_interval:
+            return (
+                self._skill_iters.get(session_id, 0) >= self.skill_nudge_interval
+                or session_id in self._skill_review_pending
+            )
+
+    def _background_review_due(self, ctx: Any, session_id: str, base_learning: bool) -> Dict[str, bool]:
+        """이번 턴 종료 시 Background Review로 무엇을 리뷰할지 결정합니다 (nudge 조건 + 요청별 스위치).
+
+        조건을 만족한 세션은 pending에 올려, 리뷰가 새 턴 때문에 취소되더라도 다음 턴 종료 때 다시 실행되게 합니다.
+        pending은 리뷰가 끝까지 수행된 뒤 _finish_memory_review / _finish_skill_review가 비웁니다.
+        """
+        due = {"semantic": False, "procedural": False}
+        if not self.review_llm:
+            return due
+        semantic_on = getattr(ctx, "semantic_memory_enabled", True) and getattr(
+            ctx, "semantic_learning_enabled", base_learning
+        )
+        if semantic_on and self._memory_nudge_reached(session_id):
+            with self._memory_lock:
+                self._memory_review_pending.add(session_id)
+            due["semantic"] = True
+        procedural_on = getattr(ctx, "procedural_memory_enabled", True) and getattr(
+            ctx, "procedural_learning_enabled", base_learning
+        )
+        if procedural_on and self._skill_nudge_reached(session_id):
+            with self._skill_lock:
                 self._skill_review_pending.add(session_id)
-            return session_id in self._skill_review_pending
+            due["procedural"] = True
+        return due
+
+    @staticmethod
+    def _episode_extraction_enabled(ctx: Any, base_learning: bool) -> bool:
+        """에피소드 추출을 예약할지 (요청별 스위치). 실행 시점은 세션 종료 조건이 정합니다."""
+        return bool(
+            getattr(ctx, "episodic_memory_enabled", True)
+            and getattr(ctx, "episodic_learning_enabled", base_learning)
+        )
 
     def _finish_skill_review(self, session_id: str) -> None:
         """스킬 리뷰가 취소되지 않고 끝났을 때만 카운터를 리셋합니다 (취소되면 다음 리뷰로 이월)."""
@@ -778,6 +893,7 @@ class MemoryMiddleware(AgentMiddleware):
                         pass
             return blocked
 
+        self._reset_memory_counter_on_tool(request)
         self._reset_skill_counter_on_manage(request)
         uid = self._resolve_current_user_id(runtime)
         tok = _memory_user_id_var.set(uid)
@@ -824,6 +940,7 @@ class MemoryMiddleware(AgentMiddleware):
                         pass
             return blocked
 
+        self._reset_memory_counter_on_tool(request)
         self._reset_skill_counter_on_manage(request)
         uid = self._resolve_current_user_id(runtime)
         tok = _memory_user_id_var.set(uid)
@@ -886,6 +1003,26 @@ class MemoryMiddleware(AgentMiddleware):
 
         return session_id, user_id
 
+    def _session_snapshot(self, user_id: str, session_id: str, kind: str, capture) -> Any:
+        """세션별 Frozen Snapshot. 그 세션에서 처음 요청될 때만 capture()로 디스크를 읽어 렌더링합니다.
+
+        스냅샷 키가 (user_id, session_id)이므로 같은 사용자가 세션 A → B → A로 오가도
+        A로 돌아왔을 때 A의 첫 턴 스냅샷을 그대로 씁니다 (세션 중 프롬프트 불변 → 프리픽스 캐시 보존).
+        """
+        if session_id == "unknown":
+            return capture()   # 세션을 알 수 없으면 고정할 단위가 없으므로 매번 새로 읽음
+        key = (user_id, session_id)
+        with self._store_lock:
+            entry = self._prompt_snapshots.get(key)
+            if entry is None:
+                entry = self._prompt_snapshots[key] = {}
+                while len(self._prompt_snapshots) > self._max_prompt_snapshots:
+                    self._prompt_snapshots.popitem(last=False)   # 가장 오래 안 쓴 세션부터 정리
+            self._prompt_snapshots.move_to_end(key)
+            if kind not in entry:
+                entry[kind] = capture()
+            return entry[kind]
+
     def _prepare_turn_and_semantic_memory(
         self, state: Dict[str, Any], runtime: Any
     ) -> Optional[tuple[Any, str, str, List[str]]]:
@@ -900,23 +1037,22 @@ class MemoryMiddleware(AgentMiddleware):
 
         recalled_parts: List[str] = []
 
-        # L3: Semantic Memory 프리페치 (세션 감지 기반 Frozen Snapshot, user_id 격리)
+        # L3: Semantic Memory 프리페치 (세션별 Frozen Snapshot, user_id 격리)
         if getattr(ctx, "semantic_memory_enabled", True):
+            self._count_memory_turn(session_id, state.get("messages", []))
             store = self._get_semantic_store(user_id)
-            with self._store_lock:
-                # 세션이 전환된 순간에만 디스크에서 최신 마크다운 로드 (세션 내 KV-Cache 보존)
-                if self._loaded_session_by_user.get(user_id) != session_id:
-                    store.load_from_disk()
-                    self._loaded_session_by_user[user_id] = session_id
-                    logger.info(
-                        "[MemoryMiddleware] New session detected (user=%s, session=%s): reloaded semantic memory snapshot.",
-                        user_id, session_id,
-                    )
 
-                memory_block = store.format_for_prompt("memory")
-                user_block = store.format_for_prompt("user")
-                mem_limit = store.memory_char_limit
-                usr_limit = store.user_char_limit
+            def _capture_semantic():
+                store.load_from_disk()   # 세션의 첫 턴에만 디스크에서 최신 마크다운 로드
+                logger.info(
+                    "[MemoryMiddleware] Captured semantic memory snapshot (user=%s, session=%s).",
+                    user_id, session_id,
+                )
+                return store.format_for_prompt("memory"), store.format_for_prompt("user")
+
+            memory_block, user_block = self._session_snapshot(user_id, session_id, "semantic", _capture_semantic)
+            mem_limit = store.memory_char_limit
+            usr_limit = store.user_char_limit
             if memory_block:
                 recalled_parts.append(memory_block)
             else:
@@ -936,14 +1072,15 @@ class MemoryMiddleware(AgentMiddleware):
                     "(No entries recorded yet in USER.md for this user.)"
                 )
 
-        # Procedural: 학습 스킬 카탈로그 프리페치 (이름 + 설명만, 세션 단위 Frozen Snapshot)
+        # Procedural: 학습 스킬 카탈로그 프리페치 (이름 + 설명만, 세션별 Frozen Snapshot)
         if self.procedural_store is not None and getattr(ctx, "procedural_memory_enabled", True):
             pstore = self._get_procedural_store(user_id)
-            with self._store_lock:
-                if self._loaded_skills_session_by_user.get(user_id) != session_id:
-                    pstore.load_from_disk()
-                    self._loaded_skills_session_by_user[user_id] = session_id
-                skills_block = pstore.format_for_prompt()
+
+            def _capture_skills():
+                pstore.load_from_disk()
+                return pstore.format_for_prompt()
+
+            skills_block = self._session_snapshot(user_id, session_id, "skills", _capture_skills)
             recalled_parts.append(skills_block or (
                 "══════════════════════════════════════════════\n"
                 "PROCEDURAL MEMORY (learned skills) [0 skills]\n"
@@ -954,12 +1091,25 @@ class MemoryMiddleware(AgentMiddleware):
 
         return ctx, session_id, user_id, recalled_parts
 
+    @staticmethod
+    def _assign_recalled_context(ctx: Any, snapshot_parts: List[str], episodic_block: str = "") -> None:
+        """세션 동결 스냅샷(memory_snapshot)과 턴별 에피소드 기억(episodic_context)을 분리 기록하고,
+        단독 @dynamic_prompt 하위 호환용 합본(recalled_memory)도 함께 채웁니다."""
+        snapshot_text = "\n\n".join(snapshot_parts) if snapshot_parts else ""
+        if hasattr(ctx, "memory_snapshot"):
+            ctx.memory_snapshot = snapshot_text
+        if hasattr(ctx, "episodic_context"):
+            ctx.episodic_context = episodic_block
+        combined = [*snapshot_parts, episodic_block] if episodic_block else list(snapshot_parts)
+        ctx.recalled_memory = "\n\n".join(combined) if combined else ""
+
     def before_agent(self, state: Dict[str, Any], runtime: Any) -> Optional[Dict[str, Any]]:
-        """동기 실행 경로용 원문 기록 + L2+L3 메모리 인출 → AgentContext.recalled_memory에 주입."""
+        """동기 실행 경로용 원문 기록 + L2+L3 메모리 인출 → memory_snapshot / episodic_context / recalled_memory 주입."""
         prepared = self._prepare_turn_and_semantic_memory(state, runtime)
         if not prepared:
             return None
         ctx, session_id, user_id, recalled_parts = prepared
+        episodic_block = ""
 
         # L2: Episodic Memory 자동 인출 (동기 호출자용 _run_async_safe 경로)
         if getattr(ctx, "episodic_memory_enabled", True) and self.top_k > 0:
@@ -976,13 +1126,11 @@ class MemoryMiddleware(AgentMiddleware):
                         )
                     )
                     if sessions:
-                        recalled_parts.append(self._format_episodic(sessions))
+                        episodic_block = self._format_episodic(sessions)
                 except Exception as e:
                     logger.warning("Episodic memory retrieval failed: %s", e)
 
-        if recalled_parts:
-            ctx.recalled_memory = "\n\n".join(recalled_parts)
-
+        self._assign_recalled_context(ctx, recalled_parts, episodic_block)
         return None
 
     async def abefore_agent(self, state: Dict[str, Any], runtime: Any) -> Optional[Dict[str, Any]]:
@@ -992,6 +1140,7 @@ class MemoryMiddleware(AgentMiddleware):
             return None
         ctx, session_id, user_id, recalled_parts = prepared
         _memory_user_id_var.set(user_id)
+        episodic_block = ""
 
         # L2: Episodic Memory 자동 인출 (이벤트 루프를 블로킹하지 않는 네이티브 await 경로)
         if getattr(ctx, "episodic_memory_enabled", True) and self.top_k > 0:
@@ -1006,23 +1155,23 @@ class MemoryMiddleware(AgentMiddleware):
                         user_id=user_id,
                     )
                     if sessions:
-                        recalled_parts.append(self._format_episodic(sessions))
+                        episodic_block = self._format_episodic(sessions)
                 except Exception as e:
                     logger.warning("Episodic memory retrieval failed: %s", e)
 
-        if recalled_parts:
-            ctx.recalled_memory = "\n\n".join(recalled_parts)
-
+        self._assign_recalled_context(ctx, recalled_parts, episodic_block)
         return None
 
     def after_agent(self, state: Dict[str, Any], runtime: Any) -> Optional[Dict[str, Any]]:
-        """턴 종료 시 누락 메시지 원문 보정 기록 및 유휴 지연 Background Review 예약.
+        """턴 종료 시 누락 메시지 원문 보정 기록 + Background Review 실행 + 에피소드 추출 예약.
 
         1. wrap 훅을 거치지 않은 메시지(예: 가드레일 조기 차단 AIMessage 또는 테스트 직접 호출)를
            transcript.db에 멱등(idempotent) 보정 기록합니다.
         2. 현재 턴이 가드레일에 의해 차단(guardrail_blocked=True)된 경우 해당 턴 전체를
-           kind='blocked'로 마킹하고 메모리 학습/요약(Background Review)을 건너뜁니다.
-        3. 정상 턴인 경우 IdleReviewQueue(기본 유휴 15초 / 최대 30분)에 리뷰를 예약합니다.
+           kind='blocked'로 마킹하고 메모리 학습/요약을 건너뜁니다.
+        3. 정상 턴이면 두 작업을 따로 판단합니다.
+           ① Background Review: nudge 조건(_background_review_due)을 만족하면 지금 바로 실행
+           ② 에피소드 추출: IdleReviewQueue에 예약 → 세션 종료 조건(기본 유휴 15초 / 최대 30분)에 실행
         """
         messages = state.get("messages", [])
         if not messages:
@@ -1069,48 +1218,59 @@ class MemoryMiddleware(AgentMiddleware):
             return None
 
         base_learning = getattr(ctx, "memory_learning_enabled", True)
-        semantic_learning = (
-            getattr(ctx, "semantic_memory_enabled", True)
-            and getattr(ctx, "semantic_learning_enabled", base_learning)
-        )
-        episodic_learning = (
-            getattr(ctx, "episodic_memory_enabled", True)
-            and getattr(ctx, "episodic_learning_enabled", base_learning)
-        )
-        procedural_learning = self._procedural_learning_due(ctx, session_id, base_learning)
-        if not (semantic_learning or episodic_learning or procedural_learning):
+        review_due = self._background_review_due(ctx, session_id, base_learning)
+        extract_episode = self._episode_extraction_enabled(ctx, base_learning)
+        if not (review_due["semantic"] or review_due["procedural"] or extract_episode):
             return None
 
         # 대화 스냅샷 복제 (transcript.db 비활성화 시 폴백용)
-        messages_snapshot = [
-            _serialize_message_for_review(m) for m in messages
-        ]
+        # 원문 기록이 꺼진 턴이면 두 작업 모두 원문 저장소를 읽거나 쓰지 않고 이 스냅샷만 사용합니다.
+        base_payload = {
+            "messages_snapshot": [_serialize_message_for_review(m) for m in messages],
+            "session_id": session_id,
+            "user_id": user_id,
+            "transcript_enabled": transcript_on,
+        }
 
-        # 유휴 큐에 예약 (최신 예약만 유지). 진행 중인 리뷰의 취소는 새 턴의 before_agent가 큐를 통해 처리합니다.
-        self._review_queue.schedule(
-            session_id=session_id,
-            user_id=user_id,
-            payload={
-                "messages_snapshot": messages_snapshot,
-                "session_id": session_id,
-                "user_id": user_id,
-                "semantic_learning": semantic_learning,
-                "episodic_learning": episodic_learning,
-                "procedural_learning": procedural_learning,
-                # 원문 기록이 꺼진 턴이면 리뷰도 원문 저장소를 읽거나 쓰지 않고 스냅샷만 사용
-                "transcript_enabled": transcript_on,
-            },
-        )
+        # ① Background Review (메모리·스킬): nudge 조건을 만족했으면 지금 바로 실행 (새 턴이 오면 취소)
+        if review_due["semantic"] or review_due["procedural"]:
+            self._spawn_background_review({
+                **base_payload,
+                "semantic_learning": review_due["semantic"],
+                "procedural_learning": review_due["procedural"],
+            })
 
-        logger.info("Background review queued for session %s (user=%s)", session_id, user_id)
+        # ② 에피소드 추출: 세션 종료 조건까지 대기 (세션당 최신 예약만 유지)
+        if extract_episode:
+            self._review_queue.schedule(session_id=session_id, user_id=user_id, payload=base_payload)
+            logger.info("Episode extraction queued for session %s (user=%s)", session_id, user_id)
         return None
 
     async def aafter_agent(self, state: Dict[str, Any], runtime: Any) -> Optional[Dict[str, Any]]:
         return await asyncio.to_thread(self.after_agent, state, runtime)
 
     # ══════════════════════════════════════════════════════════════════
-    # Background Review (Bounded ThreadPool + Session Cancel/Lock)
+    # 백그라운드 작업: ① Background Review (메모리·스킬)  ② 에피소드 추출
     # ══════════════════════════════════════════════════════════════════
+
+    def _load_session_messages(
+        self, messages_snapshot: List[Dict[str, Any]], session_id: str, user_id: str, transcript_enabled: bool
+    ) -> List[Dict[str, Any]]:
+        """원문 기록이 켜져 있으면 transcript.db의 세션 전체 원문(압축 손실 없음), 아니면 턴 종료 시점 스냅샷."""
+        if transcript_enabled and self.transcript_store is not None and session_id and session_id != "unknown":
+            try:
+                rows = self.transcript_store.read_session_sync(
+                    session_id=session_id, user_id=user_id, include_hidden=False,
+                )
+                if rows:
+                    return rows
+            except Exception as e:
+                logger.warning("[BG-Review] Failed to read transcript for %s: %s", session_id, e)
+        return messages_snapshot
+
+    def _session_lock(self, session_id: str) -> threading.Lock:
+        with self._review_meta_lock:
+            return self._session_review_locks.setdefault(session_id, threading.Lock())
 
     def _background_review(
         self,
@@ -1118,55 +1278,29 @@ class MemoryMiddleware(AgentMiddleware):
         session_id: str,
         user_id: str = _DEFAULT_USER_ID,
         semantic_learning: bool = True,
-        episodic_learning: bool = True,
+        procedural_learning: bool = False,
         cancel_event: Optional[threading.Event] = None,
         transcript_enabled: bool = True,
-        procedural_learning: bool = False,
     ) -> None:
-        """Background Review 워커.
+        """Background Review 워커 (Hermes agent/background_review.py 대응) — nudge 조건을 만족한 턴 종료 직후 실행.
 
-        1. 원문 기록이 켜져 있고 transcript.db에 원문이 있으면 세션 전체 원문을 로드(압축 손실 없음).
-           꺼져 있으면 턴 종료 시점의 state 스냅샷만 사용하며, 원문 저장소에는 읽기/쓰기 모두 하지 않습니다.
-        2. semantic_learning: LLM에게 대화 리뷰 요청 → memory() 호출 파싱 실행
-        3. procedural_learning: 스킬 도구만 가진 리뷰 에이전트가 스킬 생성/패치 (skill_review.py)
-        4. episodic_learning: EpisodicStore에 세션 주제별 요약 저장
-        진행 도중 같은 세션에서 새 턴이 시작되어 cancel_event가 설정되면 즉시 중단합니다.
+        1. semantic_learning: LLM에게 대화 리뷰 요청 → memory() 호출 파싱 실행 (add만 반영, 수정·삭제는 제안)
+        2. procedural_learning: 스킬 도구만 가진 리뷰 에이전트가 스킬 생성/패치 (skill_review.py)
+        같은 세션에서 새 턴이 시작되어 cancel_event가 설정되면 중단하고, 기준값 도달 표시는 남겨 다음 턴에 다시 실행합니다.
         """
         if cancel_event is not None and cancel_event.is_set():
             logger.info("[BG-Review] Skipped cancelled review for session %s", session_id)
             return
-
-        with self._review_meta_lock:
-            session_lock = self._session_review_locks.setdefault(session_id, threading.Lock())
-
         try:
-            logger.info(
-                "[BG-Review] Starting background review for session %s (user=%s, semantic=%s, episodic=%s)",
-                session_id, user_id, semantic_learning, episodic_learning,
-            )
+            full_messages = self._load_session_messages(messages_snapshot, session_id, user_id, transcript_enabled)
 
-            full_messages = messages_snapshot
-            if transcript_enabled and self.transcript_store is not None and session_id and session_id != "unknown":
-                try:
-                    transcript_rows = self.transcript_store.read_session_sync(
-                        session_id=session_id,
-                        user_id=user_id,
-                        include_hidden=False,
-                    )
-                    if transcript_rows:
-                        full_messages = transcript_rows
-                except Exception as e:
-                    logger.warning("[BG-Review] Failed to read transcript for %s: %s", session_id, e)
-
-            # 1. Semantic Memory 갱신 (LLM 리뷰)
             if semantic_learning and self.review_llm:
-                if cancel_event is not None and cancel_event.is_set():
-                    return
-                self._review_semantic_memory(
-                    full_messages, user_id=user_id, cancel_event=cancel_event, session_lock=session_lock
-                )
+                if self._review_semantic_memory(
+                    full_messages, user_id=user_id, cancel_event=cancel_event,
+                    session_lock=self._session_lock(session_id),
+                ):
+                    self._finish_memory_review(session_id)
 
-            # 2. Procedural Memory 스킬 리뷰 (도구 호출 반복 횟수가 기준값에 도달한 세션만)
             if procedural_learning and self.review_llm:
                 if cancel_event is not None and cancel_event.is_set():
                     return
@@ -1174,18 +1308,35 @@ class MemoryMiddleware(AgentMiddleware):
                     full_messages, session_id, user_id=user_id, cancel_event=cancel_event
                 )
 
-            # 3. Episodic Memory 세션 요약 저장
-            if episodic_learning:
-                if cancel_event is not None and cancel_event.is_set():
-                    return
-                self._review_episodic_memory(
-                    full_messages, session_id, user_id=user_id, cancel_event=cancel_event, session_lock=session_lock
-                )
-
             logger.info("[BG-Review] Completed for session %s", session_id)
-
         except Exception as e:
             logger.error("[BG-Review] Failed for session %s: %s", session_id, e)
+
+    def _extract_episode(
+        self,
+        messages_snapshot: List[Dict[str, Any]],
+        session_id: str,
+        user_id: str = _DEFAULT_USER_ID,
+        cancel_event: Optional[threading.Event] = None,
+        transcript_enabled: bool = True,
+    ) -> None:
+        """에피소드 추출 워커 (Hermes MemoryProvider.on_session_end 대응) — 세션 종료 조건을 만족하면 실행.
+
+        세션 원문을 LLM으로 주제별 요약해 EpisodicStore(episodic.db)에 색인합니다.
+        유휴로 실행된 추출은 새 턴이 시작되면(cancel_event) 중단합니다.
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info("[Episode] Skipped cancelled extraction for session %s", session_id)
+            return
+        try:
+            full_messages = self._load_session_messages(messages_snapshot, session_id, user_id, transcript_enabled)
+            self._review_episodic_memory(
+                full_messages, session_id, user_id=user_id, cancel_event=cancel_event,
+                session_lock=self._session_lock(session_id),
+            )
+            logger.info("[Episode] Extracted episode for session %s", session_id)
+        except Exception as e:
+            logger.error("[Episode] Failed for session %s: %s", session_id, e)
 
     def _review_semantic_memory(
         self,
@@ -1193,12 +1344,16 @@ class MemoryMiddleware(AgentMiddleware):
         user_id: str = _DEFAULT_USER_ID,
         cancel_event: Optional[threading.Event] = None,
         session_lock: Optional[threading.Lock] = None,
-    ) -> None:
-        """LLM으로 대화를 리뷰하여 사용자별 MEMORY.md/USER.md 갱신."""
+    ) -> bool:
+        """LLM으로 대화를 리뷰하여 사용자별 MEMORY.md/USER.md 갱신.
+
+        Returns:
+            리뷰가 끝까지 수행되었으면 True (취소·실패 시 False → 트리거 카운터를 리셋하지 않음)
+        """
         if not self.review_llm:
-            return
+            return False
         if cancel_event is not None and cancel_event.is_set():
-            return
+            return False
 
         store = self._get_semantic_store(user_id)
 
@@ -1231,7 +1386,7 @@ class MemoryMiddleware(AgentMiddleware):
             response = self.review_llm.invoke(review_prompt)
             if cancel_event is not None and cancel_event.is_set():
                 logger.info("[BG-Review] Cancelled stale semantic review before applying ops (user=%s)", user_id)
-                return
+                return False
 
             content = normalize_content(getattr(response, "content", response))
 
@@ -1239,13 +1394,15 @@ class MemoryMiddleware(AgentMiddleware):
             if session_lock is not None:
                 with session_lock:
                     if cancel_event is not None and cancel_event.is_set():
-                        return
+                        return False
                     self._parse_and_execute_memory_ops(content, store=store)
             else:
                 self._parse_and_execute_memory_ops(content, store=store)
+            return True
 
         except Exception as e:
             logger.warning("[BG-Review] Semantic review LLM call failed: %s", e)
+            return False
 
     def _review_procedural_memory(
         self,
@@ -1350,13 +1507,19 @@ class MemoryMiddleware(AgentMiddleware):
     def _apply_memory_op(
         target_store: SemanticMemoryStore, action: str, target: str, content: str, old_text: str
     ) -> None:
-        """파싱된 memory 작업 하나를 저장소에 반영합니다 (필수 인자가 빠진 작업은 건너뜀)."""
+        """파싱된 memory 작업 하나를 저장소에 반영합니다 (필수 인자가 빠진 작업은 건너뜀).
+
+        Background Delete Gate (Hermes _background_delete_gate): 이 경로는 사용자가 없는 백그라운드
+        리뷰 전용이므로 add만 바로 반영하고, replace/remove는 pending.json에 제안으로만 남깁니다.
+        대화 중 에이전트가 직접 부르는 memory 도구는 이 게이트를 거치지 않습니다.
+        """
         if action == "add" and content:
             result = target_store.add(target, content)
-        elif action == "replace" and old_text and content:
-            result = target_store.replace(target, old_text, content)
-        elif action == "remove" and old_text:
-            result = target_store.remove(target, old_text)
+        elif (action == "replace" and old_text and content) or (action == "remove" and old_text):
+            result = target_store.stage_pending(action, target, content=content, old_text=old_text)
+            logger.info("[BG-Review] Memory %s staged for approval (%s): %s",
+                        action, result.get("pending_id"), old_text[:50])
+            return
         else:
             return
 
@@ -1369,10 +1532,13 @@ class MemoryMiddleware(AgentMiddleware):
 
     @staticmethod
     def _extract_kwarg(args_str: str, key: str) -> Optional[str]:
-        """키워드 인자 문자열에서 특정 키의 값을 추출."""
-        pattern = rf'{key}\s*=\s*["\']([^"\']*)["\']'
-        m = re.search(pattern, args_str)
-        return m.group(1) if m else None
+        """키워드 인자 문자열에서 특정 키의 값을 추출.
+
+        여는 따옴표와 같은 종류의 따옴표에서만 끝냅니다 (content="User's ..."의 아포스트로피에서 잘리지 않도록).
+        """
+        pattern = rf'\b{key}\s*=\s*(["\'])(.*?)(?<!\\)\1'
+        m = re.search(pattern, args_str, re.DOTALL)
+        return m.group(2) if m else None
 
     def _review_episodic_memory(
         self,

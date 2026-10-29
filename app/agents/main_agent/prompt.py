@@ -31,7 +31,7 @@ SUPERVISOR_SYSTEM_PROMPT = """당신은 사용자의 모든 요청을 편안하�
 
 - 친근하고 자연스러운 말투로 답변하되, 전문적인 내용도 명확하게 전달하세요.
 - 답변은 간결하게. 핵심을 먼저 말하고 필요한 경우에만 부연하세요.
-- 수집한 데이터나 상세 결과물은 Layer 3(`Dynamic Session Context`)에 주입된 **세션 전용 워크스페이스(`Session Workspace Root` 하위의 `Plan Dir`, `Scripts Dir`, `Outputs Dir`)**에 저장하고,
+- 수집한 데이터나 상세 결과물은 시스템 프롬프트에 주입된 **세션 전용 워크스페이스(`Session Workspace Root` 하위의 `Plan Dir`, `Scripts Dir`, `Outputs Dir`)**에 저장하고,
   사용자에게는 요약과 파일 경로만 깔끔하게 전달하세요.
   - 메인 에이전트가 직접 작성하는 스크립트: `{Scripts Dir}/파일명.py`
   - 메인 에이전트가 직접 생성하는 최종 산출물: `{Outputs Dir}/파일명`

@@ -15,17 +15,24 @@ Source: frontier-agent-lab/modules/hermes/memory_store.py
 - Disk-immediate Write: 도구 호출로 변경 시 즉시 파일에 반영 (다음 세션에 반영)
 - Bounded Capacity: 글자 수 제한으로 무한 확장 방지
 - 영어 저장: FTS5 검색 효율 + 토큰 효율을 위해 팩트는 영어로 저장
+- Background Delete Gate: 사용자가 없는 백그라운드 리뷰의 replace/remove는 바로 반영하지 않고
+  pending.json에 제안으로만 남김 (Hermes tools/memory_tool.py _background_delete_gate).
+  교육용으로 승인 UI는 두지 않고 apply_pending / discard_pending 메서드만 제공
 ===============================================================================
 """
 
 import os
+import json
+import uuid
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
 ENTRY_DELIMITER = "\n§\n"
+PENDING_FILE = "pending.json"
 
 MEMORY_BLOCK_HEADERS = {
     "memory": "MEMORY (agent's personal notes)",
@@ -214,6 +221,76 @@ class SemanticMemoryStore:
         self._set_entries(target, entries)
         self.save_to_disk(target)
         return self._success_response(target, "Entry removed.")
+
+    # ── 승인 대기 제안 (Background Delete Gate) ──
+
+    def stage_pending(
+        self, action: str, target: str, content: str = "", old_text: str = "",
+        origin: str = "background_review",
+    ) -> Dict[str, Any]:
+        """replace/remove를 실행하지 않고 pending.json에 제안으로 남깁니다."""
+        record = {
+            "id": uuid.uuid4().hex[:8],
+            "action": action,
+            "target": target,
+            "content": content,
+            "old_text": old_text,
+            "origin": origin,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self._write_pending(self.list_pending() + [record])
+        return {
+            "success": True,
+            "staged": True,
+            "pending_id": record["id"],
+            "message": (
+                f"Background review may not {action} memory entries unattended. "
+                "The proposal was staged in pending.json (apply_pending to apply, discard_pending to drop)."
+            ),
+        }
+
+    def list_pending(self) -> List[Dict[str, Any]]:
+        path = self.memory_dir / PENDING_FILE
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Failed to read %s: %s", path, e)
+            return []
+
+    def apply_pending(self, pending_id: str) -> Dict[str, Any]:
+        """승인: 제안을 실제로 반영하고 대기 목록에서 지웁니다 (반영 실패 시 목록에 남김)."""
+        pending = self.list_pending()
+        record = next((p for p in pending if p.get("id") == pending_id), None)
+        if record is None:
+            return {"success": False, "error": f"No pending proposal '{pending_id}'."}
+        if record["action"] == "replace":
+            result = self.replace(record["target"], record["old_text"], record["content"])
+        elif record["action"] == "remove":
+            result = self.remove(record["target"], record["old_text"])
+        else:
+            result = {"success": False, "error": f"Unsupported pending action '{record['action']}'."}
+        if result.get("success"):
+            self._write_pending([p for p in pending if p.get("id") != pending_id])
+        return result
+
+    def discard_pending(self, pending_id: str) -> Dict[str, Any]:
+        """거절: 반영하지 않고 대기 목록에서 지웁니다."""
+        pending = self.list_pending()
+        remaining = [p for p in pending if p.get("id") != pending_id]
+        if len(remaining) == len(pending):
+            return {"success": False, "error": f"No pending proposal '{pending_id}'."}
+        self._write_pending(remaining)
+        return {"success": True, "message": f"Pending proposal '{pending_id}' discarded."}
+
+    def _write_pending(self, pending: List[Dict[str, Any]]) -> None:
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        path = self.memory_dir / PENDING_FILE
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
 
     # ── 시스템 프롬프트 인터페이스 ──
 

@@ -1,12 +1,11 @@
 """
 Claude Code 압축 파이프라인 (app/middleware/compaction/compactor.py) 테스트.
 
-단계별 단위 테스트 + create_agent 그래프 통합 테스트 + modules 사본 동기화 확인.
+단계별 단위 테스트 + create_agent 그래프 통합 테스트.
 """
 
 import asyncio
 import os
-import pathlib
 import time
 
 import pytest
@@ -40,8 +39,6 @@ from app.utils.message_markers import (
     is_compaction_summary,
     message_origin,
 )
-
-ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class ScriptedModel(GenericFakeChatModel):
@@ -291,6 +288,52 @@ def test_truncate_head_for_ptl_retry_keeps_pairs_and_marker():
     assert truncate_head_for_ptl_retry([HumanMessage(content="only")]) is None
 
 
+def _long_single_turn(rounds=6, size=400):
+    messages = [SystemMessage(content="System Rules"), HumanMessage(content="BIG-TASK request")]
+    for i in range(rounds):
+        messages += tool_round(f"c{i}", "bash_command", f"OUT-{i} " + "y" * size)
+    return messages
+
+
+def test_auto_compactor_summarizes_current_turn_without_prior_turns():
+    """원본 compactConversation처럼, 요약할 이전 턴이 없으면 현재 턴까지 요약합니다."""
+    llm = RecordingLLM()
+    compacted, ok = AutoCompactor(llm=llm, threshold_tokens=100).compact_if_needed(_long_single_turn())
+
+    assert ok and "BIG-TASK request" in llm.prompts[0] and "OUT-5" in llm.prompts[0]
+    assert isinstance(compacted[0], SystemMessage) and is_compaction_summary(compacted[1])
+    assert len(compacted) == 2, "남겨 두는 메시지가 없습니다"
+    assert "Recent messages are preserved verbatim." not in compacted[1].content
+
+
+def test_auto_compactor_includes_current_turn_when_it_alone_exceeds_threshold():
+    llm = RecordingLLM()
+    messages = _three_turns()[:-1] + _long_single_turn()[1:]
+    compacted, ok = AutoCompactor(llm=llm, threshold_tokens=100).compact_if_needed(messages)
+
+    assert ok and len(llm.prompts) == 1, "이전 턴 요약 뒤 곧바로 다시 요약하지 않고 한 번에 처리"
+    assert "Turn 1" in llm.prompts[0] and "BIG-TASK request" in llm.prompts[0]
+    assert len(compacted) == 2
+
+
+def test_middleware_compacts_long_single_turn_once(tmp_path):
+    compactor = create_compactor_middleware(llm=RecordingLLM(), threshold_tokens=100, swap_dir=str(tmp_path),
+                                            config={"micro": {"enabled": False}})
+    update = compactor.before_model({"messages": _long_single_turn()[1:]})
+    assert update is not None
+    state_after = update["messages"][1:]   # [0]은 RemoveMessage(REMOVE_ALL_MESSAGES)
+    assert is_compaction_summary(state_after[0])
+    assert compactor.before_model({"messages": state_after}) is None, "요약·복원 블록만 남으면 다시 압축하지 않습니다"
+
+
+def test_auto_compactor_empty_summary_is_a_failure():
+    """원본은 요약 텍스트가 없으면 오류로 처리합니다. 빈 요약으로 대화를 덮어쓰면 안 됩니다."""
+    compactor = AutoCompactor(llm=RecordingLLM(text=""), threshold_tokens=1)
+    messages = _three_turns()
+    result, ok = compactor.compact_if_needed(messages)
+    assert not ok and result == messages and compactor.consecutive_failures == 1
+
+
 def test_claude_code_threshold_formula():
     assert claude_code_autocompact_threshold(200_000) == 167_000   # 83.5%
 
@@ -304,6 +347,30 @@ def test_reactive_handle_overflow_drops_oldest_rounds():
     assert "Turn 1" not in contents and "Turn 4" in contents
     assert isinstance(sliced[0], SystemMessage)
     assert message_origin(sliced[1]) == ORIGIN_COMPACTION_MARKER
+
+
+def test_reactive_handle_overflow_keeps_current_request():
+    """한 요청으로 이어지는 긴 작업에서 앞부분을 잘라도 사용자 요청은 남습니다."""
+    sliced = ReactiveCompactor().handle_overflow(_long_single_turn(rounds=10))
+    contents = [str(m.content) for m in sliced]
+    assert message_origin(sliced[1]) == ORIGIN_COMPACTION_MARKER
+    assert contents[2] == "BIG-TASK request"
+    assert isinstance(sliced[3], AIMessage) and not any("OUT-0" in c for c in contents)
+
+
+def test_reactive_recover_summarizes_single_turn():
+    reactive = ReactiveCompactor(auto_compactor=AutoCompactor(llm=RecordingLLM(), threshold_tokens=10**9))
+    recovered = reactive.recover(_long_single_turn())
+    assert is_compaction_summary(recovered[1]) and len(recovered) == 2
+
+
+def test_model_fallback_propagates_same_overflow_errors_as_compactor():
+    from app.middleware.compaction.compactor import is_prompt_too_long_error
+    from app.middleware.error_control.self_recovery.model_fallback import _is_context_overflow
+
+    for text in ("Error code: 400 - {'error': {'message': 'prompt is too long: 215000 tokens > 200000 maximum'}}",
+                 "request too large", "context_length_exceeded"):
+        assert is_prompt_too_long_error(Exception(text)) and _is_context_overflow(Exception(text))
 
 
 def test_reactive_recover_prefers_summary():
@@ -443,13 +510,3 @@ def test_auto_compact_summary_is_not_streamed_to_user(tmp_path):
     assert any(is_compaction_summary(m) for m in agent.get_state(cfg).values["messages"]), "압축이 실제로 일어나야 함"
     assert "INTERNAL-SUMMARY" not in streamed
     assert "둘째 답변" in streamed
-
-
-# =============================================================================
-# 7. modules 사본 동기화
-# =============================================================================
-def test_modules_copy_matches_app_implementation():
-    app_src = (ROOT / "app/middleware/compaction/compactor.py").read_text(encoding="utf-8")
-    mod_src = (ROOT / "modules/claude_code/compactor.py").read_text(encoding="utf-8")
-    expected = app_src.replace("from app.utils.message_markers import (", "from .message_markers import (")
-    assert mod_src == expected, "modules/claude_code/compactor.py를 app 버전과 맞춰 주세요"

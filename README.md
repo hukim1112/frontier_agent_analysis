@@ -37,7 +37,8 @@ frontier_agent_analysis/
 │   │   ├── guardrails.py             #   │   └── InputSafety & TopicAlignment (before_agent + jump_to end)
 │   │   ├── memory/                   #   │   └── transcript_store.py, episodic_store.py, review_queue.py, semantic_store.py, memory_middleware.py,
 │   │                                 #   │       procedural_store.py, skill_tools.py, skill_review.py
-│   │   └── observability/            #   │   └── agent_log_tracer.py, visualizer.py
+│   │   ├── evaluator/                #   │   └── evaluator.py (LLM-as-a-Judge), eval_runner.py (노트북 시나리오 평가)
+│   │   └── observability/            #   │   └── agent_log_tracer.py, agent_tracer.py (노트북 실습용 트레이서), visualizer.py, viz.py
 │   ├── prompts/                      #   └── SUPERVISOR.py, CHATBOT.py, ANALYST.py, SCRAPER.py
 │   ├── tools/                        #   └── supervisor_tools.py, custom_tools.py, navigator.py, analyst.py
 │   ├── utils/                        #   └── context.py, database/, log_analyzer.py
@@ -45,15 +46,12 @@ frontier_agent_analysis/
 │   ├── chainlit_ui.py                #   └── Chainlit 대화형 채팅 UI (포트 8080)
 │   └── streamlit_ui.py               #   └── Streamlit 보조 UI
 │
-├── modules/                          # 🛠️ 실습 교안 전용 독립 모듈
-│   ├── claude_code/                  #   └── prompt_assembler, compactor, amnesia_guard, self_correction
-│   └── common/                       #   └── agent_tracer.py (토큰/지연시간 정밀 감사 트레이서)
-│
-├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (4종)
+├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (필수 4종 + 참고 1종)
 │   ├── 01_react_vs_frontier_agents.ipynb    # Step 1: ReAct vs 프론티어 에이전트 루프 & 관측성
 │   ├── 02_claude_code_harness.ipynb         # Step 2: 5계층 프롬프트, 5대 압축 파이프라인, Amnesia Guard
 │   ├── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리(transcript.db + episodic.db) 및 FTS5 인출
-│   └── 04_hermes_procedural_memory.ipynb    # Step 4: Procedural Memory — 스킬 학습 루프, 전이 실험, Curator
+│   ├── 04_hermes_procedural_memory.ipynb    # Step 4: Procedural Memory — 스킬 학습 루프, 전이 실험, Curator
+│   └── (optional)_agent_guardrails.ipynb    # (Optional) 도구 실행 직전 안전장치(ToolGuard) & 간접 인젝션 방어
 │
 ├── configs/                          # ⚙️ 런타임 제어 설정 파일
 │   ├── compaction.config             #   └── 압축 임계치 및 스왑 디렉터리 설정

@@ -15,7 +15,8 @@
 # ===============================================================================
 
 # --- Observability (H-04) ---
-from .observability.agent_log_tracer import AgentLogTracer, AgentTracer, LoggingMiddleware
+from .observability.agent_log_tracer import AgentLogTracer, LoggingMiddleware
+from .observability.agent_tracer import AgentTracer
 from .observability.visualizer import HierarchicalVisualizerMiddleware
 
 # --- Compaction (H-01, H-02) ---
