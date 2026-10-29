@@ -84,7 +84,7 @@ frontier_agent_analysis/
 
 ## 🚀 빠른 시작 (Quick Start)
 
-### 방법 A: GitHub Codespaces (권장: 설치 없이 1초 시작)
+### 방법 A: GitHub Codespaces (권장: 설치 없이 시작)
 1. GitHub 저장소 상단의 **`Code` -> `Codespaces` -> `Create codespace on main`** 클릭
 2. 사전 빌드된 Docker 이미지(`hukimartia/agent-lab:latest`) 기반으로 Python, Playwright, noVNC, Chainlit 환경이 자동 구성됩니다.
 3. 생성된 `.env` 파일에 발급받으신 LLM API Key(`OPENAI_API_KEY` 또는 `GOOGLE_API_KEY`)를 입력하면 즉시 준비 완료!
