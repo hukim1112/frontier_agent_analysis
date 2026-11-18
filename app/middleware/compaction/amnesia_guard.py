@@ -39,9 +39,9 @@ DEFAULT_SESSION_KEY = "default"
 
 # 도구 인자 중 파일 경로로 간주할 키 (file_read/file_writer/file_edit → file_path, notebook_edit → notebook_path)
 FILE_PATH_ARG_KEYS = ("file_path", "path", "filename", "file", "notebook_path")
-# 활성 계획을 등록/갱신하는 도구 (프로젝트 실제 도구: enter_plan(plan_name, steps))
+# 활성 계획을 등록/갱신하는 도구 (신규: exit_plan(plan_name, steps) / 레거시: enter_plan(plan_name, steps))
 PLAN_SET_TOOLS = {"enter_plan", "update_plan", "create_plan", "set_plan"}
-# 활성 계획을 종료하는 도구 (프로젝트 실제 도구: exit_plan(plan_name, status))
+# 활성 계획을 종료하는 도구 (steps 없이 exit_plan(plan_name) 호출 시 해제)
 PLAN_CLEAR_TOOLS = {"exit_plan"}
 PLAN_ARG_KEYS = ("steps", "plan", "content", "text")
 
@@ -220,6 +220,20 @@ class AmnesiaGuardMiddleware(AgentMiddleware):
 
     # ── Tool call interception ──
 
+    def _format_plan_text(self, args: dict) -> Optional[str]:
+        """Extract formatted plan text from tool args if non-empty."""
+        for key in PLAN_ARG_KEYS:
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                body = val
+            elif isinstance(val, list) and any(str(step).strip() for step in val):
+                body = "\n".join(f"{i}. {step}" for i, step in enumerate(val, 1))
+            else:
+                continue
+            plan_name = args.get("plan_name")
+            return f"[{plan_name}]\n{body}" if isinstance(plan_name, str) and plan_name else body
+        return None
+
     def _track_tool_request(self, request) -> None:
         tool_call = getattr(request, "tool_call", None) or {}
         tool_name = tool_call.get("name", "")
@@ -234,18 +248,18 @@ class AmnesiaGuardMiddleware(AgentMiddleware):
             if key in args and isinstance(args[key], str):
                 self.track_file_access(args[key], session_key=session_key)
 
-        if tool_name in PLAN_SET_TOOLS:
-            for key in PLAN_ARG_KEYS:
-                val = args.get(key)
-                if isinstance(val, (str, list)) and val:
-                    plan_name = args.get("plan_name")
-                    if isinstance(val, list):
-                        body = "\n".join(f"{i}. {step}" for i, step in enumerate(val, 1))
-                    else:
-                        body = val
-                    plan_text = f"[{plan_name}]\n{body}" if isinstance(plan_name, str) and plan_name else body
-                    self.set_active_plan(plan_text, session_key=session_key)
-                    break
+        if tool_name == "exit_plan":
+            plan_text = self._format_plan_text(args)
+            if plan_text is not None:
+                self.set_active_plan(plan_text, session_key=session_key)
+            else:
+                self.clear_active_plan(session_key=session_key)
+        elif tool_name in PLAN_SET_TOOLS:
+            plan_text = self._format_plan_text(args)
+            if plan_text is not None:
+                self.set_active_plan(plan_text, session_key=session_key)
+            elif tool_name == "enter_plan" and args.get("intent") == "new":
+                self.clear_active_plan(session_key=session_key)
         elif tool_name in PLAN_CLEAR_TOOLS:
             self.clear_active_plan(session_key=session_key)
 

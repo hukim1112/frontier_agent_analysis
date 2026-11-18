@@ -221,6 +221,42 @@ def test_amnesia_guard_exit_plan_clears_active_plan(Guard):
 
 
 @pytest.mark.parametrize("Guard", GUARD_IMPLS)
+def test_amnesia_guard_claude_code_plan_mode_lifecycle(Guard):
+    """신규 enter_plan(intent='new') → exit_plan(plan_name, steps) 생명주기와 호환되는지 검증."""
+    from langchain_core.tools import tool as lc_tool
+
+    @lc_tool("enter_plan")
+    def enter_plan_v2(intent: str = "new", goal: str = "", plan_name: str = "") -> str:
+        """Enter Claude Code style plan mode."""
+        return "planning"
+
+    @lc_tool("exit_plan")
+    def exit_plan_v2(plan_name: str, steps: list[str]) -> str:
+        """Finalize plan steps and enter EXECUTING."""
+        return "executing"
+
+    guard = Guard()
+    cfg = {"configurable": {"thread_id": "t-v2"}}
+
+    agent_step1 = create_agent(
+        model=scripted(_tool_call_msg("exit_plan", {"plan_name": "Phase 1", "steps": ["Step 1", "Step 2"]}, "c1"), "ok"),
+        tools=[enter_plan_v2, exit_plan_v2],
+        middleware=[guard],
+    )
+    agent_step1.invoke({"messages": [HumanMessage(content="plan")]}, config=cfg)
+    rec = guard.create_recovery_attachments(session_key="t-v2")[0].content
+    assert "[Phase 1]" in rec and "1. Step 1" in rec and "2. Step 2" in rec
+
+    agent_step2 = create_agent(
+        model=scripted(_tool_call_msg("enter_plan", {"intent": "new", "goal": "Reset"}, "c2"), "ok"),
+        tools=[enter_plan_v2, exit_plan_v2],
+        middleware=[guard],
+    )
+    agent_step2.invoke({"messages": [HumanMessage(content="new plan")]}, config=cfg)
+    assert guard.create_recovery_attachments(session_key="t-v2") == []
+
+
+@pytest.mark.parametrize("Guard", GUARD_IMPLS)
 def test_amnesia_guard_direct_calls_use_default_bucket(Guard):
     """노트북처럼 그래프 밖에서 직접 호출하면 기존과 동일하게 동작해야 합니다 (하위 호환)."""
     guard = Guard(max_restore_files=2)

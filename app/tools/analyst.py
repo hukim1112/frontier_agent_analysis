@@ -16,12 +16,79 @@ html_report     : 인터랙티브 HTML 대시보드 생성
 
 import os
 import json
-import time
+import inspect
+import builtins as _py_builtins
 import traceback
 from pathlib import Path
 from typing import Optional
-from langchain_core.tools import tool
+from langchain_core.tools import ToolException, tool
 from pydantic import BaseModel, Field
+
+
+def _format_validation_error(error: Exception) -> str:
+    """Pydantic 인자 검증 오류를 에이전트가 수정할 수 있는 안내 문자열로 포맷팅합니다."""
+    details: list[str] = []
+    errors_fn = getattr(error, "errors", None)
+    if callable(errors_fn):
+        try:
+            for item in errors_fn():
+                loc = ".".join(str(p) for p in item.get("loc", ())) or "(root)"
+                details.append(f"- `{loc}`: {item.get('msg', 'invalid value')}")
+        except Exception:
+            details = []
+    if not details:
+        details = [f"- {error}"]
+    return (
+        "[Error] 도구 인자 검증 실패:\n"
+        + "\n".join(details)
+        + "\n→ 도구 스키마의 파라미터 이름과 타입을 확인한 뒤 다시 호출하세요."
+    )
+
+
+_ANALYST_SAFE_IMPORT_ROOTS = frozenset({
+    "json", "math", "datetime", "collections", "re", "statistics",
+    "itertools", "functools", "pathlib", "platform", "decimal",
+    "fractions", "typing", "textwrap", "io", "csv",
+    "pandas", "numpy", "matplotlib", "plotly", "seaborn", "openpyxl", "scipy",
+})
+
+
+def _make_safe_builtins(allow_open: bool = False) -> dict:
+    """Analyst 코드 실행용 안전 내장 함수 딕셔너리(허용 패키지 import 포함)를 반환합니다."""
+    def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root = (name or "").split(".")[0]
+        if root in _ANALYST_SAFE_IMPORT_ROOTS:
+            return _py_builtins.__import__(name, globals, locals, fromlist, level)
+        raise ImportError(
+            f"모듈 '{name}'은 보안상 import할 수 없습니다. 허용 패키지: {sorted(_ANALYST_SAFE_IMPORT_ROOTS)}"
+        )
+
+    safe_builtins = {
+        "len": len, "range": range, "enumerate": enumerate, "zip": zip,
+        "sorted": sorted, "reversed": reversed, "list": list, "dict": dict,
+        "set": set, "tuple": tuple, "str": str, "int": int, "float": float,
+        "bool": bool, "min": min, "max": max, "sum": sum, "abs": abs,
+        "round": round, "any": any, "all": all, "isinstance": isinstance,
+        "type": type, "getattr": getattr, "hasattr": hasattr, "print": print,
+        "repr": repr, "format": format, "map": map, "filter": filter,
+        "Exception": Exception, "ValueError": ValueError, "KeyError": KeyError,
+        "TypeError": TypeError, "IndexError": IndexError, "ZeroDivisionError": ZeroDivisionError,
+        "True": True, "False": False, "None": None,
+        "__import__": _safe_import,
+    }
+    if allow_open:
+        safe_builtins["open"] = open
+    return safe_builtins
+
+
+def _df_columns_hint(df) -> str:
+    """DataFrame 컬럼명·타입 목록 복구 힌트를 반환합니다."""
+    try:
+        cols = [f"{c} ({df[c].dtype})" for c in list(df.columns)[:30]]
+        more = f" 외 {len(df.columns) - 30}개" if len(df.columns) > 30 else ""
+        return f"\n💡 사용 가능한 df 컬럼 ({len(df.columns)}개): [{', '.join(cols)}{more}]"
+    except Exception:
+        return ""
 
 
 # =============================================================================
@@ -90,19 +157,12 @@ class DataProfilerInput(BaseModel):
 
 @tool(args_schema=DataProfilerInput)
 def data_profiler(file_path: str, sample_rows: int = 10) -> str:
-    """데이터 파일을 읽어 자동으로 종합 통계 프로파일을 생성합니다.
+    """데이터 파일을 읽어 마크다운 형식의 종합 통계 프로파일을 생성합니다.
 
     스키마(컬럼명·타입), 행 수, 기술 통계, 결측값 비율, 범주형 최빈값, 샘플 데이터를 한 번에 반환합니다.
     지원 형식: JSON, CSV, TSV, Excel (.xlsx/.xls), Parquet, JSONL
 
     ⚠️ 상세 분석 패턴이 필요하면: file_read('app/agents/analyst/skills/data_analysis.md')
-
-    Args:
-        file_path: 분석할 데이터 파일 경로.
-        sample_rows: 미리보기로 표시할 행 수. 기본값 10.
-
-    Returns:
-        마크다운 형식의 종합 통계 프로파일 문자열.
     """
     try:
         import pandas as pd
@@ -169,8 +229,12 @@ def data_profiler(file_path: str, sample_rows: int = 10) -> str:
 
         return _truncate("\n\n".join(sections))
 
+    except ToolException:
+        raise
     except Exception as e:
-        return f"DataProfiler 오류: {type(e).__name__}: {str(e)}\n{traceback.format_exc()[-400:]}"
+        raise ToolException(
+            f"DataProfiler 오류: {type(e).__name__}: {str(e)}\n{traceback.format_exc()[-400:]}"
+        ) from e
 
 
 # =============================================================================
@@ -184,7 +248,7 @@ class DataQueryInput(BaseModel):
 
 @tool(args_schema=DataQueryInput)
 def data_query(file_path: str, query_code: str, output_format: str = "table") -> str:
-    """데이터 파일을 로드한 뒤 pandas 코드를 실행하여 분석 결과를 반환합니다.
+    """데이터 파일을 로드한 뒤 pandas 코드를 실행하여 분석 결과를 지정 포맷(table/json/stats)으로 반환합니다.
 
     변수 'df'로 DataFrame에 접근하고, 'result' 변수에 결과를 저장하세요.
     result를 명시하지 않으면 마지막 표현식의 결과를 반환합니다.
@@ -194,35 +258,20 @@ def data_query(file_path: str, query_code: str, output_format: str = "table") ->
       "result = df[df['price'] > 100000].sort_values('price', ascending=False)"
 
     ⚠️ 분석 패턴 참조: file_read('app/agents/analyst/skills/data_analysis.md')
-
-    Args:
-        file_path: 데이터 파일 경로.
-        query_code: 실행할 pandas 코드 문자열.
-        output_format: 'table', 'json', 'stats' 중 하나.
-
-    Returns:
-        분석 결과 문자열 (지정 포맷).
     """
     try:
         import pandas as pd
         import numpy as np
         df = _load_dataframe(file_path)
     except Exception as e:
-        return f"DataQuery 로드 오류: {str(e)}"
+        raise ToolException(f"DataQuery 로드 오류: {str(e)}") from e
 
     # 안전한 실행 네임스페이스
     exec_globals = {
-        '__builtins__': {
-            'len': len, 'range': range, 'enumerate': enumerate, 'zip': zip,
-            'sorted': sorted, 'reversed': reversed, 'list': list, 'dict': dict,
-            'set': set, 'tuple': tuple, 'str': str, 'int': int, 'float': float,
-            'bool': bool, 'min': min, 'max': max, 'sum': sum, 'abs': abs,
-            'round': round, 'isinstance': isinstance, 'type': type, 'print': print,
-            'True': True, 'False': False, 'None': None,
-        },
-        'pd': pd,
-        'np': np,
-        'df': df,
+        "__builtins__": _make_safe_builtins(allow_open=False),
+        "pd": pd,
+        "np": np,
+        "df": df,
     }
     exec_locals = {}
 
@@ -255,8 +304,13 @@ def data_query(file_path: str, query_code: str, output_format: str = "table") ->
         else:
             return _truncate(str(result))
 
+    except ToolException:
+        raise
     except Exception as e:
-        return f"DataQuery 실행 오류: {type(e).__name__}: {str(e)}\n{traceback.format_exc()[-500:]}"
+        raise ToolException(
+            f"DataQuery 실행 오류: {type(e).__name__}: {str(e)}"
+            f"{_df_columns_hint(df)}\n{traceback.format_exc()[-500:]}"
+        ) from e
 
 
 # =============================================================================
@@ -270,9 +324,8 @@ class ChartGeneratorInput(BaseModel):
 
 @tool(args_schema=ChartGeneratorInput)
 def chart_generator(file_path: str, chart_code: str, output_path: str) -> str:
-    """데이터 파일에서 전문적인 차트를 생성하여 이미지/HTML로 저장합니다.
+    """데이터 파일에서 matplotlib(PNG) 또는 plotly(HTML) 차트를 생성해 저장 경로와 메타 정보를 반환합니다.
 
-    matplotlib (PNG 이미지) 또는 plotly (HTML 인터랙티브) 차트를 생성합니다.
     코드에서 'df'로 DataFrame에 접근하고, 'fig'에 Figure를 저장하세요.
 
     matplotlib 예시:
@@ -285,31 +338,23 @@ def chart_generator(file_path: str, chart_code: str, output_path: str) -> str:
       fig = px.bar(df, x='category', y='value', title='비교')
 
     ⚠️ 차트 패턴 참조: file_read('app/agents/analyst/skills/chart_patterns.md')
-
-    Args:
-        file_path: 데이터 파일 경로.
-        chart_code: matplotlib/plotly 차트 생성 코드.
-        output_path: 저장 경로 (.png 또는 .html).
-
-    Returns:
-        생성된 차트 파일 경로와 메타 정보.
     """
     try:
         import pandas as pd
         import numpy as np
         df = _load_dataframe(file_path)
     except Exception as e:
-        return f"ChartGenerator 로드 오류: {str(e)}"
+        raise ToolException(f"ChartGenerator 로드 오류: {str(e)}") from e
 
     abs_output = os.path.abspath(os.path.expanduser(output_path))
     os.makedirs(os.path.dirname(abs_output), exist_ok=True)
     ext = Path(abs_output).suffix.lower()
 
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
 
+    try:
         # 한국어 폰트 설정 (크로스 플랫폼)
         import platform
         if platform.system() == 'Windows':
@@ -328,18 +373,12 @@ def chart_generator(file_path: str, chart_code: str, output_path: str) -> str:
         plt.rcParams['figure.dpi'] = 150
 
         exec_globals = {
-            '__builtins__': {
-                'len': len, 'range': range, 'enumerate': enumerate, 'zip': zip,
-                'sorted': sorted, 'list': list, 'dict': dict, 'str': str,
-                'int': int, 'float': float, 'min': min, 'max': max,
-                'sum': sum, 'abs': abs, 'round': round, 'print': print,
-                'True': True, 'False': False, 'None': None,
-            },
-            'pd': pd,
-            'np': np,
-            'df': df,
-            'plt': plt,
-            'matplotlib': matplotlib,
+            "__builtins__": _make_safe_builtins(allow_open=False),
+            "pd": pd,
+            "np": np,
+            "df": df,
+            "plt": plt,
+            "matplotlib": matplotlib,
         }
 
         # plotly 사용 가능 시 추가
@@ -367,7 +406,7 @@ def chart_generator(file_path: str, chart_code: str, output_path: str) -> str:
             # plt.gcf() 시도
             fig = plt.gcf()
             if not fig.axes:
-                return "ChartGenerator 오류: 'fig' 변수에 Figure를 저장하거나, plt 함수로 차트를 생성하세요."
+                raise ToolException("ChartGenerator 오류: 'fig' 변수에 Figure를 저장하거나, plt 함수로 차트를 생성하세요.")
 
         # 저장
         if ext == '.html':
@@ -375,7 +414,7 @@ def chart_generator(file_path: str, chart_code: str, output_path: str) -> str:
             if hasattr(fig, 'write_html'):
                 fig.write_html(abs_output, include_plotlyjs='cdn')
             else:
-                return "ChartGenerator 오류: .html 출력에는 plotly Figure가 필요합니다."
+                raise ToolException("ChartGenerator 오류: .html 출력에는 plotly Figure가 필요합니다.")
         else:
             # matplotlib Figure
             if hasattr(fig, 'savefig'):
@@ -384,7 +423,6 @@ def chart_generator(file_path: str, chart_code: str, output_path: str) -> str:
             else:
                 plt.savefig(abs_output, dpi=150, bbox_inches='tight',
                             facecolor='white', edgecolor='none')
-        plt.close('all')
 
         file_size = os.path.getsize(abs_output)
         return (
@@ -395,9 +433,15 @@ def chart_generator(file_path: str, chart_code: str, output_path: str) -> str:
             f"- **데이터**: {len(df)}행 from `{file_path}`"
         )
 
+    except ToolException:
+        raise
     except Exception as e:
+        raise ToolException(
+            f"ChartGenerator 실행 오류: {type(e).__name__}: {str(e)}"
+            f"{_df_columns_hint(df)}\n{traceback.format_exc()[-500:]}"
+        ) from e
+    finally:
         plt.close('all')
-        return f"ChartGenerator 실행 오류: {type(e).__name__}: {str(e)}\n{traceback.format_exc()[-500:]}"
 
 
 # =============================================================================
@@ -411,24 +455,14 @@ class FileConverterInput(BaseModel):
 
 @tool(args_schema=FileConverterInput)
 def file_converter(input_path: str, output_path: str, sheet_name: str = "Sheet1") -> str:
-    """데이터 파일을 다른 포맷으로 변환합니다.
+    """데이터 파일을 다른 포맷(CSV ↔ JSON ↔ Excel ↔ Parquet ↔ TSV ↔ JSONL)으로 변환합니다.
 
-    지원 형식: CSV ↔ JSON ↔ Excel (.xlsx) ↔ Parquet ↔ TSV ↔ JSONL
-    확장자를 기준으로 입출력 형식을 자동 감지합니다.
-
-    Args:
-        input_path: 입력 파일 경로.
-        output_path: 출력 파일 경로 (확장자로 형식 결정).
-        sheet_name: Excel 출력 시 시트 이름.
-
-    Returns:
-        변환 결과 메시지 (행 수, 파일 크기).
+    확장자를 기준으로 입출력 형식을 자동 감지하며 변환된 행 수와 파일 크기를 반환합니다.
     """
     try:
-        import pandas as pd
         df = _load_dataframe(input_path)
     except Exception as e:
-        return f"FileConverter 로드 오류: {str(e)}"
+        raise ToolException(f"FileConverter 로드 오류: {str(e)}") from e
 
     abs_output = os.path.abspath(os.path.expanduser(output_path))
     os.makedirs(os.path.dirname(abs_output), exist_ok=True)
@@ -448,7 +482,7 @@ def file_converter(input_path: str, output_path: str, sheet_name: str = "Sheet1"
         elif ext == '.parquet':
             df.to_parquet(abs_output, engine='pyarrow', compression='snappy')
         else:
-            return f"FileConverter 오류: 지원하지 않는 출력 형식 '{ext}'"
+            raise ToolException(f"FileConverter 오류: 지원하지 않는 출력 형식 '{ext}'")
 
         file_size = os.path.getsize(abs_output)
         input_ext = Path(input_path).suffix.upper()
@@ -461,8 +495,10 @@ def file_converter(input_path: str, output_path: str, sheet_name: str = "Sheet1"
             f"- **크기**: {file_size/1024:.1f} KB"
         )
 
+    except ToolException:
+        raise
     except Exception as e:
-        return f"FileConverter 저장 오류: {type(e).__name__}: {str(e)}"
+        raise ToolException(f"FileConverter 저장 오류: {type(e).__name__}: {str(e)}") from e
 
 
 # =============================================================================
@@ -476,30 +512,21 @@ class ExcelWriterInput(BaseModel):
 
 @tool(args_schema=ExcelWriterInput)
 def excel_writer(data_source: str, output_path: str, excel_code: str) -> str:
-    """전문적인 수식·서식이 포함된 Excel 보고서를 생성합니다.
+    """수식·조건부 서식·차트가 포함된 Excel 보고서(.xlsx)를 생성하고 경로와 메타 정보를 반환합니다.
 
-    openpyxl을 사용하여 수식, 조건부 서식, 차트가 포함된 프로페셔널 Excel을 생성합니다.
     코드에서 'df'로 원본 데이터, 'wb'(Workbook)와 'ws'(active sheet)로 워크북에 접근합니다.
 
     ⚠️ 핵심 규칙:
     - 수식 사용 필수, 하드코딩 금지 (=SUM(B2:B9), not Python 계산값)
     - XLOOKUP/XMATCH 사용 금지 → INDEX/MATCH 사용
     - 상세 가이드: file_read('app/agents/analyst/skills/xlsx_guide.md')
-
-    Args:
-        data_source: 원본 데이터 파일 경로.
-        output_path: 출력 .xlsx 파일 경로.
-        excel_code: openpyxl 기반 Excel 생성 코드.
-
-    Returns:
-        생성된 Excel 파일 경로와 메타 정보.
     """
     try:
         import pandas as pd
         import numpy as np
         df = _load_dataframe(data_source)
     except Exception as e:
-        return f"ExcelWriter 로드 오류: {str(e)}"
+        raise ToolException(f"ExcelWriter 로드 오류: {str(e)}") from e
 
     abs_output = os.path.abspath(os.path.expanduser(output_path))
     os.makedirs(os.path.dirname(abs_output), exist_ok=True)
@@ -514,20 +541,14 @@ def excel_writer(data_source: str, output_path: str, excel_code: str) -> str:
         ws = wb.active
 
         exec_globals = {
-            '__builtins__': {
-                'len': len, 'range': range, 'enumerate': enumerate, 'zip': zip,
-                'sorted': sorted, 'list': list, 'dict': dict, 'str': str,
-                'int': int, 'float': float, 'min': min, 'max': max,
-                'sum': sum, 'abs': abs, 'round': round, 'print': print,
-                'True': True, 'False': False, 'None': None,
-            },
-            'pd': pd, 'np': np, 'df': df,
-            'wb': wb, 'ws': ws,
-            'Workbook': Workbook,
-            'Font': Font, 'PatternFill': PatternFill, 'Alignment': Alignment,
-            'Border': Border, 'Side': Side, 'numbers': numbers,
-            'BarChart': BarChart, 'LineChart': LineChart, 'PieChart': PieChart,
-            'Reference': Reference, 'get_column_letter': get_column_letter,
+            "__builtins__": _make_safe_builtins(allow_open=False),
+            "pd": pd, "np": np, "df": df,
+            "wb": wb, "ws": ws,
+            "Workbook": Workbook,
+            "Font": Font, "PatternFill": PatternFill, "Alignment": Alignment,
+            "Border": Border, "Side": Side, "numbers": numbers,
+            "BarChart": BarChart, "LineChart": LineChart, "PieChart": PieChart,
+            "Reference": Reference, "get_column_letter": get_column_letter,
         }
 
         exec(excel_code, exec_globals, {})
@@ -544,8 +565,13 @@ def excel_writer(data_source: str, output_path: str, excel_code: str) -> str:
             f"- **데이터**: {len(df)}행 from `{data_source}`"
         )
 
+    except ToolException:
+        raise
     except Exception as e:
-        return f"ExcelWriter 실행 오류: {type(e).__name__}: {str(e)}\n{traceback.format_exc()[-500:]}"
+        raise ToolException(
+            f"ExcelWriter 실행 오류: {type(e).__name__}: {str(e)}"
+            f"{_df_columns_hint(df)}\n{traceback.format_exc()[-500:]}"
+        ) from e
 
 
 # =============================================================================
@@ -559,21 +585,12 @@ class HtmlReportInput(BaseModel):
 
 @tool(args_schema=HtmlReportInput)
 def html_report(report_code: str, output_path: str, title: str = "분석 보고서") -> str:
-    """분석 결과를 종합한 인터랙티브 HTML 대시보드를 생성합니다.
+    """분석 결과를 종합한 인터랙티브 HTML 대시보드를 생성하고 저장 경로와 메타 정보를 반환합니다.
 
     Chart.js, Mermaid CDN을 포함한 단일 HTML 파일을 생성합니다.
-    코드에서 'html_content' 변수에 최종 HTML 문자열을 저장하세요.
-    'title' 변수로 보고서 제목에 접근 가능합니다.
+    코드에서 'html_content' 변수에 최종 HTML 문자열을 저장하고 'title' 변수로 제목에 접근하세요.
 
     ⚠️ 디자인 가이드: file_read('app/agents/analyst/skills/design_tokens.md')
-
-    Args:
-        report_code: HTML 생성 Python 코드.
-        output_path: 출력 HTML 파일 경로.
-        title: 보고서 제목.
-
-    Returns:
-        생성된 HTML 파일 경로와 메타 정보.
     """
     abs_output = os.path.abspath(os.path.expanduser(output_path))
     os.makedirs(os.path.dirname(abs_output), exist_ok=True)
@@ -582,33 +599,15 @@ def html_report(report_code: str, output_path: str, title: str = "분석 보고�
         import pandas as pd
         import numpy as np
 
-        # import 허용 모듈 제한
-        _ALLOWED_MODULES = {'json', 'math', 'datetime', 'collections', 're', 'statistics'}
-        _original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
-
-        def _safe_import(name, *args, **kwargs):
-            if name in _ALLOWED_MODULES:
-                return _original_import(name, *args, **kwargs)
-            raise ImportError(f"모듈 '{name}'은 보안상 import할 수 없습니다. 허용: {_ALLOWED_MODULES}")
-
         exec_globals = {
-            '__builtins__': {
-                'len': len, 'range': range, 'enumerate': enumerate, 'zip': zip,
-                'sorted': sorted, 'reversed': reversed, 'list': list, 'dict': dict,
-                'set': set, 'tuple': tuple, 'str': str, 'int': int, 'float': float,
-                'bool': bool, 'min': min, 'max': max, 'sum': sum, 'abs': abs,
-                'round': round, 'isinstance': isinstance, 'type': type, 'print': print,
-                'True': True, 'False': False, 'None': None,
-                'open': open,
-                '__import__': _safe_import,
-            },
-            'pd': pd,
-            'np': np,
-            'json': json,
-            'title': title,
-            'Path': Path,
-            'os': os,
-            '_load_dataframe': _load_dataframe,
+            "__builtins__": _make_safe_builtins(allow_open=True),
+            "pd": pd,
+            "np": np,
+            "json": json,
+            "title": title,
+            "Path": Path,
+            "os": os,
+            "_load_dataframe": _load_dataframe,
         }
         exec_locals = {}
 
@@ -616,7 +615,7 @@ def html_report(report_code: str, output_path: str, title: str = "분석 보고�
 
         html_content = exec_locals.get('html_content', None)
         if html_content is None:
-            return "HtmlReport 오류: 'html_content' 변수에 HTML 문자열을 저장하세요."
+            raise ToolException("HtmlReport 오류: 'html_content' 변수에 HTML 문자열을 저장하세요.")
 
         with open(abs_output, 'w', encoding='utf-8') as f:
             f.write(html_content)
@@ -630,5 +629,29 @@ def html_report(report_code: str, output_path: str, title: str = "분석 보고�
             f"브라우저에서 열거나 Chainlit에서 cl.File()로 공유하세요."
         )
 
+    except ToolException:
+        raise
     except Exception as e:
-        return f"HtmlReport 실행 오류: {type(e).__name__}: {str(e)}\n{traceback.format_exc()[-500:]}"
+        raise ToolException(
+            f"HtmlReport 실행 오류: {type(e).__name__}: {str(e)}\n{traceback.format_exc()[-500:]}"
+        ) from e
+
+
+def _finalize_analyst_tool(t):
+    """Analyst 도구 공통 메타데이터(docstring 정제, 에러 핸들링)를 일관 적용합니다."""
+    if getattr(t, "description", None):
+        t.description = inspect.cleandoc(t.description)
+    t.handle_tool_error = True
+    t.handle_validation_error = _format_validation_error
+    return t
+
+
+for _analyst_tool in (
+    data_profiler,
+    data_query,
+    chart_generator,
+    file_converter,
+    excel_writer,
+    html_report,
+):
+    _finalize_analyst_tool(_analyst_tool)

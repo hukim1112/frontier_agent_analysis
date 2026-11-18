@@ -25,6 +25,7 @@ PlaywrightManager 싱글턴(CDP 공유) + 6개 도구:
 import os
 import re
 import json
+import inspect
 import asyncio
 import shutil
 import tempfile
@@ -35,12 +36,22 @@ from contextvars import ContextVar
 from functools import wraps
 from urllib.parse import urlsplit
 from datetime import datetime
-from typing import Optional
+from typing import Annotated, Any, Optional, Tuple
 
 from bs4 import BeautifulSoup, Tag
 from langchain_core.runnables.config import var_child_runnable_config
-from langchain_core.tools import tool
-from pydantic import BaseModel, Field
+from langchain_core.tools import ToolException, tool
+from pydantic import BaseModel, BeforeValidator, Field
+
+
+def _coerce_json_string(value: Any) -> Any:
+    """네이티브 dict/list 인자가 전달되면 JSON 문자열로 자동 변환합니다 (Pokayoke)."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+JsonStringParam = Annotated[str, BeforeValidator(_coerce_json_string)]
 
 
 # 현재 실행 중인 스크래퍼/에이전트 세션(thread_id) 및 멀티탭(tab_id) 식별자 ContextVar
@@ -125,11 +136,27 @@ COOKIE_BANNER_SELECTORS = [
     '[data-testid="cookie-accept"]',
 ]
 
-# 에러 페이지 감지 시그널 (AAWS get_page_structure 로직 이관)
-ERROR_PAGE_SIGNALS = [
-    "페이지를 찾을 수 없습니다", "404", "not found", "page not found",
-    "오류가 발생", "error", "접근이 거부", "403 forbidden", "서비스 점검",
-]
+# 에러 페이지 감지 시그널 (문맥 기반 판별용 강한 오류 구문)
+STRONG_ERROR_SIGNALS = (
+    "페이지를 찾을 수 없습니다",
+    "page not found",
+    "404 not found",
+    "403 forbidden",
+    "access denied",
+    "접근이 거부",
+    "서비스 점검 중",
+    "502 bad gateway",
+    "503 service unavailable",
+)
+# 단문(< 1000자) 전면 차단 인터스티셜 전용 시그널 (일반 reCAPTCHA/로그인 문구 오탐 배제)
+ANTI_BOT_SIGNALS = (
+    "verify you are human",
+    "checking if the site connection is secure",
+    "attention required! | cloudflare",
+    "429 too many requests",
+    "비정상적인 접근이 감지되어",
+)
+ERROR_PAGE_SIGNALS = list(STRONG_ERROR_SIGNALS)
 
 # 스크린샷 저장 기본 디렉토리
 SCREENSHOT_DIR = "./artifacts/screenshots"
@@ -554,17 +581,24 @@ class PlaywrightManager:
                         finally:
                             self._suppress_page_event = False
                     self._remember_page(page, session_id=session_id, tab_id=tab_id)
+        clean_url = url.strip() if isinstance(url, str) else ""
+        if clean_url and not clean_url.lower().startswith(("http://", "https://", "about:", "file:", "data:")):
+            raise ValueError(
+                f"잘못된 URL 형식입니다 ('{clean_url}'): 'http://' 또는 'https://'를 포함한 전체 URL을 입력하세요."
+            )
+        safe_wait_ms = min(30000, max(0, int(wait_ms or 0)))
+
         page = self._pages_by_session.get(slot)
         self._watch_context(page.context)
         navigated = False
-        if url and not self._same_url(url, page.url):
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if clean_url and not self._same_url(clean_url, page.url):
+            await page.goto(clean_url, wait_until="domcontentloaded", timeout=30000)
             navigated = True
         elif reload:
             await page.reload(wait_until="domcontentloaded", timeout=30000)
             navigated = True
-        if wait_ms:
-            await page.wait_for_timeout(wait_ms)
+        if safe_wait_ms:
+            await page.wait_for_timeout(safe_wait_ms)
         if navigated:
             await self._dismiss_cookie_banner(page)
         if page is self._pages_by_session.get(slot):
@@ -599,10 +633,16 @@ class PlaywrightManager:
         self._session_locks.clear()
         self._watched_contexts.clear()
         if self._browser:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
             self._browser = None
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
             self._playwright = None
         # Chrome subprocess 정리
         if self._chrome_process:
@@ -633,7 +673,7 @@ def _shared_browser_tool(function):
         try:
             manager = await PlaywrightManager.get_instance()
         except Exception as exc:
-            return f"[Error] 브라우저 준비 실패: {exc}"
+            raise ToolException(f"[Error] 브라우저 준비 실패: {exc}") from exc
         sid = _current_browser_session_id()
         tid = _current_browser_tab_id(kwargs.get("tab_id"))
         tok_s = _browser_session_var.set(sid)
@@ -648,21 +688,183 @@ def _shared_browser_tool(function):
     return wrapped
 
 
-def _detect_error_page(page_text: str, page_title: str = "") -> Optional[str]:
-    """에러 페이지를 조기 감지합니다 (AAWS get_page_structure 로직 이관).
-    
-    Returns:
-        에러 메시지 문자열 (에러 아니면 None)
-    """
-    text_sample = page_text[:500].lower()
-    detected = [sig for sig in ERROR_PAGE_SIGNALS if sig in text_sample]
-    if detected:
-        return (
-            f"[Error] 에러 페이지 감지: {', '.join(detected)}. "
-            f"페이지 제목: '{page_title}'. "
-            f"→ URL이 올바른지 확인하세요."
+def _format_validation_error(error: Exception) -> str:
+    """Pydantic 인자 검증 오류를 에이전트가 수정할 수 있는 안내 문자열로 포맷팅합니다."""
+    details: list[str] = []
+    errors_fn = getattr(error, "errors", None)
+    if callable(errors_fn):
+        try:
+            for item in errors_fn():
+                loc = ".".join(str(p) for p in item.get("loc", ())) or "(root)"
+                details.append(f"- `{loc}`: {item.get('msg', 'invalid value')}")
+        except Exception:
+            details = []
+    if not details:
+        details = [f"- {error}"]
+    return (
+        "[Error] 도구 인자 검증 실패:\n"
+        + "\n".join(details)
+        + "\n→ 도구 스키마의 파라미터 이름과 타입을 확인한 뒤 다시 호출하세요."
+    )
+
+
+def _selector_error_hint(selector: str, exc: Exception) -> str:
+    """CSS/Playwright 셀렉터 오류 유형별 수정 힌트를 반환합니다."""
+    hints: list[str] = []
+    sel = selector or ""
+    if re.search(r"#\d", sel):
+        hints.append(
+            "힌트: 숫자로 시작하는 HTML id는 CSS에서 '#123' 대신 '[id=\"123\"]' 형식으로 작성해야 합니다."
         )
+    if ":contains(" in sel:
+        hints.append(
+            "힌트: ':contains()' 대신 Playwright의 ':has-text(\"텍스트\")' 또는 표준 CSS 셀렉터를 사용하세요."
+        )
+    if re.search(r"(?<!\\)-\[[^\]=]+(?<!\\)\]", sel):
+        hints.append(
+            "힌트: Tailwind 임의값 클래스(예: pb-[50px])는 CSS 셀렉터에서 '\\\\[' 와 '\\\\]'로 "
+            "이스케이프하거나 '[class*=\"pb-[50px]\"]' 속성 셀렉터를 사용하세요."
+        )
+    if sel.startswith(("/", "xpath=")) and ("/text()" in sel or re.search(r"/@[\w-]+", sel)):
+        hints.append(
+            "힌트: XPath의 '/text()' 또는 '/@속성' 대신 CSS 셀렉터를 사용하세요. "
+            "verify_selectors에서 속성은 '셀렉터::attr(속성명)'으로 조회합니다."
+        )
+    return " ".join(hints)
+
+
+def _interaction_error_hint(selector: str, exc: Exception) -> str:
+    """Playwright 인터랙션 실패 시 셀렉터·오버레이·숨김 요소·타임아웃 복구 힌트를 반환합니다."""
+    base = _selector_error_hint(selector, exc) if selector else ""
+    extra: list[str] = [base] if base else []
+    msg = str(exc).lower()
+    if "intercepts pointer events" in msg:
+        extra.append(
+            "힌트: 팝업/배너/오버레이가 요소를 가리고 있습니다. 닫기 버튼을 먼저 클릭하거나 모달 상태를 확인하세요."
+        )
+    elif "not visible" in msg:
+        extra.append(
+            "힌트: 매칭된 요소가 숨김(hidden) 상태입니다. 화면에 보이는 구체적인 셀렉터를 지정하거나 상위 메뉴/탭을 먼저 여세요."
+        )
+    elif "timeout" in msg and selector:
+        extra.append(
+            "힌트: 해당 셀렉터의 요소가 없거나 아직 렌더링되지 않았습니다. extract_dom_skeleton(url='')으로 현재 탭의 실제 셀렉터를 확인하세요."
+        )
+    return " ".join(extra)
+
+
+def _detect_error_page(page_text: str, page_title: str = "") -> Optional[str]:
+    """문맥(제목 및 본문 길이)을 고려해 실제 HTTP/안티봇 차단 에러 페이지만 감지합니다."""
+    title_lower = (page_title or "").strip().lower()
+    stripped_text = (page_text or "").strip()
+    sample_lower = stripped_text[:800].lower()
+
+    if len(stripped_text) < 1000:
+        anti_bot_matched = [
+            sig for sig in ANTI_BOT_SIGNALS if sig in title_lower or sig in sample_lower
+        ]
+        if anti_bot_matched:
+            return (
+                f"[Error] 안티봇/CAPTCHA 또는 요청 제한(Rate Limit) 화면이 감지되었습니다 "
+                f"(제목: '{page_title}'): {', '.join(anti_bot_matched)}. "
+                "→ 우회나 반복 재시도를 중단하고 현재 상태를 보존한 채 사용자에게 보고하세요."
+            )
+
+    if len(stripped_text) < 1500:
+        matched_title = [sig for sig in STRONG_ERROR_SIGNALS if sig in title_lower]
+        if matched_title:
+            return (
+                f"[Error] 에러 페이지 감지 (제목: '{page_title}'): {', '.join(matched_title)}. "
+                "→ URL이 올바른지, 또는 접근 권한/요청 차단 여부를 확인하세요."
+            )
+        if re.search(r"\b(403|404|502|503)\b", title_lower) and any(
+            w in title_lower for w in ("error", "forbidden", "not found", "오류", "거부")
+        ):
+            return (
+                f"[Error] HTTP 에러 페이지 감지 (제목: '{page_title}'). "
+                "→ URL이 올바른지, 또는 접근 권한/차단 여부를 확인하세요."
+            )
+
+    if len(stripped_text) < 1200:
+        matched_body = [sig for sig in STRONG_ERROR_SIGNALS if sig in sample_lower]
+        if matched_body:
+            return (
+                f"[Error] 에러 페이지 감지: {', '.join(matched_body)} (페이지 제목: '{page_title}'). "
+                "→ URL이 올바른지 확인하거나 browse_web / web_search 등 대안을 검토하세요."
+            )
     return None
+
+
+def _detect_title_error_warning(page_text: str, page_title: str = "") -> str:
+    """장문(>= 1500자) 페이지 제목에 에러 문구가 포함된 경우 차단 대신 주의 배너를 반환합니다."""
+    stripped_text = (page_text or "").strip()
+    if len(stripped_text) < 1500:
+        return ""
+    title_lower = (page_title or "").strip().lower()
+    has_signal = any(sig in title_lower for sig in STRONG_ERROR_SIGNALS) or bool(
+        re.search(r"\b(403|404|429|502|503)\b", title_lower)
+        and any(w in title_lower for w in ("error", "forbidden", "not found", "오류", "거부"))
+    )
+    if has_signal:
+        return (
+            f"⚠️ [주의] 페이지 제목('{page_title}')에 에러 관련 문구가 포함되어 있습니다. "
+            "커스텀 에러 페이지인지 실제 콘텐츠인지 아래 내용을 확인하세요.\n"
+        )
+    return ""
+
+
+def _check_blank_uninitialized_page(url: str, page_url: str, html_content: str, tab_id: str) -> None:
+    """아무 URL도 열리지 않은 초기 빈 탭(about:blank)에서 url='' 호출 시 안내 오류를 발생시킵니다."""
+    if (not url or not url.strip()) and page_url == "about:blank" and len(html_content) < 300:
+        probe_soup = BeautifulSoup(html_content, "html.parser")
+        has_body_tags = bool(probe_soup.body and probe_soup.body.find(True))
+        if not has_body_tags and not probe_soup.get_text(strip=True):
+            raise ToolException(
+                f"[Error] 현재 탭(tab_id='{tab_id}')에 열린 웹페이지가 없습니다 (about:blank). "
+                "먼저 'url' 인자에 이동할 전체 주소(http:// 또는 https://)를 지정해 호출하세요."
+            )
+
+
+async def _select_root_element(
+    soup: BeautifulSoup,
+    page,
+    root_selector: str,
+    strip_tags: Tuple[str, ...],
+) -> Tuple[Optional[Tag], str]:
+    """표준 CSS(BeautifulSoup) 선택을 우선 시도하고, Playwright 확장 문법(:has-text 등)이면 라이브 로케이터로 폴백합니다."""
+    clean_sel = (root_selector or "").strip()
+    if not clean_sel:
+        raise ToolException(
+            "[Error] 'root_selector'는 비어 있을 수 없습니다. (예: 'body', 'main', 'div.product_list')"
+        )
+    try:
+        return soup.select_one(clean_sel), ""
+    except Exception:
+        try:
+            loc = page.locator(clean_sel)
+            match_count = await loc.count()
+            if match_count == 0:
+                return None, ""
+            outer_html = await loc.first.evaluate("el => el.outerHTML")
+        except Exception as loc_err:
+            hint = _selector_error_hint(clean_sel, loc_err)
+            hint_msg = f"\n→ {hint}" if hint else ""
+            raise ToolException(
+                f"[Error] 잘못된 root_selector 문법입니다 ('{clean_sel}'): {loc_err}{hint_msg}\n"
+                "→ 표준 CSS 셀렉터(예: 'body', 'main', 'div.product_list', '[id=\"123\"]')를 사용하거나 "
+                "root_selector='body'로 전체 스켈레톤을 먼저 확인하세요."
+            ) from loc_err
+        frag_soup = BeautifulSoup(outer_html, "html.parser")
+        for tag in frag_soup(list(strip_tags)):
+            tag.decompose()
+        fallback_note = ""
+        if match_count > 1:
+            fallback_note = (
+                f"💡 확장 셀렉터 매칭 {match_count}건 중 첫 번째(최상위) 요소를 선택했습니다. "
+                "상위 래퍼 전체가 잡혔다면 'div' 대신 구체적인 하위 태그·클래스"
+                "(예: 'li:has-text(...)', 'dl.spec_item:has-text(...)')로 좁히세요."
+            )
+        return next((c for c in frag_soup.children if isinstance(c, Tag)), None), fallback_note
 
 
 # =============================================================================
@@ -816,79 +1018,97 @@ class ExtractDomSkeletonInput(BaseModel):
 @tool(args_schema=ExtractDomSkeletonInput)
 @_shared_browser_tool
 async def extract_dom_skeleton(url: str = "", root_selector: str = "body", max_depth: int = 8, wait_ms: int = 3000, reload: bool = False, tab_id: str = "default") -> str:
-    """페이지의 DOM 트리 구조를 간결한 스켈레톤(구조 맵)으로 반환합니다.
+    """페이지의 DOM 트리 구조를 간결한 구조 맵(태그/클래스/ID/data속성/자식수/샘플텍스트)으로 반환합니다.
 
     url을 생략하면 현재 공유 탭을 분석합니다. 같은 URL의 상태도 유지하며,
-    명시적으로 새로고침하려면 reload=True를 지정합니다.
-
-    HTML 원문 대신, 태그/클래스/ID/data속성/자식수/샘플텍스트만 추출한
-    경량 트리(~5-15KB)를 제공합니다. 이 구조 맵으로 스크래핑 대상 영역을 파악한 뒤,
-    get_page_section으로 해당 영역의 실제 HTML을 확인하세요.
-
-    Args:
-        url: 분석할 웹페이지 URL (빈 문자열이면 현재 탭 상태 유지)
-        root_selector: 분석 시작 루트 요소의 CSS 셀렉터 (기본: body)
-        max_depth: DOM 탐색 최대 깊이 (기본: 8, SPA 대응)
-        wait_ms: 페이지 로드 후 JS 대기 시간(ms) (기본: 3000)
-        reload: 현재 문서를 명시적으로 새로고침할 때만 True (기본: False)
-        tab_id: 브라우저 탭 식별자 (기본: 'default'). 단일 스크래퍼가 여러 탭(예: 'list', 'detail')을 동시에 열어 상태를 유지하거나 병렬 탐색할 때 지정
-    
-    Returns:
-        DOM 스켈레톤 구조 맵 텍스트. 반복 패턴, 구조 변형, 주요 속성을 한눈에 파악할 수 있습니다.
+    명시적으로 새로고침하려면 reload=True를 지정하세요.
+    이 구조 맵으로 스크래핑 대상 영역을 파악한 뒤, get_page_section으로 해당 영역의 실제 HTML을 확인하세요.
     """
     print(f"\n🦴 [extract_dom_skeleton] {url} (root: {root_selector}, depth: {max_depth}, wait: {wait_ms}ms)")
-    
+    safe_max_depth = min(15, max(1, int(max_depth)))
+
     try:
         manager = await PlaywrightManager.get_instance()
         page = await manager.get_page(url, wait_ms, reload=reload, tab_id=tab_id)
     except Exception as e:
-        return f"[Error] 페이지 로드 실패: {e}\n→ URL이 올바른지 확인하세요."
-    
+        raise ToolException(f"[Error] 페이지 로드 실패: {e}\n→ URL이 올바른지 확인하세요.") from e
+
     try:
         html_content = await page.content()
         page_url = page.url
     except Exception as e:
-        return f"[Error] HTML 수집 실패: {e}"
-    
+        raise ToolException(f"[Error] HTML 수집 실패: {e}") from e
+
+    _check_blank_uninitialized_page(url, page_url, html_content, tab_id)
+
     soup = BeautifulSoup(html_content, "html.parser")
-    
+
     # 에러 페이지 조기 감지
     page_title = soup.title.string.strip() if soup.title and soup.title.string else ""
     page_text = soup.get_text(strip=True)
     error_msg = _detect_error_page(page_text, page_title)
     if error_msg:
-        return error_msg
-    
+        raise ToolException(error_msg)
+    title_warning = _detect_title_error_warning(page_text, page_title)
+
     # 비콘텐츠 태그 제거 (광고 등 특정 클래스는 절대 제거하지 않음)
-    for tag in soup(["script", "style", "noscript", "svg", "path", "link", "meta"]):
+    strip_tags = ("script", "style", "noscript", "svg", "path", "link", "meta")
+    for tag in soup(list(strip_tags)):
         tag.decompose()
-    
-    # 루트 요소 탐색
-    root = soup.select_one(root_selector)
+
+    # 루트 요소 탐색 (표준 CSS 실패 시 Playwright 로케이터 폴백 + 문법 힌트)
+    root, fallback_note = await _select_root_element(soup, page, root_selector, strip_tags)
     if not root:
         available = [
-            t.name + ('.' + '.'.join(t.get('class', [])) if t.get('class') else '') 
-            for t in (soup.body or soup).children 
+            t.name + ('.' + '.'.join(t.get('class', [])) if t.get('class') else '')
+            for t in (soup.body or soup).children
             if isinstance(t, Tag)
         ][:15]
         return (
             f"[Warning] '{root_selector}' 셀렉터에 해당하는 요소를 찾지 못했습니다.\n"
             f"사용 가능한 최상위 요소: {available}"
         )
-    
+
     # 스켈레톤 생성
-    skeleton_lines = _build_skeleton(root, depth=0, max_depth=max_depth)
-    
+    skeleton_lines = _build_skeleton(root, depth=0, max_depth=safe_max_depth)
+    if not skeleton_lines:
+        leaf_attrs = []
+        for attr_name in ("id", "href", "src"):
+            val = root.get(attr_name, "")
+            if val:
+                leaf_attrs.append(f'{attr_name}="{str(val)[:80]}"')
+        for attr_name, attr_val in root.attrs.items():
+            if isinstance(attr_name, str) and USEFUL_DATA_ATTRS.match(attr_name):
+                leaf_attrs.append(f'{attr_name}="{str(attr_val)[:50]}"')
+        direct_text = root.get_text(strip=True)[:100]
+        if leaf_attrs or direct_text:
+            attr_str = f" [{', '.join(leaf_attrs)}]" if leaf_attrs else ""
+            text_str = f' → "{direct_text}"' if direct_text else ""
+            skeleton_lines = [
+                f"└─ (하위 태그 없음 — 단일 요소){attr_str}{text_str} (원문은 get_page_section으로 확인)"
+            ]
+        else:
+            skeleton_lines = [
+                "└─ (비어 있음 — 하위 태그 및 텍스트 없음. JS 렌더링 대기(wait_ms 증가) 또는 iframe/Shadow DOM 여부를 확인하세요)"
+            ]
+
     root_cls = " ".join(root.get("class", []))
     root_sig = f"{root.name}.{root_cls}" if root_cls else root.name
-    header = f"🦴 DOM Skeleton: {page_url}\n📍 Root: {root_sig}\n{'─' * 60}"
-    
+    header_lines = [
+        f"{title_warning}🦴 DOM Skeleton: {page_url}",
+        f"📍 Root: {root_sig}",
+    ]
+    if fallback_note:
+        header_lines.append(fallback_note)
+    header_lines.append("─" * 60)
+    header = "\n".join(header_lines)
+
     skeleton_text = header + "\n" + "\n".join(skeleton_lines)
-    
+
     # 크기 제한 안전장치
     if len(skeleton_text) > 15000:
         skeleton_text = skeleton_text[:15000] + "\n\n⚠️ [출력 잘림] max_depth를 줄이거나 root_selector를 더 구체적으로 지정하세요."
-    
+
     print(f"  → 스켈레톤 생성 완료: {len(skeleton_lines)}줄, {len(skeleton_text)}자")
     return skeleton_text
 
@@ -899,8 +1119,8 @@ async def extract_dom_skeleton(url: str = "", root_selector: str = "body", max_d
 
 class GetPageSectionInput(BaseModel):
     url: str = Field(default="", description="대상 URL (빈 문자열이면 현재 탭 상태 유지)")
-    root_selector: str = Field(description="추출할 영역의 CSS 셀렉터 (예: '.product_list', '#content')")
-    max_chars: int = Field(default=30000, description="반환 HTML 최대 문자 수 (기본: 30000 ≈ ~7.5K 토큰)")
+    root_selector: str = Field(description="추출할 영역의 CSS 셀렉터 (예: '.product_list', '#content'). 텍스트 기반 매칭 시 Playwright ':has-text(...)'도 폴백 지원")
+    max_chars: int = Field(default=30000, description="반환 HTML 최대 문자 수 (200~100000, 기본: 30000 ≈ ~7.5K 토큰)")
     wait_ms: int = Field(default=3000, description="페이지 로드 후 JS 대기 시간(ms) (기본: 3000)")
     reload: bool = Field(default=False, description="현재 문서를 명시적으로 새로고침할 때만 True")
     tab_id: str = Field(
@@ -911,56 +1131,50 @@ class GetPageSectionInput(BaseModel):
 @tool(args_schema=GetPageSectionInput)
 @_shared_browser_tool
 async def get_page_section(url: str = "", root_selector: str = "body", max_chars: int = 30000, wait_ms: int = 3000, reload: bool = False, tab_id: str = "default") -> str:
-    """특정 영역의 정제된 HTML 원문을 반환합니다.
+    """특정 영역의 정제된 HTML 원문(script/style/svg/noscript 제거됨)을 반환합니다.
 
     인터랙션 이후에는 url을 생략해 현재 공유 탭의 DOM을 읽으세요.
     같은 URL은 상태를 유지하며, reload=True일 때만 명시적으로 새로고침합니다.
-
-    extract_dom_skeleton으로 구조를 파악한 뒤, 특정 영역의 실제 HTML을 보고
-    data-* 속성, 광고 혼합 패턴, 숨겨진 필드 등을 직접 분석하여
-    CSS 셀렉터를 결정할 때 사용합니다.
-
-    Args:
-        url: 대상 웹페이지 URL (빈 문자열이면 현재 탭 상태 유지)
-        root_selector: 추출할 영역의 CSS 셀렉터 (예: '.product_list', '#content')
-        max_chars: 반환 HTML 최대 문자 수 (기본: 30000 ≈ ~7.5K 토큰)
-        wait_ms: 페이지 로드 후 JS 대기 시간(ms) (기본: 3000)
-        reload: 현재 문서를 명시적으로 새로고침할 때만 True (기본: False)
-        tab_id: 브라우저 탭 식별자 (기본: 'default'). 단일 스크래퍼가 여러 탭(예: 'list', 'detail')을 동시에 열어 상태를 유지하거나 병렬 탐색할 때 지정
-    
-    Returns:
-        정제된 HTML 원문. script/style/svg/noscript 태그가 제거된 상태입니다.
+    extract_dom_skeleton으로 구조를 파악한 뒤 data-* 속성, 광고 혼합 패턴, 숨겨진 필드 등을 분석할 때 사용합니다.
     """
     print(f"\n📄 [get_page_section] {url} (selector: {root_selector}, max: {max_chars}자)")
-    
+    safe_max_chars = min(100000, max(200, int(max_chars)))
+
     try:
         manager = await PlaywrightManager.get_instance()
         page = await manager.get_page(url, wait_ms, reload=reload, tab_id=tab_id)
     except Exception as e:
-        return f"[Error] 페이지 로드 실패: {e}"
-    
+        raise ToolException(f"[Error] 페이지 로드 실패: {e}") from e
+
     try:
         html_content = await page.content()
         page_url = page.url
     except Exception as e:
-        return f"[Error] HTML 수집 실패: {e}"
-    
+        raise ToolException(f"[Error] HTML 수집 실패: {e}") from e
+
+    _check_blank_uninitialized_page(url, page_url, html_content, tab_id)
+
     soup = BeautifulSoup(html_content, "html.parser")
-    
+
     # 에러 페이지 조기 감지
     page_title = soup.title.string.strip() if soup.title and soup.title.string else ""
     page_text = soup.get_text(strip=True)
     error_msg = _detect_error_page(page_text, page_title)
     if error_msg:
-        return error_msg
-    
-    # 대상 영역 추출
-    target = soup.select_one(root_selector)
+        raise ToolException(error_msg)
+    title_warning = _detect_title_error_warning(page_text, page_title)
+
+    # 비콘텐츠 태그 선제 제거 (미매칭 시 후보 목록 오염 방지)
+    strip_tags = ("script", "style", "svg", "noscript", "link", "meta")
+    for tag in soup(list(strip_tags)):
+        tag.decompose()
+
+    # 대상 영역 추출 (표준 CSS 실패 시 Playwright 로케이터 폴백 + 문법 힌트)
+    target, fallback_note = await _select_root_element(soup, page, root_selector, strip_tags)
     if not target:
-        # 후보 셀렉터 제안
         available = [
-            t.name + ('.' + '.'.join(t.get('class', [])) if t.get('class') else '') 
-            for t in (soup.body or soup).children 
+            t.name + ('.' + '.'.join(t.get('class', [])) if t.get('class') else '')
+            for t in (soup.body or soup).children
             if isinstance(t, Tag)
         ][:15]
         return (
@@ -968,24 +1182,24 @@ async def get_page_section(url: str = "", root_selector: str = "body", max_chars
             f"→ extract_dom_skeleton으로 구조를 다시 확인하세요.\n"
             f"최상위 요소 후보: {available}"
         )
-    
-    # 비콘텐츠 태그 제거
-    for tag in target(["script", "style", "svg", "noscript"]):
-        tag.decompose()
-    
-    # 정제된 HTML 반환
+
+    # 정제된 HTML 반환 (prettify 1회 계산)
     cleaned_html = target.prettify()
-    
-    if len(cleaned_html) > max_chars:
-        cleaned_html = cleaned_html[:max_chars] + f"\n\n⚠️ [HTML 잘림 — 전체 {len(target.prettify())}자 중 {max_chars}자만 표시] root_selector를 더 구체적으로 지정하세요."
-    
-    header = (
-        f"📄 Page Section: {page_url}\n"
-        f"📍 Selector: {root_selector}\n"
-        f"📏 크기: {len(cleaned_html)}자\n"
-        f"{'─' * 60}\n"
-    )
-    
+    total_chars = len(cleaned_html)
+
+    if total_chars > safe_max_chars:
+        cleaned_html = cleaned_html[:safe_max_chars] + f"\n\n⚠️ [HTML 잘림 — 전체 {total_chars}자 중 {safe_max_chars}자만 표시] root_selector를 더 구체적으로 지정하세요."
+
+    header_lines = [
+        f"{title_warning}📄 Page Section: {page_url}",
+        f"📍 Selector: {root_selector}",
+        f"📏 크기: {len(cleaned_html)}자",
+    ]
+    if fallback_note:
+        header_lines.append(fallback_note)
+    header_lines.append("─" * 60)
+    header = "\n".join(header_lines) + "\n"
+
     print(f"  → HTML 추출 완료: {len(cleaned_html)}자")
     return header + cleaned_html
 
@@ -996,8 +1210,8 @@ async def get_page_section(url: str = "", root_selector: str = "body", max_chars
 
 class VerifySelectorsInput(BaseModel):
     url: str = Field(default="", description="대상 URL (빈 문자열이면 현재 탭 상태 유지)")
-    selectors_json: str = Field(description="JSON 문자열 셀렉터 딕셔너리. 텍스트: '{\"title\": \"a.title\"}', 속성: '{\"link\": \"a.title::attr(href)\"}'")
-    max_samples: int = Field(default=5, description="각 셀렉터당 반환할 최대 샘플 수 (기본: 5)")
+    selectors_json: JsonStringParam = Field(description="JSON 문자열 셀렉터 딕셔너리. 텍스트: '{\"title\": \"a.title\"}', 속성: '{\"link\": \"a.title::attr(href)\"}'")
+    max_samples: int = Field(default=5, description="각 셀렉터당 반환할 최대 샘플 수 (1~50, 기본: 5)")
     wait_ms: int = Field(default=2000, description="페이지 로드 후 대기 시간(ms) (기본: 2000)")
     reload: bool = Field(default=False, description="현재 문서를 명시적으로 새로고침할 때만 True")
     tab_id: str = Field(
@@ -1008,77 +1222,130 @@ class VerifySelectorsInput(BaseModel):
 @tool(args_schema=VerifySelectorsInput)
 @_shared_browser_tool
 async def verify_selectors(url: str = "", selectors_json: str = "{}", max_samples: int = 5, wait_ms: int = 2000, reload: bool = False, tab_id: str = "default") -> str:
-    """CSS 셀렉터가 실제로 데이터를 가져오는지 브라우저로 검증합니다.
+    """CSS 셀렉터 딕셔너리가 실제로 데이터를 가져오는지 브라우저로 일괄 검증하고 OK/FAILED와 샘플을 반환합니다.
 
-    url을 생략하면 현재 공유 탭을 검증합니다. 전체 매칭 수와 반환한 샘플 수를
-    구분하며, 같은 URL의 상태를 유지합니다. 새로고침은 reload=True로 요청합니다.
-
-    기본적으로 요소의 텍스트를 반환하며, 속성(href, src 등)이 필요하면 ::attr() 구문을 사용하세요.
-
-    Args:
-        url: 검증할 웹페이지 URL (빈 문자열이면 현재 탭 상태 유지)
-        selectors_json: JSON 문자열 셀렉터 딕셔너리.
-            텍스트: '{"title": "a.title"}'
-            속성: '{"link": "a.title::attr(href)", "image": "img.thumb::attr(src)"}'
-        max_samples: 각 셀렉터당 반환할 최대 샘플 수 (기본: 5)
-        wait_ms: 페이지 로드 후 대기 시간(ms) (기본: 2000)
-        reload: 현재 문서를 명시적으로 새로고침할 때만 True (기본: False)
-        tab_id: 브라우저 탭 식별자 (기본: 'default'). 단일 스크래퍼가 여러 탭(예: 'list', 'detail')을 동시에 열어 상태를 유지하거나 병렬 탐색할 때 지정
-    
-    Returns:
-        각 셀렉터의 검증 결과 (OK/FAILED)와 샘플 데이터
+    url을 생략하면 현재 공유 탭을 검증하며, 같은 URL의 상태를 유지합니다. 새로고침은 reload=True로 요청하세요.
+    기본적으로 요소의 텍스트를 반환하며, 속성(href, src 등)이 필요하면 '셀렉터::attr(속성명)' 구문을 사용하세요.
     """
     print(f"\n🔍 [verify_selectors] {url}")
-    
+
     try:
         sel_dict = json.loads(selectors_json)
     except json.JSONDecodeError as e:
-        return f"[Error] 유효한 JSON 문자열이어야 합니다: {e}"
-    
+        raise ToolException(f"[Error] 유효한 JSON 문자열이어야 합니다: {e}") from e
+
+    if not isinstance(sel_dict, dict) or not sel_dict:
+        raise ToolException(
+            "[Error] selectors_json은 비어 있지 않은 JSON 객체 문자열"
+            "(예: '{\"title\": \"h2.name\", \"link\": \"a::attr(href)\"}')이어야 합니다."
+        )
+
+    safe_max_samples = min(50, max(1, int(max_samples)))
+
     try:
         manager = await PlaywrightManager.get_instance()
         page = await manager.get_page(url, wait_ms, reload=reload, tab_id=tab_id)
     except Exception as e:
-        return f"[Error] 페이지 로드 실패: {e}"
-    
-    results = {}
+        raise ToolException(f"[Error] 페이지 로드 실패: {e}") from e
+
     try:
-        for key, sel in sel_dict.items():
-            actual_sel = sel
-            attr_name = ""
-            
-            # ::attr() 커스텀 구문 파싱
-            if "::attr(" in sel:
-                match = re.search(r'(.*?)::attr\((.*?)\)', sel)
-                if match:
-                    actual_sel = match.group(1).strip()
-                    attr_name = match.group(2).strip()
-            
+        html_content = await page.content()
+        _check_blank_uninitialized_page(url, page.url, html_content, tab_id)
+    except ToolException:
+        raise
+    except Exception as e:
+        raise ToolException(f"[Error] HTML 상태 확인 실패: {e}") from e
+
+    soup_check = BeautifulSoup(html_content, "html.parser")
+    page_title = soup_check.title.string.strip() if soup_check.title and soup_check.title.string else ""
+    error_msg = _detect_error_page(soup_check.get_text(strip=True), page_title)
+    if error_msg:
+        raise ToolException(error_msg)
+
+    output_lines: list[str] = []
+    error_lines: list[str] = []
+    error_count = 0
+    total_matched = 0
+
+    for key, sel in sel_dict.items():
+        if not isinstance(sel, str) or not sel.strip():
+            err_msg = f"[Error] {key}: 셀렉터 문자열이 비어 있습니다."
+            error_lines.append(err_msg)
+            output_lines.append(err_msg)
+            error_count += 1
+            continue
+
+        actual_sel = sel.strip()
+        attr_name = ""
+
+        # ::text / ::attr() 커스텀 구문 파싱
+        if actual_sel.endswith("::text"):
+            actual_sel = actual_sel[:-6].strip()
+            if not actual_sel:
+                err_msg = f"[Error] {key} ({sel}): '::text' 앞의 CSS 셀렉터가 비어 있습니다."
+                error_lines.append(err_msg)
+                output_lines.append(err_msg)
+                error_count += 1
+                continue
+        elif "::attr(" in actual_sel:
+            match = re.match(r"^(.*?)::attr\((.*?)\)\s*$", actual_sel)
+            if not match or not match.group(1).strip() or not match.group(2).strip():
+                err_msg = (
+                    f"[Error] {key} ({sel}): '셀렉터::attr(속성명)' 형식이 올바르지 않습니다 "
+                    "(예: 'a.title::attr(href)')."
+                )
+                error_lines.append(err_msg)
+                output_lines.append(err_msg)
+                error_count += 1
+                continue
+            actual_sel = match.group(1).strip()
+            attr_name = match.group(2).strip()
+
+        try:
             elements = await page.query_selector_all(actual_sel)
             samples = []
-            for el in elements[:max_samples]:
+            for el in elements[:safe_max_samples]:
                 if attr_name:
                     val = await el.get_attribute(attr_name)
                 else:
                     val = await el.text_content()
-                if val:
+                if val and val.strip():
                     samples.append(val.strip())
-            
-            results[key] = (len(elements), samples)
-    except Exception as e:
-        return f"[Error] 브라우저 검증 중 오류: {e}"
-    
-    # 결과 포맷팅
-    output_lines = []
-    for key, (match_count, samples) in results.items():
-        sel = sel_dict[key]
-        if samples:
-            output_lines.append(f"[✅ OK] {key} ({sel}): 매칭 {match_count}건 (샘플 {len(samples)}건)")
-            for i, s in enumerate(samples):
-                output_lines.append(f"  샘플{i+1}: {s[:100]}")
-        else:
-            output_lines.append(f"[⚠️ FAILED] {key} ({sel}): 매칭 {match_count}건 (비어 있지 않은 샘플 0건)")
-    
+
+            match_count = len(elements)
+            total_matched += match_count
+            if samples:
+                output_lines.append(f"[✅ OK] {key} ({sel}): 매칭 {match_count}건 (샘플 {len(samples)}건)")
+                for i, s in enumerate(samples):
+                    output_lines.append(f"  샘플{i+1}: {s[:100]}")
+            else:
+                output_lines.append(f"[⚠️ FAILED] {key} ({sel}): 매칭 {match_count}건 (비어 있지 않은 샘플 0건)")
+                if match_count > 0 and not attr_name:
+                    output_lines.append(
+                        "  → 요소는 매칭되었으나 텍스트가 비어 있습니다. href/src/value 등 속성은 '셀렉터::attr(속성명)'으로 확인하세요."
+                    )
+        except Exception as sel_err:
+            error_count += 1
+            hint = _selector_error_hint(actual_sel, sel_err)
+            err_line = f"[Error] {key} ({sel}): 브라우저 검증 실패 ({sel_err})"
+            if hint:
+                err_line += f"\n  → {hint}"
+            error_lines.append(err_line)
+            output_lines.append(err_line)
+
+    if error_count == len(sel_dict):
+        raise ToolException("\n".join(error_lines))
+
+    if error_count < len(sel_dict) and total_matched == 0:
+        try:
+            iframe_count = len(await page.query_selector_all("iframe"))
+        except Exception:
+            iframe_count = 0
+        if iframe_count > 0:
+            output_lines.append(
+                f"💡 모든 셀렉터가 0건 매칭되었으며 현재 페이지에 iframe({iframe_count}개)이 존재합니다. 대상 데이터가 iframe 내부에 있는지 확인하세요."
+            )
+
     return "\n".join(output_lines)
 
 
@@ -1088,15 +1355,16 @@ async def verify_selectors(url: str = "", selectors_json: str = "{}", max_sample
 
 class InteractPageInput(BaseModel):
     url: str = Field(default="", description="대상 URL (빈 문자열이면 현재 페이지에서 계속)")
-    actions_json: str = Field(description=(
-        '수행할 액션 리스트 JSON. 예: '
-        '\'[{"action": "click", "selector": "button.load_more"}]\' '
-        '\'[{"action": "fill", "selector": "input#search", "value": "검색어"}]\' '
-        '\'[{"action": "scroll", "direction": "down", "amount": 3000}]\' '
-        '\'[{"action": "select", "selector": "select#category", "value": "electronics"}]\' '
-        '\'[{"action": "wait", "selector": ".results", "timeout_ms": 5000}]\''
+    actions_json: JsonStringParam = Field(description=(
+        '수행할 액션 리스트 JSON. 지원 액션: '
+        '[{"action": "click", "selector": "button.load_more"}], '
+        '[{"action": "fill", "selector": "input#search", "value": "검색어"}], '
+        '[{"action": "press", "selector": "input#search", "value": "Enter"}], '
+        '[{"action": "select", "selector": "select#category", "value": "electronics"}], '
+        '[{"action": "scroll", "direction": "down", "amount": 3000}], '
+        '[{"action": "wait", "selector": ".results", "timeout_ms": 5000}]'
     ))
-    wait_ms: int = Field(default=2000, description="액션 후 결과 대기 시간(ms) (기본: 2000)")
+    wait_ms: int = Field(default=2000, description="액션 후 결과 대기 시간(ms, 0~30000 범위, 기본: 2000)")
     reload: bool = Field(default=False, description="현재 문서를 명시적으로 새로고침할 때만 True")
     tab_id: str = Field(
         default="default",
@@ -1106,97 +1374,149 @@ class InteractPageInput(BaseModel):
 @tool(args_schema=InteractPageInput)
 @_shared_browser_tool
 async def interact_page(url: str = "", actions_json: str = "[]", wait_ms: int = 2000, reload: bool = False, tab_id: str = "default") -> str:
-    """페이지에서 클릭, 입력, 스크롤 등 경량 인터랙션을 수행합니다.
+    """페이지에서 클릭, 입력, 키 입력, 드롭다운 선택, 스크롤, 대기 인터랙션을 수행합니다.
 
-    url을 생략하면 활성 탭에서 계속합니다. 작업 후 탭을 유지하므로 L1 도구와
-    스크린샷에서 같은 상태를 읽을 수 있습니다. 새로고침은 reload=True로 요청합니다.
+    url을 생략하면 활성 탭에서 계속하며, 작업 후 탭을 유지하므로 L1 도구와 스크린샷에서
+    같은 상태를 읽을 수 있습니다. 새로고침은 reload=True로 요청합니다.
 
-    더보기 버튼 클릭, 검색어 입력, 드롭다운 선택, 페이지 스크롤 등
-    단순 인터랙션을 browser-use 없이 1~2초 만에 처리합니다.
-
-    Args:
-        url: 대상 URL (빈 문자열이면 현재 페이지에서 계속)
-        actions_json: 수행할 액션 리스트 JSON. 지원 액션:
-            - click: {"action": "click", "selector": "button.more"}
-            - fill: {"action": "fill", "selector": "input#q", "value": "검색어"}
-            - select: {"action": "select", "selector": "select#cat", "value": "opt1"}
-            - scroll: {"action": "scroll", "direction": "down", "amount": 3000}
-            - wait: {"action": "wait", "selector": ".results", "timeout_ms": 5000}
-        wait_ms: 액션 후 결과 대기 시간(ms) (기본: 2000)
-        reload: 현재 문서를 명시적으로 새로고침할 때만 True (기본: False)
-        tab_id: 브라우저 탭 식별자 (기본: 'default'). 단일 스크래퍼가 여러 탭(예: 'list', 'detail')을 동시에 열어 상태를 유지하거나 병렬 탐색할 때 지정
-
-    Returns:
-        수행 결과 요약 (현재 URL, 각 액션 성공/실패, DOM 변경 감지)
+    단순 인터랙션을 browser-use 없이 1~2초 만에 처리하고, 수행 전후 URL·DOM 변화를 보고합니다.
     """
     print(f"\n🎯 [interact_page] {url or '(현재 페이지)'}")
-    
+
     try:
         actions = json.loads(actions_json)
     except json.JSONDecodeError as e:
-        return f"[Error] 유효한 JSON 액션 리스트여야 합니다: {e}"
-    
+        raise ToolException(f"[Error] 유효한 JSON 액션 리스트여야 합니다: {e}") from e
+
     if not isinstance(actions, list):
         actions = [actions]
-    
+    if not actions:
+        raise ToolException("[Error] actions_json에 최소 1개 이상의 액션을 지정해야 합니다.")
+    if not all(isinstance(a, dict) for a in actions):
+        raise ToolException("[Error] actions_json의 각 요소는 객체(dict)여야 합니다.")
+
+    clamped_wait_ms = max(0, min(int(wait_ms), 30000))
+
     try:
         manager = await PlaywrightManager.get_instance()
-        page = await manager.get_page(url if url else None, wait_ms=wait_ms, reload=reload, tab_id=tab_id)
+        clean_target_url = (url or "").strip()
+        existing_page = manager._pages_by_session.get(_current_browser_slot_key(tab_id=tab_id))
+        existing_url = existing_page.url if (existing_page and not existing_page.is_closed()) else ""
+        will_navigate = bool(reload or (clean_target_url and not manager._same_url(clean_target_url, existing_url)))
+        page = await manager.get_page(
+            clean_target_url if clean_target_url else None,
+            wait_ms=clamped_wait_ms if will_navigate else 0,
+            reload=reload,
+            tab_id=tab_id,
+        )
+    except ToolException:
+        raise
     except Exception as e:
-        return f"[Error] 페이지 로드 실패: {e}"
-    
-    # 인터랙션 전 상태 스냅샷
+        raise ToolException(f"[Error] 페이지 로드 실패: {e}") from e
+
+    # 인터랙션 전 상태 스냅샷 및 빈 탭 조기 감지
     initial_url = page.url
     try:
-        initial_content_length = len(await page.content())
+        initial_html = await page.content()
+        initial_content_length = len(initial_html)
     except Exception:
+        initial_html = ""
         initial_content_length = 0
-    
+    _check_blank_uninitialized_page(clean_target_url, initial_url, initial_html, tab_id)
+
     action_results = []
-    
+    succeeded_count = 0
+
     try:
-        for i, action_spec in enumerate(actions):
+        for action_spec in actions:
             # Follow a popup opened by the preceding action.
             page = await manager.get_page(wait_ms=0, tab_id=tab_id)
-            action_type = action_spec.get("action", "").lower()
-            selector = action_spec.get("selector", "")
-            
+            action_type = str(action_spec.get("action", "")).lower().strip()
+            selector = str(action_spec.get("selector", "") or "").strip()
+
+            if action_type in ("click", "fill", "select", "wait") and not selector:
+                action_results.append(f"  ❌ {action_type} 실패: 'selector' 필드가 비어 있습니다.")
+                continue
+
             try:
                 if action_type == "click":
                     await page.click(selector, timeout=5000)
                     action_results.append(f"  ✅ click '{selector}' 성공")
-                    
+                    succeeded_count += 1
+
                 elif action_type == "fill":
-                    value = action_spec.get("value", "")
+                    value = str(action_spec.get("value", ""))
                     await page.fill(selector, value, timeout=5000)
                     action_results.append(f"  ✅ fill '{selector}' = '{value}' 성공")
-                    
+                    succeeded_count += 1
+
+                elif action_type == "press":
+                    key = str(action_spec.get("value") or action_spec.get("key") or "Enter")
+                    if selector:
+                        await page.press(selector, key, timeout=5000)
+                        action_results.append(f"  ✅ press '{selector}' key='{key}' 성공")
+                    else:
+                        await page.keyboard.press(key)
+                        action_results.append(f"  ✅ press page key='{key}' 성공")
+                    succeeded_count += 1
+
                 elif action_type == "select":
-                    value = action_spec.get("value", "")
+                    value = str(action_spec.get("value", ""))
                     await page.select_option(selector, value, timeout=5000)
                     action_results.append(f"  ✅ select '{selector}' = '{value}' 성공")
-                    
+                    succeeded_count += 1
+
                 elif action_type == "scroll":
-                    direction = action_spec.get("direction", "down")
-                    amount = action_spec.get("amount", 1000)
-                    scroll_y = amount if direction == "down" else -amount
-                    await page.evaluate(f"window.scrollBy(0, {scroll_y})")
-                    action_results.append(f"  ✅ scroll {direction} {amount}px 성공")
-                    
+                    direction = str(action_spec.get("direction", "down") or "down").lower().strip()
+                    raw_amount = action_spec.get("amount")
+                    amount = 1000 if raw_amount is None else int(raw_amount)
+                    if direction == "down":
+                        await page.evaluate("(y) => window.scrollBy(0, y)", abs(amount))
+                        action_results.append(f"  ✅ scroll down {abs(amount)}px 성공")
+                        succeeded_count += 1
+                    elif direction == "up":
+                        await page.evaluate("(y) => window.scrollBy(0, y)", -abs(amount))
+                        action_results.append(f"  ✅ scroll up {abs(amount)}px 성공")
+                        succeeded_count += 1
+                    elif direction == "bottom":
+                        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                        action_results.append("  ✅ scroll bottom (페이지 끝) 성공")
+                        succeeded_count += 1
+                    elif direction == "top":
+                        await page.evaluate("() => window.scrollTo(0, 0)")
+                        action_results.append("  ✅ scroll top (페이지 상단) 성공")
+                        succeeded_count += 1
+                    else:
+                        action_results.append(
+                            f"  ❌ scroll 실패: 지원하지 않는 direction='{direction}' (지원: down, up, bottom, top)"
+                        )
+
                 elif action_type == "wait":
-                    timeout = action_spec.get("timeout_ms", 5000)
+                    raw_timeout = action_spec.get("timeout_ms")
+                    timeout = max(0, min(5000 if raw_timeout is None else int(raw_timeout), 30000))
                     await page.wait_for_selector(selector, timeout=timeout)
                     action_results.append(f"  ✅ wait '{selector}' 요소 출현 확인")
-                    
+                    succeeded_count += 1
+
                 else:
-                    action_results.append(f"  ⚠️ 미지원 액션: '{action_type}'")
-                    
+                    action_results.append(
+                        f"  ⚠️ 미지원 액션: '{action_type}' (지원: click, fill, press, select, scroll, wait)"
+                    )
+
             except Exception as e:
-                action_results.append(f"  ❌ {action_type} '{selector}' 실패: {e}")
-        
+                hint = _interaction_error_hint(selector, e)
+                hint_suffix = f" ({hint})" if hint else ""
+                action_results.append(f"  ❌ {action_type} '{selector}' 실패: {e}{hint_suffix}")
+
+        if succeeded_count == 0:
+            raise ToolException(
+                "[Error] 요청한 모든 인터랙션 액션이 실패했습니다.\n" + "\n".join(action_results)
+            )
+
         # 액션 후 대기
-        await page.wait_for_timeout(wait_ms)
-        
+        if clamped_wait_ms > 0:
+            await page.wait_for_timeout(clamped_wait_ms)
+
         # 인터랙션 후 상태
         page = await manager.get_page(wait_ms=0, tab_id=tab_id)
         final_url = page.url
@@ -1204,23 +1524,30 @@ async def interact_page(url: str = "", actions_json: str = "[]", wait_ms: int = 
             final_content_length = len(await page.content())
         except Exception:
             final_content_length = 0
-        
+
         url_changed = final_url != initial_url
         content_changed = abs(final_content_length - initial_content_length) > 100
-        
+
+    except ToolException:
+        raise
     except Exception as e:
-        return f"[Error] 인터랙션 중 오류: {e}"
-    
+        raise ToolException(f"[Error] 인터랙션 중 오류: {e}") from e
+
     # 결과 요약
     summary_parts = [
         f"🎯 [interact_page 결과]",
         f"  URL: {final_url}" + (" ← URL 변경됨!" if url_changed else ""),
         f"  DOM 변경: {'✅ 감지됨' if content_changed else '❌ 변경 없음'} "
         f"(이전: {initial_content_length}자 → 이후: {final_content_length}자)",
-        f"  수행된 액션 ({len(actions)}개):",
+        f"  수행된 액션 ({succeeded_count}/{len(actions)}개 성공):",
     ]
+    if succeeded_count < len(actions):
+        summary_parts.insert(
+            3,
+            f"  ⚠️ [부분 실패] 전체 {len(actions)}개 중 {len(actions) - succeeded_count}개 액션이 실패했습니다.",
+        )
     summary_parts.extend(action_results)
-    
+
     return "\n".join(summary_parts)
 
 
@@ -1230,9 +1557,9 @@ async def interact_page(url: str = "", actions_json: str = "[]", wait_ms: int = 
 
 class TakeScreenshotInput(BaseModel):
     url: str = Field(default="", description="스크린샷 대상 URL (빈 문자열이면 현재 페이지)")
-    selector: str = Field(default="", description="특정 요소만 캡처할 CSS 셀렉터 (빈 문자열이면 전체 페이지)")
+    selector: str = Field(default="", description="특정 요소만 캡처할 CSS/Playwright 셀렉터 (빈 문자열이면 전체 페이지)")
     full_page: bool = Field(default=True, description="전체 페이지 캡처 여부 (기본: True)")
-    filename: str = Field(default="", description="저장 파일명 (빈 문자열이면 타임스탬프 자동 생성)")
+    filename: str = Field(default="", description="저장 파일명 (빈 문자열이면 타임스탬프 자동 생성, SCREENSHOT_DIR 기준 상대 경로)")
     reload: bool = Field(default=False, description="현재 문서를 명시적으로 새로고침할 때만 True")
     tab_id: str = Field(
         default="default",
@@ -1242,65 +1569,80 @@ class TakeScreenshotInput(BaseModel):
 @tool(args_schema=TakeScreenshotInput)
 @_shared_browser_tool
 async def take_screenshot(url: str = "", selector: str = "", full_page: bool = True, filename: str = "", reload: bool = False, tab_id: str = "default") -> str:
-    """현재 페이지 또는 특정 영역의 스크린샷을 저장합니다.
+    """현재 페이지 또는 특정 요소의 스크린샷 PNG 파일을 저장하고 절대 경로를 반환합니다.
 
-    url을 생략하면 현재 공유 탭을 캡처하고 탭을 유지합니다.
-    같은 URL도 상태를 보존하며, 명시적 새로고침은 reload=True로 요청합니다.
-
-    페이지 분석, 인터랙션 전후 비교, 디버깅, 사용자 보고에 사용합니다.
-    저장된 이미지 경로를 반환합니다.
-
-    Args:
-        url: 스크린샷 대상 URL (빈 문자열이면 현재 페이지)
-        selector: 특정 요소만 캡처할 CSS 셀렉터 (빈 문자열이면 전체)
-        full_page: 전체 페이지 캡처 여부 (기본: True)
-        filename: 저장 파일명 (빈 문자열이면 타임스탬프 자동 생성)
-        reload: 현재 문서를 명시적으로 새로고침할 때만 True (기본: False)
-        tab_id: 브라우저 탭 식별자 (기본: 'default'). 단일 스크래퍼가 여러 탭(예: 'list', 'detail')을 동시에 열어 상태를 유지하거나 병렬 탐색할 때 지정
-
-    Returns:
-        저장된 스크린샷 파일의 절대 경로
+    url을 생략하면 현재 공유 탭을 캡처하고 탭을 유지합니다. 같은 URL도 상태를 보존하며,
+    명시적 새로고침은 reload=True로 요청합니다. 페이지 분석, 인터랙션 전후 비교, 디버깅에 사용합니다.
     """
     print(f"\n📸 [take_screenshot] {url or '(현재 페이지)'}")
-    
-    # 저장 디렉토리 생성
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-    
-    # 파일명 생성 (playwright-skill takeScreenshot 패턴: 타임스탬프)
-    if not filename:
-        timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-        filename = f"screenshot-{timestamp}.png"
-    if not filename.endswith(".png"):
-        filename += ".png"
-    
-    filepath = os.path.join(SCREENSHOT_DIR, filename)
-    abs_filepath = os.path.abspath(filepath)
-    
+
+    base_dir = os.path.abspath(SCREENSHOT_DIR)
+    os.makedirs(base_dir, exist_ok=True)
+
+    # 파일명 정규화 (./, SCREENSHOT_DIR, artifacts/screenshots/ 접두사 및 상위 경로 이탈 방지)
+    default_name = f"screenshot-{datetime.now().strftime('%Y-%m-%dT%H-%M-%S')}.png"
+    raw_name = (filename or "").replace("\\", "/").strip()
+    while raw_name.startswith("./"):
+        raw_name = raw_name[2:]
+    normalized_dir = os.path.normpath(SCREENSHOT_DIR).replace("\\", "/")
+    while normalized_dir.startswith("./"):
+        normalized_dir = normalized_dir[2:]
+    for prefix in tuple(dict.fromkeys((f"{normalized_dir}/", "artifacts/screenshots/", "screenshots/"))):
+        if prefix != "/" and raw_name.startswith(prefix):
+            raw_name = raw_name[len(prefix):]
+    cleaned_parts = []
+    for p in raw_name.split("/"):
+        p = re.sub(r"^[A-Za-z]:", "", p).strip()
+        if p and p not in (".", ".."):
+            cleaned_parts.append(p)
+    parts = cleaned_parts or [default_name]
+    if not parts[-1].lower().endswith(".png"):
+        parts[-1] += ".png"
+
+    abs_filepath = os.path.abspath(os.path.join(base_dir, *parts))
+    if os.path.commonpath([base_dir, abs_filepath]) != base_dir:
+        raise ToolException("[Error] 잘못된 스크린샷 저장 경로입니다.")
+    os.makedirs(os.path.dirname(abs_filepath), exist_ok=True)
+
     try:
         manager = await PlaywrightManager.get_instance()
         page = await manager.get_page(url if url else None, wait_ms=2000, reload=reload, tab_id=tab_id)
+    except ToolException:
+        raise
     except Exception as e:
-        return f"[Error] 페이지 로드 실패: {e}"
-    
+        raise ToolException(f"[Error] 페이지 로드 실패: {e}") from e
+
+    if not url or not url.strip():
+        try:
+            _check_blank_uninitialized_page(url, page.url, await page.content(), tab_id)
+        except ToolException:
+            raise
+        except Exception:
+            pass
+
     try:
         # 멀티탭 환경에서 백그라운드 탭의 Compositor 프레임 생성이 멈춰 타임아웃되는 현상 방지
         await page.bring_to_front()
         if selector:
-            # 특정 요소만 캡처
-            element = await page.query_selector(selector)
-            if element:
-                await element.screenshot(path=abs_filepath)
-            else:
-                return f"[Error] '{selector}' 셀렉터에 해당하는 요소를 찾지 못했습니다."
+            loc = page.locator(selector)
+            if await loc.count() == 0:
+                raise ToolException(
+                    f"[Error] '{selector}' 셀렉터에 해당하는 요소를 찾지 못했습니다. "
+                    "extract_dom_skeleton(url='')으로 현재 탭의 셀렉터를 다시 확인하세요."
+                )
+            await loc.first.screenshot(path=abs_filepath, timeout=5000)
         else:
-            # 전체 페이지 캡처
             await page.screenshot(path=abs_filepath, full_page=full_page)
+    except ToolException:
+        raise
     except Exception as e:
-        return f"[Error] 스크린샷 저장 실패: {e}"
-    
+        hint = _selector_error_hint(selector, e) if selector else ""
+        hint_suffix = f" ({hint})" if hint else ""
+        raise ToolException(f"[Error] 스크린샷 저장 실패: {e}{hint_suffix}") from e
+
     file_size = os.path.getsize(abs_filepath)
     print(f"  → 스크린샷 저장: {abs_filepath} ({file_size:,} bytes)")
-    
+
     return f"📸 스크린샷 저장 완료: {abs_filepath} ({file_size:,} bytes)"
 
 
@@ -1335,7 +1677,7 @@ class BrowseWebInput(BaseModel):
     )
     max_steps: int = Field(
         default=15,
-        description="최대 탐색 단계 수 (기본 15, 복잡한 작업은 25~30)"
+        description="최대 탐색 단계 수 (1~50 범위, 기본 15, 복잡한 작업은 25~30)"
     )
     tab_id: str = Field(
         default="default",
@@ -1349,28 +1691,19 @@ async def browse_web(task: str, url: str = "", max_steps: int = 15, tab_id: str 
     """[Level 3 - 최후의 수단] browser-use 에이전트를 가동하여 고난이도 웹 작업을 자율 수행합니다.
 
     Level 1(정적 분석)과 Level 2(interact_page)로 해결할 수 없는 경우에만 호출하세요.
-    동일 Chrome 인스턴스를 공유하므로, 로그인 등의 세션 상태가
-    이후 L1/L2 도구 호출에서도 유지됩니다.
-    
-    적합한 상황:
-    - obfuscated DOM (랜덤 클래스명 SPA)에서 비전 기반 탐색
-    - Shadow DOM / iframe 중첩 구조
-    - 미지의 UI에서 자율적 탐색이 필요한 경우
+    동일 Chrome 인스턴스를 공유하므로, 로그인 등의 세션 상태가 이후 L1/L2 도구 호출에서도 유지됩니다.
 
-    현재 공유 탭을 이어받고 마지막 활성 탭을 L1/L2에 인계합니다.
+    적합한 상황: obfuscated DOM(랜덤 클래스명 SPA) 비전 탐색, Shadow DOM/iframe 중첩 구조,
+    미지의 UI 자율 탐색. 현재 공유 탭을 이어받고 마지막 활성 탭을 L1/L2에 인계합니다.
     CAPTCHA·2FA 등 사람의 개입이 필요한 단계는 상태를 보존하고 보고하세요.
-
-    Args:
-        task: 브라우저가 자율적으로 수행해야 할 자연어 지시사항
-        url: 시작 URL (빈 문자열이면 현재 페이지에서 계속)
-        max_steps: 최대 탐색 단계 수 (기본 15)
-        tab_id: 브라우저 탭 식별자 (기본: 'default'). 단일 스크래퍼가 여러 탭(예: 'list', 'detail')을 동시에 열어 상태를 유지하거나 병렬 탐색할 때 지정
-
-    Returns:
-        수행 결과 요약 (스텝 수, 성공 여부, 최종 URL, 에이전트 결과)
     """
-    print(f"\n🌐 [browse_web] task='{task[:80]}...' url='{url}' max_steps={max_steps}")
-    
+    task_clean = (task or "").strip()
+    if not task_clean:
+        raise ToolException("[Error] task 지시사항은 비어 있을 수 없습니다.")
+
+    clamped_max_steps = max(1, min(int(max_steps), 50))
+    print(f"\n🌐 [browse_web] task='{task_clean[:80]}...' url='{url}' max_steps={clamped_max_steps}")
+
     browser_session = None
     manager = None
     try:
@@ -1380,24 +1713,24 @@ async def browse_web(task: str, url: str = "", max_steps: int = 15, tab_id: str 
 
         async with manager._browser_use_lock:
             try:
-                # 2. browser-use BrowserSession을 동일 Chrome에 연결
+                # 2. 초기 탭 이동/검증 후 browser-use BrowserSession을 동일 Chrome에 연결
                 from browser_use import Agent, BrowserSession
-                browser_session = BrowserSession(cdp_url=cdp_url, keep_alive=True)
                 page = await manager.get_page(url or None, wait_ms=0, tab_id=tab_id)
+                browser_session = BrowserSession(cdp_url=cdp_url, keep_alive=True)
                 await manager.focus_browser_session(browser_session, tab_id=tab_id)
-                
+
                 # 3. LLM 설정 (browser-use 전용 래퍼)
                 #    .env에서 OPENAI_API_KEY를 로드하여 browser-use ChatOpenAI에 전달
                 from dotenv import load_dotenv
                 load_dotenv()
                 from browser_use import ChatOpenAI
                 llm = ChatOpenAI(model="gpt-4.1-mini")
-                
+
                 # 4. task에 가이드라인 프리펜드 (다른 5개 브라우저 도구와 동일한 기본 탭·상태 유지 원칙 적용)
                 full_task = BROWSER_AGENT_GUIDE + "\n"
                 full_task += (
                     f"[현재 포커스된 탭 URL]\n{page.url}\n"
-                    f"[작업 지시]\n{task}\n\n"
+                    f"[작업 지시]\n{task_clean}\n\n"
                     "[탭 및 상태 관리 원칙]\n"
                     "1. 기본 탭 작업 원칙: 작업 지시(task)에서 명시적으로 '새 탭 열기'를 요구하지 않는 한, "
                     "새 탭(new_tab=True)을 열지 말고 현재 포커스된 탭(new_tab=False)에서 모든 이동과 조작을 수행하세요.\n"
@@ -1406,7 +1739,7 @@ async def browse_web(task: str, url: str = "", max_steps: int = 15, tab_id: str 
                     "   - 작업 지시에 따라 다른 URL이나 사이트로 이동해야 할 때는 이전 페이지를 보존하려고 새 탭을 열지 말고, 현재 탭에서 바로 해당 URL로 이동(navigate with new_tab=False)하세요.\n"
                     "3. 작업 완료 후에도 후속 도구(get_page_section 등)가 결과를 이어서 분석할 수 있도록 현재 탭을 닫지 말고 열어 두세요."
                 )
-                
+
                 # 5. Agent 실행 (이미 PlaywrightManager가 탭 포커스 및 초기 이동을 처리했으므로 directly_open_url=False)
                 agent = Agent(
                     task=full_task,
@@ -1420,37 +1753,58 @@ async def browse_web(task: str, url: str = "", max_steps: int = 15, tab_id: str 
                 # long_term_memory와 extracted_content를 동시에 반환할 때
                 # include_extracted_content_only_once=False(기본값)이면 MessageManager의
                 # if/elif 분기에서 extracted_content가 누락되어 LLM에 전달되지 않는 현상 수정
-                orig_update_history = agent._message_manager._update_agent_history_description
-                def _patched_update_history(model_output=None, result=None, step_info=None):
-                    if result:
-                        for r in result:
-                            if (
-                                getattr(r, "extracted_content", None)
-                                and getattr(r, "long_term_memory", None)
-                                and not getattr(r, "is_done", False)
-                            ):
-                                r.include_extracted_content_only_once = True
-                    return orig_update_history(
-                        model_output=model_output, result=result, step_info=step_info
-                    )
-                agent._message_manager._update_agent_history_description = _patched_update_history
-                history = await agent.run(max_steps=max_steps)
-                
+                msg_mgr = getattr(agent, "_message_manager", None)
+                orig_update_history = getattr(msg_mgr, "_update_agent_history_description", None)
+                if callable(orig_update_history):
+                    def _patched_update_history(model_output=None, result=None, step_info=None):
+                        if result:
+                            for r in result:
+                                if (
+                                    getattr(r, "extracted_content", None)
+                                    and getattr(r, "long_term_memory", None)
+                                    and not getattr(r, "is_done", False)
+                                ):
+                                    r.include_extracted_content_only_once = True
+                        return orig_update_history(
+                            model_output=model_output, result=result, step_info=step_info
+                        )
+                    msg_mgr._update_agent_history_description = _patched_update_history
+
+                history = await agent.run(max_steps=clamped_max_steps)
+
                 # 6. 결과 포맷팅 (탭 인계와 세션 연결 정리는 finally에서 수행)
                 steps = len(history)
                 success = history.is_successful()
                 urls = history.urls()
                 final_url = urls[-1] if urls else "알 수 없음"
-                result_text = history.final_result() or "결과 반환 없음"
-                
+                raw_result = history.final_result()
+                if raw_result:
+                    result_text = raw_result
+                elif success:
+                    result_text = "결과 반환 없음"
+                else:
+                    last_err = ""
+                    errors_fn = getattr(history, "errors", None)
+                    if callable(errors_fn):
+                        try:
+                            errs = [e for e in (errors_fn() or []) if e]
+                            if errs:
+                                last_err = f" (마지막 사유: {str(errs[-1])[:200]})"
+                        except Exception:
+                            pass
+                    if steps >= clamped_max_steps:
+                        result_text = f"⚠️ 작업 미완료 상태로 종료됨 (최대 스텝 {clamped_max_steps} 도달){last_err}"
+                    else:
+                        result_text = f"⚠️ 작업 미완료 상태로 종료됨{last_err}"
+
                 summary = (
                     f"[browse_web 실행 결과]\n"
-                    f"  스텝: {steps}/{max_steps}, 성공: {'✅' if success else '❌'}\n"
+                    f"  스텝: {steps}/{clamped_max_steps}, 성공: {'✅' if success else '❌'}\n"
                     f"  최종 URL: {final_url}\n"
                     f"  💡 동일 Chrome 세션 유지 — L1/L2 도구에서 인증 상태 접근 가능\n\n"
                     f"{result_text}"
                 )
-                
+
                 print(f"  → browse_web 완료: {steps}스텝, {'성공' if success else '실패'}")
                 return summary
             finally:
@@ -1463,8 +1817,30 @@ async def browse_web(task: str, url: str = "", max_steps: int = 15, tab_id: str 
                         await browser_session.stop()
                     except Exception as exc:
                         logger.warning("browser-use 연결 정리 실패: %s", exc)
+    except ToolException:
+        raise
     except Exception as e:
         error_msg = f"[Error] browse_web 실행 실패: {e}"
         print(f"  ❌ {error_msg}")
-        return error_msg
+        raise ToolException(error_msg) from e
+
+
+def _finalize_navigator_tool(t):
+    """브라우저 도구 공통 메타데이터(docstring 정제, 에러 핸들링)를 일관 적용합니다."""
+    if getattr(t, "description", None):
+        t.description = inspect.cleandoc(t.description)
+    t.handle_tool_error = True
+    t.handle_validation_error = _format_validation_error
+    return t
+
+
+for _nav_tool in (
+    extract_dom_skeleton,
+    get_page_section,
+    verify_selectors,
+    interact_page,
+    take_screenshot,
+    browse_web,
+):
+    _finalize_navigator_tool(_nav_tool)
 

@@ -24,25 +24,47 @@ Supervisor 에이전트의 멀티에이전트 오케스트레이션 핵심 도�
 """
 
 import os
+import inspect
 import uuid
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from langchain_core.tools import tool
+from langchain_core.tools import ToolException, tool
 from langgraph.prebuilt import ToolRuntime
 
+
+def _format_validation_error(error: Exception) -> str:
+    """Formats Pydantic tool validation errors into an actionable error message."""
+    details: list[str] = []
+    errors_fn = getattr(error, "errors", None)
+    if callable(errors_fn):
+        try:
+            for item in errors_fn():
+                loc = ".".join(str(p) for p in item.get("loc", ())) or "(root)"
+                details.append(f"{loc}: {item.get('msg', 'invalid value')}")
+        except Exception:
+            details = []
+    if not details:
+        details = [str(error)]
+    return "[ERROR: Invalid tool arguments — " + "; ".join(details) + "]"
+
 from app.client import AsyncAgentClient
+from app.tools.plan import check_plan_mode_tool_allowed
 
 # FastAPI 백엔드 기본 URL 및 공유 비동기 클라이언트 (커넥션 풀 재사용)
 FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "http://localhost:8000")
-_shared_client = AsyncAgentClient(base_url=FASTAPI_BASE_URL, timeout=600.0)
+_DefaultAsyncAgentClient = AsyncAgentClient
+_shared_client = _DefaultAsyncAgentClient(base_url=FASTAPI_BASE_URL, timeout=600.0)
 
 
 def get_subagent_client() -> AsyncAgentClient:
     """서브에이전트 통신에 사용되는 공유 AsyncAgentClient 인스턴스를 반환합니다."""
+    if AsyncAgentClient is not _DefaultAsyncAgentClient:
+        return AsyncAgentClient(base_url=FASTAPI_BASE_URL, timeout=600.0)
     return _shared_client
 
 
-# 기본 호출자 에이전트 이름 (컨텍스트 미제공 시 폴백)
+# 이 도구 모듈을 사용하는 에이전트의 이름 (콜백 대상 자동 지정에 활용)
+# agents/<agent_name>.py 의 AGENT_METADATA["name"] 값과 일치해야 합니다.
 _CALLER_AGENT_NAME = "main_agent"
 
 # =============================================================================
@@ -51,13 +73,17 @@ _CALLER_AGENT_NAME = "main_agent"
 
 _FULL_PROTOCOL_HEADER = """\
 [SUB-AGENT MODE - STRICT PROTOCOL]
-You are operating as a sub-agent under a Supervisor. You MUST follow these rules:
+You are operating as a sub-agent under a Main Agent. You MUST follow these rules:
 1. NO greetings or conversational responses. Execute the task immediately.
 2. Context & Plan: If a plan is shared, refer to it to understand the broader context and prior outputs.
    Do NOT modify the plan yourself. If adjustments are needed, propose them in your report.
-3. On ANY blocker (corrupted file / site blocked / selector failure / access denied):
-   STOP immediately and return EXACTLY:
-   [BLOCKER: <concise reason>]
+3. Recoverable failures (selector mismatch, delayed rendering, temporary network errors):
+   Read a relevant local skill and attempt evidence-based recovery within the task's time/retry budget.
+   If no budget was given, attempt at most 2 distinct recovery strategies for the same problem.
+   Never repeat the same failed action without new evidence. Recovery must stay within the authorized task.
+   STOP when authorization/credentials are missing, human intervention is required, or the budget is exhausted.
+   Then return EXACTLY:
+   [BLOCKER: <reason; recovery attempts; preserved state/artifacts; required next step>]
 4. On success: write all results to disk first, then return EXACTLY:
    [TASK REPORT]
    - Status: SUCCESS
@@ -71,7 +97,11 @@ _PROTOCOL_REMINDER = """\
 [CONTINUE SUB-AGENT PROTOCOL]
 This is a follow-up task in the same session.
 Apply the same strict sub-agent protocol established earlier:
-no conversational responses, return [BLOCKER] on failure, [TASK REPORT] on success.
+no conversational responses; try relevant skills for recoverable failures within the task budget
+(at most 2 distinct strategies for the same problem if unspecified).
+Return [BLOCKER] for missing authorization/credentials, required human intervention, or exhausted recovery;
+include previous attempts and preserved state. Do not reset the recovery budget on follow-up calls.
+Return [TASK REPORT] on success.
 ══════════════════════════════════════════════════════════"""
 
 
@@ -100,30 +130,30 @@ def _build_subagent_message(
 # =============================================================================
 
 SUB_AGENT_ROLE = "sub"
+_NON_SUB_AGENT_NAMES = {"supervisor", "main_agent", "chatbot"}
 
 
 async def _get_sub_agents(client: AsyncAgentClient) -> List[dict]:
     """Agent Registry에서 AGENT_METADATA["roles"]에 'sub'가 포함된 에이전트만 반환합니다."""
     agents = await client.get_agents()
-    return [
-        a for a in (agents or [])
-        if isinstance(a, dict) and SUB_AGENT_ROLE in (a.get("roles") or [])
-    ]
+    result = []
+    for a in (agents or []):
+        if not isinstance(a, dict):
+            continue
+        roles = a.get("roles")
+        if roles is None:
+            roles = ["main"] if a.get("name") in _NON_SUB_AGENT_NAMES else ["main", "sub"]
+        if SUB_AGENT_ROLE in roles:
+            result.append(a)
+    return result
 
 
 @tool
 async def list_sub_agents() -> str:
-    """Returns the list of specialist sub-agents currently available on the server.
+    """Returns the formatted list of specialist sub-agents currently available on the server.
 
     Use this tool to discover which sub-agents can be delegated to before calling
     invoke_sub_agent. The returned list includes each agent's name and description.
-
-    Returns:
-        A formatted string listing available sub-agent names and descriptions.
-        Example:
-            Available sub-agents:
-            - scraper: 웹 데이터 수집 전문 에이전트
-            - analyst: 데이터 분석 및 리포트 생성 전문 에이전트
     """
     client = get_subagent_client()
     try:
@@ -137,8 +167,12 @@ async def list_sub_agents() -> str:
             desc = agent.get("description", "No description provided.")
             lines.append(f"  - {name}: {desc}")
         return "\n".join(lines)
+    except ToolException:
+        raise
     except Exception as e:
-        return f"[ERROR: Failed to query agent registry — {str(e)}]"
+        raise ToolException(
+            f"[ERROR: Failed to query agent registry at {FASTAPI_BASE_URL} — {str(e)}. Ensure the FastAPI server is running.]"
+        ) from e
 
 
 # =============================================================================
@@ -155,8 +189,8 @@ class InvokeSubAgentInput(BaseModel):
     target_file_list: List[str] = Field(
         default_factory=list,
         description=(
-            "List of relative file paths the sub-agent should inspect or create. "
-            "These define where the sub-agent reads input context or stores its output artifacts."
+            "List of relative file paths the sub-agent should inspect or create "
+            "(including the Shared Plan File path returned by exit_plan, input data paths, and output artifact paths)."
         )
     )
     subagent_role: str = Field(
@@ -191,13 +225,13 @@ class InvokeSubAgentInput(BaseModel):
 @tool(args_schema=InvokeSubAgentInput)
 async def invoke_sub_agent(
     task_instruction: str,
-    target_file_list: List[str] = [],
+    target_file_list: Optional[List[str]] = None,
     subagent_role: str = "scraper",
     run_in_background: bool = False,
     sub_thread_id: Optional[str] = None,
     runtime: ToolRuntime = None,
 ) -> str:
-    """Delegates a focused task to a specialized sub-agent running on the server.
+    """Delegates a focused task to a specialized sub-agent and returns [TASK REPORT], [JOB SUBMITTED], or [BLOCKER].
 
     WHEN TO USE:
       - Web scraping / data collection tasks          → subagent_role="scraper"
@@ -214,31 +248,43 @@ async def invoke_sub_agent(
         instance to continue its prior work or recover from a [BLOCKER] with its memory preserved.
 
     PROTOCOL — BEFORE CALLING:
-      1. Register a task with task_create() to track this delegation.
-      2. Set target_file_list to exact output artifact path(s)
-         (e.g. ['artifacts/users/default/sessions/.../outputs/quotes.json']).
+      1. For multi-step tasks, enter_plan(intent='new' or 'revise') -> perform any needed read-only discovery -> exit_plan(plan_name, steps)
+         to publish your plan on the Shared Blackboard before delegating.
+      2. Register a task with task_create() to track this delegation.
+      3. Include the Shared Plan File path (returned by exit_plan) along with target input/output artifact paths
+         in target_file_list (e.g. ['artifacts/users/.../plan/plan_state.json', 'artifacts/data/quotes.json'])
+         so the sub-agent shares the full context.
 
-    PROTOCOL — BACKGROUND EXECUTION (run_in_background=True) [RECOMMENDED DEFAULT FOR SUB-AGENTS]:
-      - MUST be used for all data analysis, chart/dashboard creation, Excel writing, and scraping.
-      - Even if data already exists, generating charts & dashboards takes multiple tool steps (>1 min).
-      - Returns immediately with [JOB SUBMITTED] including Job ID and Sub-Thread ID.
-      - Inform the user that the background job has started (with Job ID).
-      - When finished, the server will automatically notify and wake you up with full results to continue.
+    PROTOCOL — EXECUTION MODE (run_in_background):
+      - Background mode (run_in_background=True) [RECOMMENDED DEFAULT FOR SUB-AGENTS]:
+          * MUST be used for all data analysis, chart/dashboard creation, Excel writing, and scraping.
+          * Even if data already exists, generating charts & dashboards takes multiple tool steps (>1 min).
+          * Returns immediately with [JOB SUBMITTED] including Job ID and Sub-Thread ID.
+          * Inform the user that the background job has started (with Job ID).
+          * When finished, the server will automatically notify and wake you up with full results to continue.
+      - Synchronous mode (run_in_background=False):
+          * Use ONLY for lightweight text inquiries (e.g. asking agent capabilities).
 
-    PROTOCOL — AFTER RECEIVING RESPONSE (SYNCHRONOUS / run_in_background=False):
-      - Use ONLY for lightweight text inquiries (e.g. asking agent capabilities).
+    PROTOCOL — AFTER RECEIVING SUB-AGENT RESULT (BACKGROUND WAKEUP OR SYNCHRONOUS):
       - [TASK REPORT] + Status: SUCCESS
           → Call task_update(task_id, 'COMPLETED').
       - [BLOCKER: <reason>]  (sub-agent encountered an unrecoverable issue)
           → Call task_update(task_id, 'BLOCKED').
-          → Create a fallback task with task_create() and retry with
-            corrected parameters or an alternative target.
-
-    Returns:
-        [TASK REPORT] formatted string (with Sub-Thread ID) on synchronous success.
-        [JOB SUBMITTED] formatted string (with Job ID and Sub-Thread ID) on background launch.
-        [BLOCKER: reason] string on failure.
+          → Inspect the cause, previous recovery attempts, preserved artifacts,
+            and remaining budget.
+          → When new evidence and budget support an alternative strategy or fallback path,
+            backtrack first: call enter_plan(intent='revise', goal=...) -> perform any needed
+            read-only discovery -> call exit_plan(plan_name, steps) -> register the fallback
+            task with task_create(), then re-delegate (pass the same sub_thread_id if continuing
+            the same attempt history; do not reset retry counts on follow-up calls).
+          → Report missing authorization/credentials, required human intervention,
+            or exhausted recovery to the user with the required next step.
     """
+    if not (task_instruction or "").strip():
+        return "[BLOCKER: 'task_instruction' cannot be empty. Provide a clear, actionable instruction for the sub-agent.]"
+
+    resolved_files = list(target_file_list or [])
+
     # 1. ToolRuntime으로 호출 에이전트 정보 추출
     supervisor_tid = "supervisor_default"
     if runtime and runtime.execution_info and runtime.execution_info.thread_id:
@@ -250,9 +296,25 @@ async def invoke_sub_agent(
         caller_agent = getattr(runtime.context, "agent_name", None) or _CALLER_AGENT_NAME
         caller_user_id = getattr(runtime.context, "user_id", None) or "default"
 
+    guard_sid = (
+        runtime.execution_info.thread_id
+        if (runtime and runtime.execution_info and runtime.execution_info.thread_id)
+        else None
+    )
+    guard_uid = (
+        getattr(runtime.context, "user_id", None)
+        if (runtime and hasattr(runtime, "context") and runtime.context)
+        else None
+    )
+    block_msg = check_plan_mode_tool_allowed(
+        "invoke_sub_agent", session_id=guard_sid, user_id=guard_uid
+    )
+    if block_msg:
+        return block_msg
+
     client = get_subagent_client()
 
-    # 2. Agent Registry 동적 조회 — sub 역할이 없는 에이전트(main_agent, chatbot 등)는 즉시 차단
+    # 2. Agent Registry 동적 조회 — sub 역할이 없는 에이전트(supervisor, chatbot 등)는 즉시 차단
     try:
         available_agents = await _get_sub_agents(client)
         agent_names = [a.get("name") for a in available_agents]
@@ -303,7 +365,7 @@ async def invoke_sub_agent(
 
     message = _build_subagent_message(
         task_instruction,
-        target_file_list,
+        resolved_files,
         is_first_call,
         workspace_info=workspace_info,
     )
@@ -368,20 +430,23 @@ class GetJobStatusInput(BaseModel):
 
 @tool(args_schema=GetJobStatusInput)
 async def get_sub_agent_job_status(job_id: str) -> str:
-    """Checks the progress and completion result of a background sub-agent job.
+    """Checks the progress and completion result (RUNNING, SUCCESS, FAILED) of a background sub-agent job.
 
     WHEN TO USE:
       - When the user asks for the status of a background task.
       - To inspect intermediate status or final reports of background jobs.
-
-    Returns:
-        Formatted status string containing status (RUNNING, SUCCESS, FAILED) and result/error.
     """
+    if not (job_id or "").strip():
+        raise ToolException("[ERROR: 'job_id' cannot be empty. Pass the Job ID returned by invoke_sub_agent.]")
+
     client = get_subagent_client()
     try:
         job = await client.get_job(job_id)
         if not job or job.get("status") == "error":
-            return f"[ERROR: Job '{job_id}' not found or query failed — {job.get('message', '')}]"
+            err_msg = job.get("message", "") if isinstance(job, dict) else ""
+            raise ToolException(
+                f"[ERROR: Job '{job_id}' not found or query failed — {err_msg}. Verify the Job ID from invoke_sub_agent.]"
+            )
 
         status = job.get("status", "UNKNOWN")
         agent_name = job.get("agent_name", "unknown")
@@ -409,5 +474,20 @@ async def get_sub_agent_job_status(job_id: str) -> str:
             lines.append(f"\n[Error Detail]\n{job.get('error', 'Unknown error')}")
 
         return "\n".join(lines)
+    except ToolException:
+        raise
     except Exception as e:
-        return f"[ERROR: Exception while checking job status — {str(e)}]"
+        raise ToolException(f"[ERROR: Exception while checking job status — {str(e)}]") from e
+
+
+def _finalize_supervisor_tool(t):
+    """Supervisor 오케스트레이션 도구 공통 메타데이터(docstring 정제, 에러 핸들링)를 일관 적용합니다."""
+    if getattr(t, "description", None):
+        t.description = inspect.cleandoc(t.description)
+    t.handle_tool_error = True
+    t.handle_validation_error = _format_validation_error
+    return t
+
+
+for _sup_tool in (list_sub_agents, invoke_sub_agent, get_sub_agent_job_status):
+    _finalize_supervisor_tool(_sup_tool)

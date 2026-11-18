@@ -69,7 +69,7 @@ async def create_agent_executor(checkpointer=None):
         checkpointer = AsyncSqliteSaver(conn)
         await checkpointer.setup()
     
-    # 4. 도구 바인딩 (범용 10대 도구 + Mission 01 커스텀 도구 2종 결합)
+    # 4. 도구 바인딩 (범용 9대 도구 + Mission 01 커스텀 도구 2종 결합)
     active_tools = list(tools_chatbot) + [roll_dice, convert_currency]
     
     # 5. 하네스로 결합된 최종 에이전트 인스턴스 구축
