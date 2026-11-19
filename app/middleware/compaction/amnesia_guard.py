@@ -234,6 +234,16 @@ class AmnesiaGuardMiddleware(AgentMiddleware):
             return f"[{plan_name}]\n{body}" if isinstance(plan_name, str) and plan_name else body
         return None
 
+    @staticmethod
+    def _is_tool_result_error(result) -> bool:
+        """Return True when the tool execution returned an error status or error prefix."""
+        if getattr(result, "status", None) == "error":
+            return True
+        content = getattr(result, "content", None)
+        if isinstance(content, str) and content.lstrip().startswith(("[ERROR", "[PLANNING MODE GUARDRAIL]")):
+            return True
+        return False
+
     def _track_tool_request(self, request) -> None:
         tool_call = getattr(request, "tool_call", None) or {}
         tool_name = tool_call.get("name", "")
@@ -248,8 +258,8 @@ class AmnesiaGuardMiddleware(AgentMiddleware):
             if key in args and isinstance(args[key], str):
                 self.track_file_access(args[key], session_key=session_key)
 
-        if tool_name == "exit_plan":
-            plan_text = self._format_plan_text(args)
+        if tool_name in PLAN_CLEAR_TOOLS:
+            plan_text = self._format_plan_text(args) if tool_name == "exit_plan" else None
             if plan_text is not None:
                 self.set_active_plan(plan_text, session_key=session_key)
             else:
@@ -260,16 +270,18 @@ class AmnesiaGuardMiddleware(AgentMiddleware):
                 self.set_active_plan(plan_text, session_key=session_key)
             elif tool_name == "enter_plan" and args.get("intent") == "new":
                 self.clear_active_plan(session_key=session_key)
-        elif tool_name in PLAN_CLEAR_TOOLS:
-            self.clear_active_plan(session_key=session_key)
 
     def wrap_tool_call(self, request, handler):
-        self._track_tool_request(request)
-        return handler(request)
+        result = handler(request)
+        if not self._is_tool_result_error(result):
+            self._track_tool_request(request)
+        return result
 
     async def awrap_tool_call(self, request, handler):
-        self._track_tool_request(request)
-        return await handler(request)
+        result = await handler(request)
+        if not self._is_tool_result_error(result):
+            self._track_tool_request(request)
+        return result
 
 
 def create_amnesia_guard_middleware(amnesia_guard: AmnesiaGuardMiddleware) -> AmnesiaGuardMiddleware:

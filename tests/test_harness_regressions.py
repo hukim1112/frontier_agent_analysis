@@ -257,6 +257,58 @@ def test_amnesia_guard_claude_code_plan_mode_lifecycle(Guard):
 
 
 @pytest.mark.parametrize("Guard", GUARD_IMPLS)
+def test_amnesia_guard_ignores_rejected_plan_tool_calls(Guard):
+    """실패하거나 차단된 exit_plan/enter_plan 호출은 기존 active_plan을 덮어쓰거나 지우지 않아야 합니다."""
+    from langchain_core.tools import ToolException, tool as lc_tool
+
+    @lc_tool("exit_plan")
+    def failing_exit_plan(plan_name: str, steps: list[str]) -> str:
+        """Finalize plan steps (simulated rejection)."""
+        raise ToolException("[ERROR] Not currently in planning mode.")
+
+    failing_exit_plan.handle_tool_error = True
+
+    @lc_tool("enter_plan")
+    def failing_enter_plan(intent: str = "new", goal: str = "") -> str:
+        """Enter plan mode (simulated block)."""
+        return "[ERROR: Invalid transition]"
+
+    guard = Guard()
+    cfg = {"configurable": {"thread_id": "t-err"}}
+    guard.set_active_plan("[Original Plan]\n1. Keep me", session_key="t-err")
+
+    sync_agent = create_agent(
+        model=scripted(
+            _tool_call_msg("exit_plan", {"plan_name": "Bad Overwrite", "steps": ["Wrong step"]}, "e1"),
+            _tool_call_msg("enter_plan", {"intent": "new", "goal": "Should not clear"}, "e2"),
+            "done",
+        ),
+        tools=[failing_exit_plan, failing_enter_plan],
+        middleware=[guard],
+    )
+    sync_agent.invoke({"messages": [HumanMessage(content="try bad calls")]}, config=cfg)
+
+    rec = guard.create_recovery_attachments(session_key="t-err")[0].content
+    assert "[Original Plan]" in rec and "Keep me" in rec
+    assert "Bad Overwrite" not in rec
+
+    async def check_async():
+        async_agent = create_agent(
+            model=scripted(
+                _tool_call_msg("exit_plan", {"plan_name": "Async Overwrite", "steps": ["Bad"]}, "e3"),
+                "done",
+            ),
+            tools=[failing_exit_plan],
+            middleware=[guard],
+        )
+        await async_agent.ainvoke({"messages": [HumanMessage(content="async fail")]}, config=cfg)
+
+    asyncio.run(check_async())
+    rec_after = guard.create_recovery_attachments(session_key="t-err")[0].content
+    assert "[Original Plan]" in rec_after and "Async Overwrite" not in rec_after
+
+
+@pytest.mark.parametrize("Guard", GUARD_IMPLS)
 def test_amnesia_guard_direct_calls_use_default_bucket(Guard):
     """노트북처럼 그래프 밖에서 직접 호출하면 기존과 동일하게 동작해야 합니다 (하위 호환)."""
     guard = Guard(max_restore_files=2)
