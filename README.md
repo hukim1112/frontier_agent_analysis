@@ -28,7 +28,7 @@
 ```text
 frontier_agent_analysis/
 ├── app/                              # 🧠 메인 애플리케이션 및 하네스 모듈
-│   ├── agents/                       #   ├── main_agent.py (21종 도구 + 9단계 미들웨어 오케스트레이터)
+│   ├── agents/                       #   ├── main_agent.py (22종 도구 + 9단계 미들웨어 오케스트레이터)
 │   │                                 #   └── chatbot.py, analyst.py, scraper.py
 │   ├── middleware/                   #   📁 체계화된 하네스 미들웨어 패키지
 │   │   ├── prompt/                   #   │   └── prompt_assembler.py (16-Module 5-Layer 조립기)
@@ -115,7 +115,7 @@ chainlit run app/chainlit_ui.py --port 8080
 - **기본 로그인 계정**:
   - **ID**: `user`
   - **Password**: `1234`
-- 21종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
+- 22종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
 
 ### 2. 백엔드 FastAPI 서버 구동
 ```bash

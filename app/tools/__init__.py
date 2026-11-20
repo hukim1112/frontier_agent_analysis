@@ -38,14 +38,14 @@ tools_scraper = [
     bash_command, web_search, web_fetch,
 ]
 
-# 👑 Supervisor용 도구 바인딩: 계획(5종) + 오케스트레이션(3종) + 범용(7종) = 15종
+# 👑 Supervisor용 도구 바인딩: 계획(5종) + 오케스트레이션(3종) + 범용(8종) = 16종
 tools_supervisor = [
     # Planning & Task Board
     enter_plan, exit_plan, task_create, task_list, task_update,
     # Sub-Agent Orchestration
     list_sub_agents, invoke_sub_agent, get_sub_agent_job_status,
-    # Common File / Search / Shell
-    file_read, file_writer, file_edit, grep_search, glob_search, web_search, bash_command,
+    # Common File / Search / Shell / Web
+    file_read, file_writer, file_edit, grep_search, glob_search, bash_command, web_search, web_fetch,
 ]
 
 # 🔬 Analyst용 도구 바인딩: 분석(3종) + 출력(3종) + 공통(6종) = 12종

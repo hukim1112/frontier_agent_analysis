@@ -7,7 +7,7 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
   app/agents/main_agent/
    ├── agent.py       (에이전트 조립 및 9단계 미들웨어 파이프라인)
    ├── prompt.py      (SUPERVISOR_SYSTEM_PROMPT — PromptAssembler의 Layer 1)
-   ├── tools.py       (계획 5종 + 오케스트레이션 3종 + 공통 7종 = 15종 도구 바인딩)
+   ├── tools.py       (계획 5종 + 오케스트레이션 3종 + 공통 8종 = 16종 도구 바인딩)
    └── skills/        (에이전트 내재화 스킬 — 대화 속 skill_listing 알림으로 노출)
 
 [하네스 구성 요소]
@@ -33,7 +33,7 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
    - ToolErrorHandlerMiddleware : 도구 예외 시 ToolMessage(Observation)로 변환
    - ModelCallLimitMiddleware   : 무한 루프 차단 (run_limit=50)
    - StopHooksMiddleware        : 생성된 Python 코드블록 AST 구문 검증 및 자가 교정 루프
-5. 도구: tools_supervisor(15종) + memory_tools(2종) + skill_tools(2종) + custom_tools(2종) = 총 21종
+5. 도구: tools_supervisor(16종) + memory_tools(2종) + skill_tools(2종) + custom_tools(2종) = 총 22종
    + MCP 도구 (configs/mcp.config, 예: mcp__wikipedia__search / mcp__wikipedia__readArticle)
 
 [미들웨어 파이프라인 실행 순서]
@@ -149,7 +149,7 @@ async def create_agent_executor(checkpointer=None):
         checkpointer = AsyncSqliteSaver(conn)
         await checkpointer.setup()
 
-    # 4. 도구 바인딩 (Supervisor 15종 + Custom 2종 = 17종 / Memory 2종 + Skill 2종은 memory_mw가 create_agent에 자동 등록 → 총 21종)
+    # 4. 도구 바인딩 (Supervisor 16종 + Custom 2종 = 18종 / Memory 2종 + Skill 2종은 memory_mw가 create_agent에 자동 등록 → 총 22종)
     #    ※ 도구 정의는 create_agent(tools=...)를 거쳐 API tools 필드로만 전달합니다 (시스템 프롬프트에는 넣지 않음).
     active_tools = list(tools_supervisor) + [roll_dice, convert_currency]
 
