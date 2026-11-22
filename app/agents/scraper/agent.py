@@ -98,10 +98,15 @@ async def create_agent_executor(checkpointer=None):
     middleware = []
 
     # log_dir 미지정(기본): 서브에이전트 워크스페이스 logs/audit.jsonl / 지정 시: {log_dir}/{session_id}/audit.jsonl
+    # logging_enabled=False여도 실시간 진행 상태 스냅샷(메모리)은 항상 수집하고 디스크 적재만 제어
     logging_cfg = _load_config("./configs/logging.config", {"logging_enabled": False})
-    if logging_cfg.get("logging_enabled"):
-        log_dir = logging_cfg.get("log_dir")
-        middleware.append(AgentLogTracer(log_dir=log_dir) if log_dir else AgentLogTracer())
+    disk_logging_enabled = bool(logging_cfg.get("logging_enabled", False))
+    log_dir = logging_cfg.get("log_dir")
+    middleware.append(
+        AgentLogTracer(log_dir=log_dir, disk_enabled=disk_logging_enabled)
+        if log_dir
+        else AgentLogTracer(disk_enabled=disk_logging_enabled)
+    )
 
     middleware.append(prompt_mw)
 
@@ -113,15 +118,11 @@ async def create_agent_executor(checkpointer=None):
     ])
 
     # 5. Scraper 에이전트 구축
-    scraper_agent = create_agent(
+    return create_agent(
         model=llm,
         tools=tools_scraper,
         middleware=middleware,
         checkpointer=checkpointer,
         context_schema=AgentContext
     )
-    scraper_agent.registered_tools = list(tools_scraper)
-    scraper_agent.checkpointer_conn = conn
-    scraper_agent.assembler = assembler
-    return scraper_agent
 

@@ -183,16 +183,23 @@ class AsyncAgentClient:
         except httpx.HTTPError as e:
             return {"status": "error", "message": str(e)}
 
-    async def get_job(self, job_id: str) -> dict:
+    async def get_job(self, job_id: str, caller_thread_id: Optional[str] = None) -> dict:
         """
         GET /jobs/{job_id} — 백그라운드 작업의 상태 및 결과를 조회합니다.
         """
         url = f"{self.base_url}/jobs/{job_id}"
+        params = {"caller_thread_id": caller_thread_id} if caller_thread_id else None
         client = self._get_client()
         try:
-            response = await client.get(url, timeout=10.0)
+            response = await client.get(url, params=params, timeout=10.0)
             response.raise_for_status()
             return response.json()
+        except httpx.HTTPStatusError as e:
+            return {
+                "status": "error",
+                "status_code": e.response.status_code,
+                "message": f"{e} — {e.response.text}",
+            }
         except httpx.HTTPError as e:
             return {"status": "error", "message": str(e)}
 
@@ -208,6 +215,35 @@ class AsyncAgentClient:
             return response.json()
         except httpx.HTTPError:
             return []
+
+    async def cancel_job(
+        self,
+        job_id: str,
+        reason: Optional[str] = None,
+        caller_thread_id: Optional[str] = None,
+    ) -> dict:
+        """
+        POST /jobs/{job_id}/cancel — 실행 중이거나 대기 중인 백그라운드 작업을 취소합니다.
+        """
+        url = f"{self.base_url}/jobs/{job_id}/cancel"
+        payload = {}
+        if reason:
+            payload["reason"] = reason
+        if caller_thread_id:
+            payload["caller_thread_id"] = caller_thread_id
+        client = self._get_client()
+        try:
+            response = await client.post(url, json=payload, timeout=15.0)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            return {
+                "status": "error",
+                "status_code": e.response.status_code,
+                "message": f"{e} — {e.response.text}",
+            }
+        except httpx.HTTPError as e:
+            return {"status": "error", "message": str(e)}
 
     async def get_messages(self, session_id: str) -> list:
         """

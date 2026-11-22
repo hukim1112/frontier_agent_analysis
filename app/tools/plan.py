@@ -50,6 +50,7 @@ PLANNING_ALLOWED_TOOLS = frozenset({
     "task_update",
     "list_sub_agents",
     "get_sub_agent_job_status",
+    "cancel_sub_agent_job",
     "file_read",
     "grep_search",
     "glob_search",

@@ -622,7 +622,54 @@ class PlaywrightManager:
             except Exception:
                 continue
         return False
-    
+
+    async def close_session_tabs(self, session_id: str) -> int:
+        """특정 세션(sub_thread_id)에 할당된 모든 브라우저 탭과 슬롯 상태를 안전하게 정리합니다.
+
+        공유 Chrome 인스턴스가 종료되지 않도록 컨텍스트의 마지막 남은 탭인 경우 닫는 대신 about:blank로 초기화합니다.
+        """
+        sid = (session_id or "").strip()
+        if not sid or sid == _DEFAULT_BROWSER_SESSION:
+            return 0
+
+        prefix = f"{sid}::"
+        matching_slots = sorted(
+            {
+                k
+                for k in (
+                    list(self._pages_by_session.keys())
+                    + list(self._target_ids_by_session.keys())
+                    + list(self._session_locks.keys())
+                )
+                if k.startswith(prefix)
+            }
+        )
+        if not matching_slots:
+            return 0
+
+        cleaned = 0
+        for slot in matching_slots:
+            page = self._pages_by_session.pop(slot, None)
+            self._target_ids_by_session.pop(slot, None)
+            self._session_locks.pop(slot, None)
+            if page is None:
+                continue
+            self._watched_pages.discard(page)
+            try:
+                if page.is_closed():
+                    cleaned += 1
+                    continue
+                context = getattr(page, "context", None)
+                open_pages = [p for p in (getattr(context, "pages", None) or []) if not p.is_closed()]
+                if len(open_pages) > 1:
+                    await page.close()
+                else:
+                    await page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+                cleaned += 1
+            except Exception as err:
+                logger.warning(f"⚠️ Failed to clean up browser tab for slot '{slot}': {err}")
+        return cleaned
+
     async def close(self):
         """브라우저를 종료하고 리소스를 해제합니다.
         

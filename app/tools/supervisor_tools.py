@@ -18,8 +18,12 @@ Supervisor 에이전트의 멀티에이전트 오케스트레이션 핵심 도�
     - 이후 호출: 간결한 Protocol Reminder만 주입 (기존 계약 참조)
     - [BLOCKER] 반환으로 Supervisor의 Backtracking 트리거
 
-  get_sub_agent_job_status: 백그라운드 작업의 진행 상태 및 결과 조회 도구.
-    - GET /jobs/{job_id} 로 작업 상태(RUNNING, SUCCESS, FAILED) 및 보고서 확인
+  get_sub_agent_job_status: 백그라운드 작업의 진행 상태(실시간 LLM/도구 텔레메트리 포함) 및 결과 조회 도구.
+    - GET /jobs/{job_id} 또는 GET /sessions/{thread_id}/jobs 로 진행 상태(SUBMITTED, RUNNING, SUCCESS, FAILED, CANCELLED) 확인
+    - job_id 생략 시 현재 세션에 연관된 모든 백그라운드 작업 요약 목록 반환
+
+  cancel_sub_agent_job: 실행 중이거나 대기 중인 백그라운드 서브에이전트 작업 중단 도구.
+    - POST /jobs/{job_id}/cancel 로 실행 중인 태스크 취소, 브라우저 탭 정리 및 Reactive Wakeup 억제
 ===============================================================================
 """
 
@@ -48,6 +52,7 @@ def _format_validation_error(error: Exception) -> str:
     return "[ERROR: Invalid tool arguments — " + "; ".join(details) + "]"
 
 from app.client import AsyncAgentClient
+from app.middleware.observability.agent_log_tracer import AgentLogTracer, _render_snapshot_report
 from app.tools.plan import check_plan_mode_tool_allowed
 
 # FastAPI 백엔드 기본 URL 및 공유 비동기 클라이언트 (커넥션 풀 재사용)
@@ -326,9 +331,24 @@ async def invoke_sub_agent(
     except Exception as e:
         return f"[BLOCKER: Failed to query agent registry — {str(e)}]"
 
-    # 3. Sub-agent 전용 세션 ID 구성 및 첫 호출 여부 판단
+    # 3. Sub-agent 전용 세션 ID 구성 및 첫 호출 여부 판단 (취소된 세션 재사용 차단 포함)
     if sub_thread_id and sub_thread_id.strip():
         resolved_sub_tid = sub_thread_id.strip()
+        try:
+            session_jobs = await client.get_session_jobs(supervisor_tid)
+        except Exception:
+            session_jobs = []
+        if any(
+            isinstance(j, dict)
+            and j.get("sub_thread_id") == resolved_sub_tid
+            and j.get("status") == "CANCELLED"
+            for j in (session_jobs or [])
+        ):
+            return (
+                f"[BLOCKER: Cannot reuse cancelled sub_thread_id '{resolved_sub_tid}'. "
+                f"A cancelled sub-agent thread may contain incomplete tool-call checkpoints. "
+                f"Omit sub_thread_id (leave it None) to start a fresh, isolated sub-agent session.]"
+            )
         try:
             prior_messages = await client.get_messages(resolved_sub_tid)
             is_first_call = len(prior_messages) == 0
@@ -419,44 +439,140 @@ async def invoke_sub_agent(
 
 
 # =============================================================================
-# get_sub_agent_job_status Tool
+# get_sub_agent_job_status & cancel_sub_agent_job Tools
 # =============================================================================
 
+def _extract_caller_thread_id(runtime: ToolRuntime = None) -> Optional[str]:
+    if runtime and getattr(runtime, "execution_info", None) and runtime.execution_info.thread_id:
+        tid = str(runtime.execution_info.thread_id).strip()
+        return tid or None
+    return None
+
+
 class GetJobStatusInput(BaseModel):
-    job_id: str = Field(
-        description="The Job ID returned by invoke_sub_agent when run_in_background=True (e.g. 'job_a1b2c3d4')."
+    job_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional Job ID returned by invoke_sub_agent when run_in_background=True "
+            "(e.g. 'job_a1b2c3d4'). Omit to list all background jobs in the current session."
+        ),
     )
 
 
 @tool(args_schema=GetJobStatusInput)
-async def get_sub_agent_job_status(job_id: str) -> str:
-    """Checks the progress and completion result (RUNNING, SUCCESS, FAILED) of a background sub-agent job.
+async def get_sub_agent_job_status(
+    job_id: Optional[str] = None,
+    runtime: ToolRuntime = None,
+) -> str:
+    """Checks the progress and completion result (SUBMITTED, RUNNING, SUCCESS, FAILED, CANCELLED) of background sub-agent jobs.
 
     WHEN TO USE:
-      - When the user asks for the status of a background task.
-      - To inspect intermediate status or final reports of background jobs.
+      - Pass job_id to inspect live execution phase/tools/telemetry and final reports for a specific job.
+      - Omit job_id to list all background jobs and their live summaries in the current session.
     """
-    if not (job_id or "").strip():
-        raise ToolException("[ERROR: 'job_id' cannot be empty. Pass the Job ID returned by invoke_sub_agent.]")
-
     client = get_subagent_client()
+    clean_job_id = (job_id or "").strip()
+    caller_tid = _extract_caller_thread_id(runtime)
+
     try:
-        job = await client.get_job(job_id)
+        if not clean_job_id:
+            supervisor_tid = caller_tid
+            if not supervisor_tid:
+                raise ToolException(
+                    "[ERROR: 'job_id' cannot be empty when no active session context is available. "
+                    "Pass the Job ID returned by invoke_sub_agent.]"
+                )
+            jobs = await client.get_session_jobs(supervisor_tid)
+            if not jobs:
+                return (
+                    f"[SESSION JOBS: {supervisor_tid}]\n"
+                    "No background sub-agent jobs found for this session."
+                )
+
+            lines = [f"[SESSION JOBS: {supervisor_tid}] ({len(jobs)} job(s))"]
+            for item in jobs:
+                jid = item.get("job_id", "unknown")
+                role = item.get("agent_name", "unknown")
+                st = item.get("status", "UNKNOWN")
+                sub_tid = item.get("sub_thread_id") or ""
+                wu = item.get("wakeup_status") or ""
+                summary = f"- Job ID: {jid} | Sub-Agent: {role} | Status: {st}"
+                if wu:
+                    summary += f" | Wakeup: {wu}"
+                if sub_tid:
+                    summary += f" | Sub-Thread ID: {sub_tid}"
+                lines.append(summary)
+
+                prog = item.get("progress")
+                if not prog and sub_tid and st in ("SUBMITTED", "RUNNING"):
+                    parent_sid = item.get("parent_thread_id") or item.get("callback_thread_id") or supervisor_tid
+                    snap = AgentLogTracer.get_session_snapshot(
+                        session_id=sub_tid,
+                        user_id=item.get("user_id"),
+                        parent_session_id=parent_sid,
+                        workspace_dir=item.get("workspace_dir"),
+                        recent_limit=3,
+                        allow_disk_fallback=False,
+                    )
+                    snap_started = snap.get("started_at")
+                    job_created_ts = item.get("created_at_ts")
+                    stale_by_time = (
+                        snap_started is not None
+                        and job_created_ts is not None
+                        and float(snap_started) < float(job_created_ts) - 0.05
+                    )
+                    if (
+                        snap.get("found")
+                        and not stale_by_time
+                        and not (st == "SUBMITTED" and snap.get("status") in ("SUCCESS", "FAILED", "CANCELLED"))
+                    ):
+                        prog = snap
+                if isinstance(prog, dict) and prog.get("found"):
+                    elapsed_s = prog.get("elapsed_ms", 0) / 1000.0
+                    detail = (
+                        f"  Progress: phase={prog.get('phase')}, "
+                        f"LLM steps={prog.get('llm_step_count', 0)}, "
+                        f"Tool calls={prog.get('total_tool_calls', 0)} (failed={prog.get('failed_tool_calls', 0)}), "
+                        f"elapsed={elapsed_s:.1f}s"
+                    )
+                    active_tools = prog.get("active_tools") or []
+                    if active_tools:
+                        active_names = ", ".join(
+                            str(t.get("tool_name", "")) for t in active_tools if t.get("tool_name")
+                        )
+                        if active_names:
+                            detail += f", active_tools=[{active_names}]"
+                    lines.append(detail)
+                elif st == "CANCELLED" and item.get("cancel_reason"):
+                    lines.append(f"  Cancel Reason: {item['cancel_reason']}")
+                elif st == "FAILED" and item.get("error"):
+                    lines.append(f"  Error: {str(item['error'])[:160]}")
+            return "\n".join(lines)
+
+        job = await client.get_job(clean_job_id, caller_thread_id=caller_tid)
         if not job or job.get("status") == "error":
             err_msg = job.get("message", "") if isinstance(job, dict) else ""
             raise ToolException(
-                f"[ERROR: Job '{job_id}' not found or query failed — {err_msg}. Verify the Job ID from invoke_sub_agent.]"
+                f"[ERROR: Job '{clean_job_id}' not found or query failed — {err_msg}. Verify the Job ID from invoke_sub_agent.]"
             )
+
+        if caller_tid:
+            owners = {tid for tid in (job.get("callback_thread_id"), job.get("parent_thread_id")) if tid}
+            if owners and caller_tid not in owners:
+                raise ToolException(
+                    f"[ERROR: Access denied — Job '{clean_job_id}' does not belong to session '{caller_tid}'.]"
+                )
 
         status = job.get("status", "UNKNOWN")
         agent_name = job.get("agent_name", "unknown")
         sub_tid = job.get("sub_thread_id") or ""
         created_at = job.get("created_at", "")
-        completed_at = job.get("completed_at") or "In Progress"
+        completed_at = job.get("completed_at") or ("Cancelled" if status == "CANCELLED" else "In Progress")
+        wakeup_status = job.get("wakeup_status")
 
         lines = [
-            f"[JOB STATUS REPORT]",
-            f"- Job ID: {job_id}",
+            "[JOB STATUS REPORT]",
+            f"- Job ID: {clean_job_id}",
             f"- Sub-Agent: {agent_name}",
         ]
         if sub_tid:
@@ -466,18 +582,128 @@ async def get_sub_agent_job_status(job_id: str) -> str:
             f"- Started: {created_at}",
             f"- Completed: {completed_at}",
         ])
+        if wakeup_status:
+            lines.append(f"- Wakeup Status: {wakeup_status}")
+
+        progress_report = (job.get("progress_report") or "").strip()
+        if not progress_report and isinstance(job.get("progress"), dict):
+            progress_report = _render_snapshot_report(job["progress"]).strip()
+        is_active = status in ("SUBMITTED", "RUNNING")
+        if not progress_report and sub_tid:
+            parent_sid = job.get("parent_thread_id") or job.get("callback_thread_id")
+            snap = AgentLogTracer.get_session_snapshot(
+                session_id=sub_tid,
+                user_id=job.get("user_id"),
+                parent_session_id=parent_sid,
+                workspace_dir=job.get("workspace_dir"),
+                recent_limit=5,
+            )
+            snap_started = snap.get("started_at")
+            job_created_ts = job.get("created_at_ts")
+            stale_by_time = (
+                is_active
+                and snap_started is not None
+                and job_created_ts is not None
+                and float(snap_started) < float(job_created_ts) - 0.05
+            )
+            stale_terminal = not is_active and snap.get("status") in ("RUNNING", "INTERRUPTED")
+            if (
+                snap.get("found")
+                and not stale_by_time
+                and not stale_terminal
+                and not (status == "SUBMITTED" and snap.get("status") in ("SUCCESS", "FAILED", "CANCELLED"))
+            ):
+                progress_report = _render_snapshot_report(snap).strip()
+
+        if progress_report:
+            lines.append(f"\n[Live Execution Progress]\n{progress_report}")
+
         if status == "SUCCESS":
             lines.append(f"\n[Sub-Agent Final Report]\n{job.get('result', '')}")
             if job.get("supervisor_response"):
                 lines.append(f"\n[Supervisor Follow-up Action]\n{job.get('supervisor_response')}")
         elif status == "FAILED":
             lines.append(f"\n[Error Detail]\n{job.get('error', 'Unknown error')}")
+            if job.get("supervisor_response"):
+                lines.append(f"\n[Supervisor Follow-up Action]\n{job.get('supervisor_response')}")
+            if job.get("wakeup_error"):
+                lines.append(f"\n[Wakeup Error]\n{job.get('wakeup_error')}")
+        elif status == "CANCELLED":
+            if job.get("cancel_reason"):
+                lines.append(f"- Cancel Reason: {job['cancel_reason']}")
+            lines.append(
+                "- Note: This job was cancelled (reactive wakeup suppressed). "
+                "Do not reuse this Sub-Thread ID; omit sub_thread_id to start a fresh session."
+            )
 
         return "\n".join(lines)
     except ToolException:
         raise
     except Exception as e:
         raise ToolException(f"[ERROR: Exception while checking job status — {str(e)}]") from e
+
+
+class CancelJobInput(BaseModel):
+    job_id: str = Field(
+        description="The Job ID of the background sub-agent job to cancel (e.g. 'job_a1b2c3d4')."
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="Optional concise reason for cancellation.",
+    )
+
+
+@tool(args_schema=CancelJobInput)
+async def cancel_sub_agent_job(
+    job_id: str,
+    reason: Optional[str] = None,
+    runtime: ToolRuntime = None,
+) -> str:
+    """Cancels a queued or running background sub-agent job and cleans up its runtime resources.
+
+    WHEN TO USE:
+      - When user goals change, a background job is no longer needed, or live status shows a stall.
+      - Stops task execution, closes isolated browser tabs, and suppresses reactive wakeup.
+      - Do NOT reuse a cancelled job's sub_thread_id afterward.
+    """
+    clean_job_id = (job_id or "").strip()
+    if not clean_job_id:
+        raise ToolException("[ERROR: 'job_id' cannot be empty. Pass the Job ID to cancel.]")
+
+    caller_tid = _extract_caller_thread_id(runtime)
+    client = get_subagent_client()
+    try:
+        res = await client.cancel_job(clean_job_id, reason=reason, caller_thread_id=caller_tid)
+        if not isinstance(res, dict) or res.get("status") == "error":
+            err_msg = res.get("message", "unknown error") if isinstance(res, dict) else "invalid response"
+            raise ToolException(f"[ERROR: Failed to cancel job '{clean_job_id}' — {err_msg}]")
+
+        if res.get("already_finished") and not res.get("cancelled"):
+            return (
+                f"[JOB ALREADY FINISHED]\n"
+                f"- Job ID: {clean_job_id}\n"
+                f"- Status: {res.get('status', 'UNKNOWN')}\n"
+                f"- Detail: {res.get('message', 'Job already finished before cancellation.')}"
+            )
+
+        lines = [
+            "[JOB CANCELLED]",
+            f"- Job ID: {clean_job_id}",
+            f"- Sub-Agent: {res.get('agent_name', 'unknown')}",
+        ]
+        if res.get("sub_thread_id"):
+            lines.append(f"- Sub-Thread ID: {res['sub_thread_id']}")
+        lines.append(f"- Status: {res.get('status', 'CANCELLED')}")
+        lines.append(f"- Reason: {res.get('cancel_reason') or reason or 'Cancelled by request'}")
+        lines.append(
+            "- Note: Reactive wakeup is suppressed for this job. "
+            "Do not reuse this Sub-Thread ID; omit sub_thread_id to start a fresh session."
+        )
+        return "\n".join(lines)
+    except ToolException:
+        raise
+    except Exception as e:
+        raise ToolException(f"[ERROR: Exception while cancelling job — {str(e)}]") from e
 
 
 def _finalize_supervisor_tool(t):
@@ -489,5 +715,5 @@ def _finalize_supervisor_tool(t):
     return t
 
 
-for _sup_tool in (list_sub_agents, invoke_sub_agent, get_sub_agent_job_status):
+for _sup_tool in (list_sub_agents, invoke_sub_agent, get_sub_agent_job_status, cancel_sub_agent_job):
     _finalize_supervisor_tool(_sup_tool)

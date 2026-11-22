@@ -30,14 +30,15 @@ else:
 
 import logging
 import json
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 import traceback
 import inspect
 import importlib
 from typing import AsyncGenerator, Optional, Dict, Any, List
 
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -50,6 +51,7 @@ from app.utils.database import (
     get_shared_checkpointer, close_shared_checkpointer,
 )
 from app.context import AgentContext
+from app.middleware.observability.agent_log_tracer import AgentLogTracer, _render_snapshot_report
 from app.tools.plan import plan_session_scope
 from app.utils.workspace import resolve_session_workspace
 
@@ -58,6 +60,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LLMOps_Server")
 
 DEFAULT_RECURSION_LIMIT = 250
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def load_config(file_path: str, default: dict) -> dict:
@@ -188,12 +194,19 @@ class JobSubmitInput(BaseModel):
     user_id: Optional[str] = None
 
 
+class JobCancelInput(BaseModel):
+    reason: Optional[str] = None
+    caller_thread_id: Optional[str] = None
+
+
 # --- Router Factory & Async Lock Store ---
 from contextlib import asynccontextmanager
 import asyncio
 
 # --- In-Memory Job Store & Unified Thread-Level Execution Lock ---
 job_store: Dict[str, dict] = {}
+job_tasks: Dict[str, asyncio.Task] = {}
+MAX_CONSECUTIVE_FAILED_WAKEUPS = 3
 thread_locks: Dict[str, asyncio.Lock] = {}
 thread_inflight_counts: Dict[str, int] = {}
 wakeup_locks = thread_locks
@@ -238,27 +251,28 @@ async def lifespan(app: FastAPI):
     app.state.checkpointer = await get_shared_checkpointer()
     yield
     logger.info("🛑 FastAPI Lifespan Shutdown: Cleaning up resources...")
-    # 1. 공유 LangGraph checkpointer 및 개별 에이전트 커넥션 종료
+    # 0. 실행 중인 백그라운드 작업 태스크 취소 및 대기
+    pending_tasks = [t for t in list(job_tasks.values()) if not t.done()]
+    for t in pending_tasks:
+        t.cancel()
+    if pending_tasks:
+        await asyncio.wait(pending_tasks, timeout=3.0)
+    job_tasks.clear()
+    # 1. 공유 LangGraph checkpointer, MemoryMiddleware 백그라운드 리뷰/스토어, 개별 커넥션 종료
     await close_shared_checkpointer()
+    try:
+        from app.middleware.memory import MemoryMiddleware
+        await MemoryMiddleware.aclose_all_instances(review_timeout=5.0)
+    except Exception as e:
+        logger.error(f"⚠️ Error closing MemoryMiddleware instances: {e}")
+
     for name, agent in list(app.state.agents.items()):
         try:
-            mem_mw = getattr(agent, "memory_middleware", None)
-            if mem_mw is not None and hasattr(mem_mw, "wait_for_reviews"):
-                await asyncio.to_thread(mem_mw.wait_for_reviews, 5.0)
-                if hasattr(mem_mw, "_review_queue"):
-                    mem_mw._review_queue.shutdown()
-            epi_store = getattr(agent, "episodic_store", None)
-            if epi_store is not None and hasattr(epi_store, "close"):
-                await epi_store.close()
-            tr_store = getattr(agent, "transcript_store", None)
-            if tr_store is not None and hasattr(tr_store, "close"):
-                await tr_store.close()
             checkpointer = getattr(agent, "checkpointer", None)
-            if checkpointer:
-                conn = getattr(checkpointer, "conn", None)
-                if conn and getattr(conn, "_running", False):
-                    logger.info(f"🔌 Closing database connection for agent: {name}")
-                    await conn.close()
+            conn = getattr(checkpointer, "conn", None) if checkpointer else None
+            if conn is not None and getattr(conn, "_running", False):
+                logger.info(f"🔌 Closing database connection for agent: {name}")
+                await conn.close()
         except Exception as e:
             logger.error(f"⚠️ Error cleaning up database connection for agent '{name}': {e}")
     # 2. 공유 AsyncAgentClient 커넥션 풀 종료
@@ -479,6 +493,247 @@ async def invoke_agent(agent_name: str, input_data: UserInput, request: Request)
 
 
 # --- Long-Running Background Job Worker (Event-Driven Reactive Wakeup) ---
+def _verify_job_caller(job: dict, caller_thread_id: Optional[str]) -> None:
+    """caller_thread_id가 전달된 경우 대상 Job의 부모 세션 소유권을 검증합니다 (불일치 시 403)."""
+    caller_tid = (caller_thread_id or "").strip()
+    if not caller_tid:
+        return
+    owners = {
+        tid
+        for tid in (job.get("callback_thread_id"), job.get("parent_thread_id"))
+        if tid
+    }
+    if owners and caller_tid not in owners:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Job '{job.get('job_id')}' does not belong to session '{caller_tid}'.",
+        )
+
+
+def _effective_job_start_ts(job: dict) -> Optional[float]:
+    if "execution_started_at_ts" in job:
+        ts = job.get("execution_started_at_ts")
+        return float(ts) if ts is not None else None
+    ts = job.get("created_at_ts")
+    return float(ts) if ts is not None else None
+
+
+def _snapshot_belongs_to_job(job: dict, snap: dict) -> bool:
+    """현재 sub_thread_id의 스냅샷이 주어진 job에 속하는지 시작 시각 기준으로 판별합니다."""
+    job_id = job.get("job_id")
+    sub_tid = job.get("sub_thread_id")
+    if not job_id or not sub_tid:
+        return True
+
+    if "execution_started_at_ts" in job and job.get("execution_started_at_ts") is None:
+        return False
+
+    same_thread_jobs = [
+        (idx, j)
+        for idx, j in enumerate(job_store.values())
+        if j.get("sub_thread_id") == sub_tid
+    ]
+    if not same_thread_jobs:
+        return True
+
+    snap_started_at = snap.get("started_at")
+    if snap_started_at is not None:
+        snap_ts = float(snap_started_at)
+        candidates = []
+        for idx, j in same_thread_jobs:
+            eff_ts = _effective_job_start_ts(j)
+            if eff_ts is not None and eff_ts <= snap_ts + 0.005:
+                candidates.append((eff_ts, idx, j.get("job_id")))
+        if candidates:
+            _, _, owner_job_id = max(candidates, key=lambda item: (item[0], item[1]))
+            return owner_job_id == job_id
+        if any(_effective_job_start_ts(j) is not None for _, j in same_thread_jobs):
+            return False
+
+    started_jobs = [
+        (idx, j)
+        for idx, j in same_thread_jobs
+        if not ("execution_started_at_ts" in j and j.get("execution_started_at_ts") is None)
+    ]
+    if not started_jobs:
+        return False
+    return started_jobs[-1][1].get("job_id") == job_id
+
+
+def _enrich_job_with_progress(job: dict, include_terminal: bool = True) -> dict:
+    """job_store 레코드에 AgentLogTracer 실시간/디스크 진행 스냅샷을 결합한 사본을 반환합니다."""
+    enriched = dict(job)
+    sub_tid = job.get("sub_thread_id")
+    if not sub_tid:
+        return enriched
+
+    status = job.get("status", "")
+    is_active = status in ("SUBMITTED", "RUNNING")
+    if not include_terminal and not is_active:
+        return enriched
+    if "execution_started_at_ts" in job and job.get("execution_started_at_ts") is None:
+        return enriched
+
+    parent_sid = job.get("parent_thread_id") or job.get("callback_thread_id")
+    snap = AgentLogTracer.get_session_snapshot(
+        session_id=sub_tid,
+        user_id=job.get("user_id"),
+        parent_session_id=parent_sid,
+        workspace_dir=job.get("workspace_dir"),
+        recent_limit=5,
+        allow_disk_fallback=include_terminal,
+    )
+    if not snap.get("found"):
+        return enriched
+    if not _snapshot_belongs_to_job(job, snap):
+        return enriched
+    if not is_active and snap.get("status") in ("RUNNING", "INTERRUPTED"):
+        return enriched
+    if status == "SUBMITTED" and snap.get("status") in ("SUCCESS", "FAILED", "CANCELLED"):
+        return enriched
+
+    enriched["progress"] = snap
+    enriched["progress_report"] = _render_snapshot_report(snap)
+    return enriched
+
+
+def _count_consecutive_failures(callback_thread_id: Optional[str], agent_name: str) -> int:
+    """동일 부모 세션의 특정 서브에이전트 최근 연속 실패 횟수를 완료 시각 역순으로 계산합니다."""
+    matched = [
+        (idx, j)
+        for idx, j in enumerate(job_store.values())
+        if j.get("callback_thread_id") == callback_thread_id
+        and j.get("agent_name") == agent_name
+        and j.get("status") in ("SUCCESS", "FAILED")
+    ]
+    matched.sort(
+        key=lambda item: (item[1].get("completed_at") or item[1].get("created_at") or "", item[0]),
+        reverse=True,
+    )
+    count = 0
+    for _, j in matched:
+        if j.get("status") == "FAILED":
+            count += 1
+        elif j.get("status") == "SUCCESS":
+            break
+    return count
+
+
+async def _cleanup_cancelled_subagent_resources(sub_thread_id: Optional[str]) -> int:
+    """취소된 서브에이전트 세션이 점유한 브라우저 탭 등 외부 리소스를 안전하게 정리합니다."""
+    if not sub_thread_id:
+        return 0
+    try:
+        from app.tools.navigator import PlaywrightManager
+
+        if PlaywrightManager._instance is not None:
+            return await PlaywrightManager._instance.close_session_tabs(sub_thread_id)
+    except Exception as err:
+        logger.warning(f"⚠️ Failed to clean up browser tabs for '{sub_thread_id}': {err}")
+    return 0
+
+
+async def _trigger_reactive_wakeup(
+    job_id: str,
+    agent_name: str,
+    input_data: JobSubmitInput,
+    context_obj: AgentContext,
+    app: FastAPI,
+    outcome: str,
+    task_report: str = "",
+    error_text: str = "",
+) -> None:
+    """서브에이전트 SUCCESS 또는 FAILED 직후 Supervisor를 비동기 재호출하고 wakeup_status를 추적합니다."""
+    job = job_store.get(job_id)
+    if not input_data.callback_agent:
+        if job is not None:
+            job["wakeup_status"] = "SKIPPED"
+        return
+
+    cb_agent = input_data.callback_agent
+    cb_thread_id = input_data.callback_thread_id or f"session_{job_id}"
+    fail_count = 0
+
+    if outcome == "FAILED":
+        fail_count = _count_consecutive_failures(cb_thread_id, agent_name)
+        if fail_count > MAX_CONSECUTIVE_FAILED_WAKEUPS:
+            msg = (
+                f"Suppressed reactive wakeup after {fail_count} consecutive failures "
+                f"for '{agent_name}'."
+            )
+            if job is not None:
+                job["wakeup_status"] = "SKIPPED"
+                job["wakeup_error"] = msg
+            logger.warning(f"🧯 [Job {job_id}] {msg}")
+            return
+
+        telemetry = ""
+        if input_data.thread_id:
+            telemetry = AgentLogTracer.format_session_report(
+                session_id=input_data.thread_id,
+                user_id=getattr(context_obj, "user_id", None) or input_data.user_id,
+                parent_session_id=input_data.parent_thread_id or input_data.callback_thread_id,
+                workspace_dir=getattr(context_obj, "workspace_dir", None),
+            )
+        telemetry_section = f"- Execution Telemetry:\n{telemetry}\n" if telemetry else ""
+        trigger_prompt = (
+            f"[SYSTEM NOTIFICATION: BACKGROUND TASK FAILED]\n"
+            f"- Job ID: {job_id}\n"
+            f"- Sub-Agent: {agent_name}\n"
+            f"- Sub-Thread ID: {input_data.thread_id} (use sub_thread_id='{input_data.thread_id}' to inspect/continue if appropriate)\n"
+            f"- Consecutive Failures for '{agent_name}': {max(1, fail_count)}/{MAX_CONSECUTIVE_FAILED_WAKEUPS}\n"
+            f"- Error Detail:\n{error_text}\n"
+            f"{telemetry_section}\n"
+            f"[INSTRUCTION FOR SUPERVISOR]\n"
+            f"서브에이전트 백그라운드 작업이 실패했습니다. 태스크 상태를 `task_update(..., 'BLOCKED')`로 갱신하고 오류 원인과 텔레메트리를 점검하세요. "
+            f"근거 있는 대안이나 수정 전략이 있다면 계획을 수정(`enter_plan(intent='revise')`)한 뒤 재위임하고, "
+            f"동일 실패를 근거 없이 반복하지 마세요. 복구가 불가능하거나 사용자 조치가 필요하면 원인과 현재 상태를 명확히 보고하세요."
+        )
+    else:
+        trigger_prompt = (
+            f"[SYSTEM NOTIFICATION: BACKGROUND TASK COMPLETED]\n"
+            f"- Job ID: {job_id}\n"
+            f"- Sub-Agent: {agent_name}\n"
+            f"- Sub-Thread ID: {input_data.thread_id} (use sub_thread_id='{input_data.thread_id}' to continue this agent)\n"
+            f"- Report Content:\n{task_report}\n\n"
+            f"[INSTRUCTION FOR SUPERVISOR]\n"
+            f"위 서브에이전트의 완료 보고서와 생성된 산출물을 바탕으로 다음 작업을 수행하거나 유저에게 답변합니다 "
+            f"생성된 차트 이미지나 HTML 대시보드가 있다면 UI 렌더링 태그(<Render_HTML>, <Render_Image>, <Render_File>)를 통해 출력 가능합니다."
+        )
+
+    if job is not None:
+        job["wakeup_status"] = "RUNNING"
+
+    try:
+        logger.info(
+            f"🚀 [Job {job_id}] Triggering reactive wakeup ({outcome}) for '{cb_agent}' (Thread: {cb_thread_id})..."
+        )
+        cb_executor = await get_or_load_agent(cb_agent, app)
+        cb_user_id = getattr(context_obj, "user_id", None) or input_data.user_id
+        cb_context_obj, cb_config = await _resolve_run(
+            cb_agent, cb_thread_id, user_id=cb_user_id, force_disable_hitl=True
+        )
+        async with acquire_thread_slot(cb_thread_id):
+            with plan_session_scope(cb_thread_id, user_id=cb_context_obj.user_id):
+                sup_result = await cb_executor.ainvoke(
+                    {"messages": [("user", trigger_prompt)]},
+                    config=cb_config,
+                    context=cb_context_obj,
+                )
+            sup_last = sup_result["messages"][-1]
+            sup_response = sanitize_text(normalize_content(sup_last.content))
+            if job is not None:
+                job["supervisor_response"] = sup_response
+                job["wakeup_status"] = "COMPLETED"
+        logger.info(f"🎉 [Job {job_id}] Reactive Wakeup ({outcome}) completed! Supervisor produced final response.")
+    except Exception as cb_err:
+        if job is not None:
+            job["wakeup_status"] = "FAILED"
+            job["wakeup_error"] = str(cb_err)
+        logger.error(f"⚠️ [Job {job_id}] Error during reactive wakeup of '{cb_agent}': {cb_err}")
+        traceback.print_exc()
+
+
 async def _run_agent_job(
     job_id: str,
     agent_name: str,
@@ -490,7 +745,30 @@ async def _run_agent_job(
     job = job_store.get(job_id)
     if not job:
         return
+
+    if input_data.callback_thread_id and not job.get("callback_thread_id"):
+        job["callback_thread_id"] = input_data.callback_thread_id
+    if input_data.parent_thread_id and not job.get("parent_thread_id"):
+        job["parent_thread_id"] = input_data.parent_thread_id
+    if getattr(context_obj, "user_id", None) and not job.get("user_id"):
+        job["user_id"] = context_obj.user_id
+    if getattr(context_obj, "workspace_dir", None) and not job.get("workspace_dir"):
+        job["workspace_dir"] = context_obj.workspace_dir
+    if not job.get("sub_thread_id") and input_data.thread_id:
+        job["sub_thread_id"] = input_data.thread_id
+
+    if job.get("cancel_requested"):
+        job["status"] = "CANCELLED"
+        job["completed_at"] = _utc_now_iso()
+        job["wakeup_status"] = "SKIPPED"
+        job.setdefault("cancel_reason", "Cancelled before execution started")
+        await _cleanup_cancelled_subagent_resources(input_data.thread_id)
+        return
+
     job["status"] = "RUNNING"
+    job.setdefault("created_at_ts", time.time())
+    job.setdefault("execution_started_at_ts", None)
+    job.setdefault("wakeup_status", "PENDING" if input_data.callback_agent else "SKIPPED")
     logger.info(f"⚙️ [Job {job_id}] Started background execution for agent '{agent_name}'")
 
     try:
@@ -511,58 +789,64 @@ async def _run_agent_job(
             return sanitize_text(normalize_content(last_message.content))
 
         async with acquire_thread_slot(input_data.thread_id):
+            job["execution_started_at_ts"] = time.time()
             task_report = await _execute_subagent()
 
+        if job.get("cancel_requested"):
+            raise asyncio.CancelledError()
+
         job["status"] = "SUCCESS"
-        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
+        job["completed_at"] = _utc_now_iso()
         job["result"] = task_report
         logger.info(f"✅ [Job {job_id}] Sub-agent '{agent_name}' completed successfully")
 
-        # 2. 🌟 Reactive Agent Wakeup: 서브에이전트 완료 즉시 Supervisor 자동 호출 & 후속 작업 수행
-        if input_data.callback_agent:
-            try:
-                cb_agent = input_data.callback_agent
-                cb_thread_id = input_data.callback_thread_id or f"session_{job_id}"
-                logger.info(f"🚀 [Job {job_id}] Triggering reactive wakeup for '{cb_agent}' (Thread: {cb_thread_id})...")
-
-                cb_executor = await get_or_load_agent(cb_agent, app)
-
-                trigger_prompt = (
-                    f"[SYSTEM NOTIFICATION: BACKGROUND TASK COMPLETED]\n"
-                    f"- Job ID: {job_id}\n"
-                    f"- Sub-Agent: {agent_name}\n"
-                    f"- Sub-Thread ID: {input_data.thread_id} (use sub_thread_id='{input_data.thread_id}' to continue this agent)\n"
-                    f"- Report Content:\n{task_report}\n\n"
-                    f"[INSTRUCTION FOR SUPERVISOR]\n"
-                    f"위 서브에이전트의 완료 보고서와 생성된 산출물을 바탕으로 다음 작업을 수행하거나 유저에게 답변합니다 "
-                    f"생성된 차트 이미지나 HTML 대시보드가 있다면 UI 렌더링 태그(<Render_HTML>, <Render_Image>, <Render_File>)를 통해 출력 가능합니다."
-                )
-
-                cb_user_id = getattr(context_obj, "user_id", None) or input_data.user_id
-                cb_context_obj, cb_config = await _resolve_run(
-                    cb_agent, cb_thread_id, user_id=cb_user_id, force_disable_hitl=True
-                )
-                async with acquire_thread_slot(cb_thread_id):
-                    with plan_session_scope(cb_thread_id, user_id=cb_context_obj.user_id):
-                        sup_result = await cb_executor.ainvoke(
-                            {"messages": [("user", trigger_prompt)]},
-                            config=cb_config,
-                            context=cb_context_obj,
-                        )
-                    sup_last = sup_result["messages"][-1]
-                    sup_response = sanitize_text(normalize_content(sup_last.content))
-                    job["supervisor_response"] = sup_response
-                logger.info(f"🎉 [Job {job_id}] Reactive Wakeup completed! Supervisor produced final response.")
-            except Exception as cb_err:
-                logger.error(f"⚠️ [Job {job_id}] Error during reactive wakeup of '{input_data.callback_agent}': {cb_err}")
-                traceback.print_exc()
+    except asyncio.CancelledError:
+        logger.info(f"🛑 [Job {job_id}] Background execution cancelled for agent '{agent_name}'")
+        job["status"] = "CANCELLED"
+        job["completed_at"] = _utc_now_iso()
+        job["wakeup_status"] = "SKIPPED"
+        job.setdefault("cancel_reason", "Cancelled")
+        await _cleanup_cancelled_subagent_resources(input_data.thread_id)
+        raise
 
     except Exception as e:
+        if job.get("cancel_requested"):
+            logger.info(
+                f"🛑 [Job {job_id}] Ignored teardown exception after cancel request ({type(e).__name__}: {e})"
+            )
+            job["status"] = "CANCELLED"
+            job["completed_at"] = job.get("completed_at") or _utc_now_iso()
+            job["wakeup_status"] = "SKIPPED"
+            job.setdefault("cancel_reason", "Cancelled")
+            await _cleanup_cancelled_subagent_resources(input_data.thread_id)
+            return
         logger.error(f"❌ [Job {job_id}] Background execution failed: {e}")
         traceback.print_exc()
+        err_text = str(e)
         job["status"] = "FAILED"
-        job["completed_at"] = datetime.utcnow().isoformat() + "Z"
-        job["error"] = str(e)
+        job["completed_at"] = _utc_now_iso()
+        job["error"] = err_text
+        await _trigger_reactive_wakeup(
+            job_id=job_id,
+            agent_name=agent_name,
+            input_data=input_data,
+            context_obj=context_obj,
+            app=app,
+            outcome="FAILED",
+            error_text=err_text,
+        )
+        return
+
+    # 2. 🌟 Reactive Agent Wakeup: 서브에이전트 완료(SUCCESS) 후 Supervisor 자동 호출 & 후속 작업 수행
+    await _trigger_reactive_wakeup(
+        job_id=job_id,
+        agent_name=agent_name,
+        input_data=input_data,
+        context_obj=context_obj,
+        app=app,
+        outcome="SUCCESS",
+        task_report=task_report,
+    )
 
 
 # --- Job Management Endpoints ---
@@ -570,7 +854,6 @@ async def _run_agent_job(
 async def submit_agent_job(
     agent_name: str,
     input_data: JobSubmitInput,
-    background_tasks: BackgroundTasks,
     request: Request,
 ):
     """비동기 백그라운드 작업을 등록하고 job_id를 즉시 반환합니다."""
@@ -579,56 +862,150 @@ async def submit_agent_job(
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found. Available: {available}")
 
     effective_parent_tid = input_data.parent_thread_id or input_data.callback_thread_id
+    resolved_tid = (input_data.thread_id or "").strip() or (
+        f"{effective_parent_tid or 'bg'}_{agent_name}_{uuid.uuid4().hex[:8]}"
+    )
+    if input_data.thread_id != resolved_tid:
+        input_data = input_data.model_copy(update={"thread_id": resolved_tid})
+
+    if any(
+        j.get("sub_thread_id") == resolved_tid and j.get("status") == "CANCELLED"
+        for j in job_store.values()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reuse cancelled sub_thread_id '{resolved_tid}'. Start a fresh session instead.",
+        )
+
     context_obj, config = await _resolve_run(
         agent_name,
-        input_data.thread_id,
+        resolved_tid,
         user_id=input_data.user_id,
         parent_thread_id=effective_parent_tid,
         force_disable_hitl=True,
     )
 
     job_id = f"job_{uuid.uuid4().hex[:8]}"
-    created_at = datetime.utcnow().isoformat() + "Z"
+    created_at_ts = time.time()
+    created_at = _utc_now_iso()
     job_store[job_id] = {
         "job_id": job_id,
         "agent_name": agent_name,
-        "sub_thread_id": input_data.thread_id,
+        "sub_thread_id": resolved_tid,
+        "parent_thread_id": effective_parent_tid,
         "user_id": context_obj.user_id,
+        "workspace_dir": context_obj.workspace_dir,
         "status": "SUBMITTED",
         "created_at": created_at,
+        "created_at_ts": created_at_ts,
+        "execution_started_at_ts": None,
         "completed_at": None,
         "result": None,
         "error": None,
+        "cancel_requested": False,
+        "cancel_reason": None,
         "supervisor_response": None,
+        "wakeup_status": "PENDING" if input_data.callback_agent else "SKIPPED",
+        "wakeup_error": None,
         "callback_agent": input_data.callback_agent,
         "callback_thread_id": input_data.callback_thread_id,
     }
 
-    background_tasks.add_task(_run_agent_job, job_id, agent_name, input_data, context_obj, config, request.app)
-    return {"job_id": job_id, "status": "SUBMITTED", "agent_name": agent_name}
+    task = asyncio.create_task(
+        _run_agent_job(job_id, agent_name, input_data, context_obj, config, request.app),
+        name=f"agent-job-{job_id}",
+    )
+    job_tasks[job_id] = task
+    task.add_done_callback(lambda _t, jid=job_id: job_tasks.pop(jid, None))
+    return {
+        "job_id": job_id,
+        "status": "SUBMITTED",
+        "agent_name": agent_name,
+        "sub_thread_id": resolved_tid,
+    }
 
 
-@app.get("/jobs/{job_id}")
-async def get_job_status(job_id: str):
-    """특정 작업의 진행 상태와 결과(및 Supervisor 후속 보고서)를 조회합니다."""
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, body: Optional[JobCancelInput] = None):
+    """실행 중이거나 대기 중인 백그라운드 작업을 즉시 취소하고 리소스를 정리합니다."""
     job = job_store.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-    return job
+    _verify_job_caller(job, body.caller_thread_id if body else None)
+
+    if job.get("status") == "CANCELLED":
+        return {
+            "job_id": job_id,
+            "agent_name": job.get("agent_name"),
+            "sub_thread_id": job.get("sub_thread_id"),
+            "status": "CANCELLED",
+            "cancelled": True,
+            "already_finished": True,
+            "cancel_reason": job.get("cancel_reason"),
+            "message": f"Job '{job_id}' was already cancelled.",
+        }
+
+    if job.get("status") not in ("SUBMITTED", "RUNNING"):
+        return {
+            "job_id": job_id,
+            "agent_name": job.get("agent_name"),
+            "sub_thread_id": job.get("sub_thread_id"),
+            "status": job.get("status"),
+            "cancelled": False,
+            "already_finished": True,
+            "message": f"Job '{job_id}' already finished with status '{job.get('status')}'.",
+        }
+
+    reason = (body.reason.strip() if (body and body.reason) else "") or "Cancelled by request"
+    job["cancel_requested"] = True
+    job["cancel_reason"] = reason
+
+    task = job_tasks.get(job_id)
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.wait({task}, timeout=3.0)
+
+    if job.get("status") in ("SUBMITTED", "RUNNING"):
+        job["status"] = "CANCELLED"
+        job["completed_at"] = _utc_now_iso()
+        job["wakeup_status"] = "SKIPPED"
+        await _cleanup_cancelled_subagent_resources(job.get("sub_thread_id"))
+
+    return {
+        "job_id": job_id,
+        "agent_name": job.get("agent_name"),
+        "sub_thread_id": job.get("sub_thread_id"),
+        "status": job.get("status"),
+        "cancelled": job.get("status") == "CANCELLED",
+        "already_finished": False,
+        "cancel_reason": job.get("cancel_reason"),
+        "wakeup_status": job.get("wakeup_status"),
+    }
+
+
+@app.get("/jobs/{job_id}")
+async def get_job_status(job_id: str, caller_thread_id: Optional[str] = None):
+    """특정 작업의 진행 상태와 결과(및 실시간 실행 텔레메트리/Supervisor 후속 보고서)를 조회합니다."""
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    _verify_job_caller(job, caller_thread_id)
+    return _enrich_job_with_progress(job, include_terminal=True)
 
 
 @app.get("/jobs")
 async def list_jobs():
     """모든 백그라운드 작업 목록을 조회합니다."""
-    return list(job_store.values())
+    return [_enrich_job_with_progress(job, include_terminal=False) for job in job_store.values()]
 
 
 @app.get("/sessions/{thread_id}/jobs")
 async def list_session_jobs(thread_id: str):
-    """특정 세션(thread)에 연관된 모든 백그라운드 작업 목록을 반환합니다."""
+    """특정 세션(thread)에 연관된 모든 백그라운드 작업 목록과 실시간 텔레메트리를 반환합니다."""
     return [
-        job for job in job_store.values()
-        if job.get("callback_thread_id") == thread_id
+        _enrich_job_with_progress(job, include_terminal=False)
+        for job in job_store.values()
+        if job.get("callback_thread_id") == thread_id or job.get("parent_thread_id") == thread_id
     ]
 
 

@@ -7,7 +7,7 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
   app/agents/main_agent/
    ├── agent.py       (에이전트 조립 및 9단계 미들웨어 파이프라인)
    ├── prompt.py      (SUPERVISOR_SYSTEM_PROMPT — PromptAssembler의 Layer 1)
-   ├── tools.py       (계획 5종 + 오케스트레이션 3종 + 공통 8종 = 16종 도구 바인딩)
+   ├── tools.py       (계획 5종 + 오케스트레이션 4종 + 공통 8종 = 17종 도구 바인딩)
    └── skills/        (에이전트 내재화 스킬 — 대화 속 skill_listing 알림으로 노출)
 
 [하네스 구성 요소]
@@ -20,7 +20,7 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
    - L4 Environment & Memory   ← CWD, Host OS, Session ID, Session Workspace Root + 메모리 사용 규칙(Module 9)
    - L5 Resource Control       ← scratchpad, 도구 결과 정리 공지 (MCP 지침은 대화 속 알림)
    - 사용자 컨텍스트 메시지(M3) ← CLAUDE.md + 장기기억 동결 스냅샷(MEMORY.md / USER.md / PROCEDURAL 스킬 카탈로그) + 세션 시작 날짜
-   - 대화 끝 에피소드 알림      ← 현재 턴 질문으로 회상된 EPISODIC MEMORY (<system-reminder>)
+   - 대화 끝 에피소드 알림      ← 현재 턴 질문으로 회상된 EPISODIC MEMORY (before_model이 턴당 1회 state에 영속 저장)
 3. 계층형 메모리 (Layered Memory & Dual-Tier Session Data):
    - L1 단기 기억  : AsyncSqliteSaver (세션별 체크포인터 — AutoCompactor가 압축 교체)
    - L2 에피소드 원문: TranscriptStore (transcript.db — 대화·도구 호출/결과 실시간 Append-only 백업)
@@ -33,7 +33,7 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
    - ToolErrorHandlerMiddleware : 도구 예외 시 ToolMessage(Observation)로 변환
    - ModelCallLimitMiddleware   : 무한 루프 차단 (run_limit=50)
    - StopHooksMiddleware        : 생성된 Python 코드블록 AST 구문 검증 및 자가 교정 루프
-5. 도구: tools_supervisor(16종) + memory_tools(2종) + skill_tools(2종) + custom_tools(2종) = 총 22종
+5. 도구: tools_supervisor(17종) + memory_tools(2종) + skill_tools(2종) + custom_tools(2종) = 총 23종
    + MCP 도구 (configs/mcp.config, 예: mcp__wikipedia__search / mcp__wikipedia__readArticle)
 
 [미들웨어 파이프라인 실행 순서]
@@ -149,7 +149,7 @@ async def create_agent_executor(checkpointer=None):
         checkpointer = AsyncSqliteSaver(conn)
         await checkpointer.setup()
 
-    # 4. 도구 바인딩 (Supervisor 16종 + Custom 2종 = 18종 / Memory 2종 + Skill 2종은 memory_mw가 create_agent에 자동 등록 → 총 22종)
+    # 4. 도구 바인딩 (Supervisor 17종 + Custom 2종 = 19종 / Memory 2종 + Skill 2종은 memory_mw가 create_agent에 자동 등록 → 총 23종)
     #    ※ 도구 정의는 create_agent(tools=...)를 거쳐 API tools 필드로만 전달합니다 (시스템 프롬프트에는 넣지 않음).
     active_tools = list(tools_supervisor) + [roll_dice, convert_currency]
 
@@ -231,7 +231,7 @@ async def create_agent_executor(checkpointer=None):
     #    - bypass_user_context=True: 원본 Claude Code처럼
     #      · git 스냅샷(브랜치·status·최근 커밋)은 시스템 프롬프트 맨 끝에 gitStatus로
     #      · CLAUDE.md + 장기기억 동결 스냅샷(MEMORY.md / USER.md / PROCEDURAL) + 세션 시작 날짜는 대화 맨 앞 별도 <system-reminder> 메시지로
-    #      · 턴별 EPISODIC MEMORY 검색 결과는 대화 맨 끝 <system-reminder> 알림으로 부착
+    #      · 턴별 EPISODIC MEMORY 검색 결과는 before_model이 턴당 1회 state 끝에 <system-reminder>로 영속 저장(프리픽스 캐시 보존)
     #      (자정이 지나면 before_model이 대화 끝에 date_change 알림을 추가)
     skill_guidelines = str(SKILLS_DIR / "SKILL.md") if (SKILLS_DIR / "SKILL.md").exists() else None
     skill_builder = SkillPromptBuilder(
@@ -346,25 +346,11 @@ async def create_agent_executor(checkpointer=None):
     ])
 
     # 6. 하네스로 결합된 최종 메인 에이전트 인스턴스 구축
-    main_agent = create_agent(
+    return create_agent(
         model=llm,
         tools=active_tools,
         middleware=middleware,
         checkpointer=checkpointer,
         context_schema=AgentContext,
     )
-
-    # 리소스 정리 및 검증용 참조 보존 (테스트 스크립트에서 접근)
-    main_agent.registered_tools = active_tools
-    main_agent.registered_middlewares = middleware
-    main_agent.checkpointer_conn = conn
-    main_agent.transcript_store = transcript_store
-    main_agent.episodic_store = episodic_store
-    main_agent.semantic_store = semantic_store
-    main_agent.procedural_store = procedural_store
-    main_agent.assembler = assembler
-    main_agent.mcp_registry = mcp_registry
-    main_agent.memory_middleware = memory_mw
-
-    return main_agent
 

@@ -12,7 +12,9 @@ from .plan import (
     enter_plan, exit_plan, task_create, task_list, task_update,
     tools_planning, PLANNING_AND_TASK_TOOLS
 )
-from .supervisor_tools import invoke_sub_agent, list_sub_agents, get_sub_agent_job_status
+from .supervisor_tools import (
+    invoke_sub_agent, list_sub_agents, get_sub_agent_job_status, cancel_sub_agent_job,
+)
 from .analyst import (
     data_profiler, data_query, chart_generator,
     file_converter, excel_writer, html_report
@@ -38,12 +40,12 @@ tools_scraper = [
     bash_command, web_search, web_fetch,
 ]
 
-# 👑 Supervisor용 도구 바인딩: 계획(5종) + 오케스트레이션(3종) + 범용(8종) = 16종
+# 👑 Supervisor용 도구 바인딩: 계획(5종) + 오케스트레이션(4종) + 범용(8종) = 17종
 tools_supervisor = [
     # Planning & Task Board
     enter_plan, exit_plan, task_create, task_list, task_update,
     # Sub-Agent Orchestration
-    list_sub_agents, invoke_sub_agent, get_sub_agent_job_status,
+    list_sub_agents, invoke_sub_agent, get_sub_agent_job_status, cancel_sub_agent_job,
     # Common File / Search / Shell / Web
     file_read, file_writer, file_edit, grep_search, glob_search, bash_command, web_search, web_fetch,
 ]
@@ -69,7 +71,7 @@ __all__ = [
     "verify_selectors", "interact_page", "take_screenshot",
     "browse_web",
     "enter_plan", "exit_plan", "task_create", "task_list", "task_update",
-    "list_sub_agents", "invoke_sub_agent", "get_sub_agent_job_status",
+    "list_sub_agents", "invoke_sub_agent", "get_sub_agent_job_status", "cancel_sub_agent_job",
     "data_profiler", "data_query", "chart_generator",
     "file_converter", "excel_writer", "html_report",
 ]

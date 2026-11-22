@@ -11,7 +11,7 @@ import os
 import tempfile
 import pytest
 from unittest.mock import patch, MagicMock
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
 # Import from APP-level (production) prompt_assembler
 from app.middleware.prompt.prompt_assembler import (
@@ -40,6 +40,10 @@ from app.middleware.prompt.prompt_assembler import (
     get_frozen_git_snapshot,
     prepend_user_context,
     append_episodic_memory,
+    get_episodic_memory_attachment,
+    has_episodic_memory_in_current_turn,
+    make_episodic_memory_message,
+    make_date_change_message,
     split_recalled_memory,
     get_skill_listing_delta,
     get_mcp_instructions_delta,
@@ -50,17 +54,21 @@ from app.middleware.prompt.prompt_assembler import (
     # Constants
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     MAX_STATUS_CHARS,
+    MAX_EPISODIC_MEMORY_CHARS,
 )
 from app.utils.message_markers import (
     ORIGIN_DATE_CHANGE,
     ORIGIN_EPISODIC_MEMORY,
     ORIGIN_MCP_INSTRUCTIONS_DELTA,
     ORIGIN_SKILL_LISTING,
+    ORIGIN_STOP_HOOK,
     ORIGIN_USER_CONTEXT,
     TRANSCRIPT_SKIP_KEY,
+    is_attachment,
     is_user_turn_start,
     last_user_turn_start,
     message_origin,
+    origin_kwargs,
 )
 
 
@@ -1040,3 +1048,193 @@ class TestSkillBuilderListSkills:
             self._write(root, "beta", "B skill")
             assert [s["name"] for s in builder.list_skills()] == ["alpha", "beta", "zeta"]
             assert "Z skill" in builder.build_catalog()
+
+
+# =============================================================================
+# Test: Persistent Episodic Memory Attachment (before_model + cache stability)
+# =============================================================================
+
+class TestEpisodicMemoryAttachment:
+    """에피소드 기억이 before_model에서 턴당 1회 state에 영속 저장되고 캐시를 깨지 않는지 검증."""
+
+    def _mw(self, *, bypass_user_context=True):
+        assembler = PromptAssembler(
+            system_rules="Rules",
+            claude_code_modules=True,
+            skill_guidelines="Policy",
+            skill_provider=lambda: list(SKILLS),
+            mcp_instructions=lambda: {"wikipedia": "Use search first."},
+            mcp_delta_enabled=True,
+        )
+        return create_prompt_assembler_middleware(
+            assembler,
+            bypass_user_context=bypass_user_context,
+            claude_md_content="Use pytest.",
+        )
+
+    def test_episodic_and_date_change_are_attachments_with_transcript_skip(self):
+        from app.middleware.compaction.compactor import _serialize_for_summary
+        from app.middleware.memory.transcript_store import classify_message
+
+        epi_msg = make_episodic_memory_message("EPISODIC: Past session summary.")
+        date_msg = make_date_change_message("2026-10-24")
+        for msg in (epi_msg, date_msg):
+            assert msg.additional_kwargs.get(TRANSCRIPT_SKIP_KEY) is True
+            assert is_attachment(msg) is True
+            assert is_user_turn_start(msg) is False
+            assert classify_message(msg) is None
+
+        serialized = _serialize_for_summary(
+            [HumanMessage(content="질문"), epi_msg, date_msg, AIMessage(content="답변")],
+            max_chars_per_message=500,
+        )
+        assert "User: 질문" in serialized
+        assert "Assistant: 답변" in serialized
+        assert "# episodicMemory" not in serialized
+        assert "Today's date is now" not in serialized
+
+    def test_episodic_memory_budget_truncation(self):
+        oversized = "x" * (MAX_EPISODIC_MEMORY_CHARS + 500)
+        msg = make_episodic_memory_message(oversized)
+        assert "truncated due to episodic memory budget" in msg.content
+        assert "session_recall" in msg.content
+        assert len(msg.content) < MAX_EPISODIC_MEMORY_CHARS + 200
+
+    def test_before_model_persists_episodic_once_and_preserves_cache_across_tool_loop_and_turns(self):
+        from langchain.agents.middleware import ModelRequest
+
+        mw = self._mw(bypass_user_context=True)
+
+        class DummyCtx:
+            cwd = "/workspace"
+            session_id = "sess-epi-1"
+            user_id = "u1"
+            memory_snapshot = "MEMORY: Use pytest."
+            episodic_context = "EPISODIC_T1"
+
+        ctx = DummyCtx()
+        runtime = MagicMock(context=ctx, config=None, execution_info=None)
+        state = {"messages": [HumanMessage(content="질문1", id="u1")]}
+
+        def call_model(cur_state):
+            req = ModelRequest(
+                messages=cur_state["messages"],
+                model="mock-model",
+                tools=[],
+                tool_choice="auto",
+                model_settings={},
+                state=cur_state,
+                runtime=runtime,
+            )
+            return mw.wrap_model_call(req, lambda r: r)
+
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"), \
+             patch("app.middleware.prompt.prompt_assembler.get_frozen_git_snapshot", return_value="Current branch: main"):
+            # Turn 1, Call 1: skill_listing, mcp_instructions_delta, episodic_memory(EPISODIC_T1) 영속 저장
+            upd1 = mw.before_model(state, runtime=runtime) or {}
+            added1 = upd1.pop("messages", [])
+            state.update(upd1)
+            state["messages"] = state["messages"] + added1
+            assert [message_origin(m) for m in added1] == [
+                ORIGIN_SKILL_LISTING,
+                ORIGIN_MCP_INSTRUCTIONS_DELTA,
+                ORIGIN_EPISODIC_MEMORY,
+            ]
+            out1 = call_model(state)
+            assert message_origin(out1.messages[-1]) == ORIGIN_EPISODIC_MEMORY
+            assert "EPISODIC_T1" in out1.messages[-1].content
+
+            # Turn 1, Call 2 (도구 실행 후 재호출): 중복 저장 없음 + 앞부분 바이트 100% 일치 + ToolMessage 뒤 HumanMessage 없음
+            state["messages"] = state["messages"] + [
+                AIMessage(content="", id="a1", tool_calls=[{"name": "mcp__wikipedia__search", "args": {"query": "x"}, "id": "c1"}]),
+                ToolMessage(content="tool result", tool_call_id="c1", name="mcp__wikipedia__search", id="t1"),
+            ]
+            assert mw.before_model(state, runtime=runtime) is None
+            out2 = call_model(state)
+            assert [m.content for m in out2.messages[:len(out1.messages)]] == [m.content for m in out1.messages]
+            assert isinstance(out2.messages[-1], ToolMessage)
+
+            # Turn 2, Call 1: 새 질문 + 새 에피소드 기억 -> Turn 1의 EPISODIC_T1도 그대로 보존되고 Turn 2 뒤에 EPISODIC_T2 저장
+            state["messages"] = state["messages"] + [
+                AIMessage(content="답변1", id="a2"),
+                HumanMessage(content="질문2", id="u2"),
+            ]
+            ctx.episodic_context = "EPISODIC_T2"
+            upd3 = mw.before_model(state, runtime=runtime) or {}
+            added3 = upd3.pop("messages", [])
+            state.update(upd3)
+            state["messages"] = state["messages"] + added3
+            assert [message_origin(m) for m in added3] == [ORIGIN_EPISODIC_MEMORY]
+            out3 = call_model(state)
+            assert [m.content for m in out3.messages[:len(out2.messages)]] == [m.content for m in out2.messages]
+            assert message_origin(out3.messages[-1]) == ORIGIN_EPISODIC_MEMORY
+            assert "EPISODIC_T2" in out3.messages[-1].content
+            assert sum(1 for m in out3.messages if message_origin(m) == ORIGIN_EPISODIC_MEMORY) == 2
+
+    def test_stop_hook_retry_does_not_duplicate_episodic(self):
+        mw = self._mw(bypass_user_context=True)
+
+        class DummyCtx:
+            episodic_context = "E1"
+
+        runtime = MagicMock(context=DummyCtx(), config=None, execution_info=None)
+        u1 = HumanMessage(content="코드 짜줘", id="u1")
+        attachments = mw.assembler.collect_attachments([u1])
+        msgs = [
+            u1,
+            *attachments,
+            make_episodic_memory_message("E1"),
+            AIMessage(content="bad code", id="a1"),
+            HumanMessage(content="[stop_hook_blocking] err", id="sh1", additional_kwargs=origin_kwargs(ORIGIN_STOP_HOOK)),
+        ]
+        state = {"messages": msgs, "session_start_date": "2026-10-23", "last_emitted_date": "2026-10-23"}
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            assert mw.before_model(state, runtime=runtime) is None
+            assert has_episodic_memory_in_current_turn(msgs) is True
+
+    def test_before_model_splits_legacy_recalled_memory_fallback(self):
+        mw = self._mw(bypass_user_context=True)
+
+        class LegacyCtx:
+            recalled_memory = (
+                "MEMORY: A\n\n"
+                "══════════════════════════════════════════════\n"
+                "EPISODIC MEMORY (relevant past sessions)\n"
+                "[Session 1] S1"
+            )
+
+        runtime = MagicMock(context=LegacyCtx(), config=None, execution_info=None)
+        state = {"messages": [HumanMessage(content="질문")], "session_start_date": "2026-10-23", "last_emitted_date": "2026-10-23"}
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            upd = mw.before_model(state, runtime=runtime)
+        epi_msgs = [m for m in upd["messages"] if message_origin(m) == ORIGIN_EPISODIC_MEMORY]
+        assert len(epi_msgs) == 1
+        assert "[Session 1] S1" in epi_msgs[0].content
+
+    def test_assemble_multi_turn_keeps_previous_and_appends_new_episodic(self):
+        assembler = PromptAssembler(system_rules="Rules", claude_code_modules=True)
+        base_ctx = {"cwd": "/workspace", "session_id": "s-multi", "current_date": "2026-10-23", "memory_snapshot": "M"}
+        turn1 = assembler.assemble("질문1", {**base_ctx, "episodic_context": "E1"}, claude_md_content="C")
+        assert message_origin(turn1[4]) == ORIGIN_EPISODIC_MEMORY and "E1" in turn1[4].content
+
+        chat_history = [turn1[3], turn1[4], AIMessage(content="답변1")]
+        turn2 = assembler.assemble("질문2", {**base_ctx, "episodic_context": "E2"}, chat_history=chat_history, claude_md_content="C")
+        assert [m.content for m in turn2[:len(turn1)]] == [m.content for m in turn1]
+        assert message_origin(turn2[-1]) == ORIGIN_EPISODIC_MEMORY
+        assert "E2" in turn2[-1].content
+
+    def test_empty_messages_and_bypass_false_skip_episodic(self):
+        class DummyCtx:
+            episodic_context = "E1"
+
+        runtime = MagicMock(context=DummyCtx(), config=None, execution_info=None)
+        mw_bypass = self._mw(bypass_user_context=True)
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            upd_empty = mw_bypass.before_model({"messages": []}, runtime=runtime)
+        assert not any(message_origin(m) == ORIGIN_EPISODIC_MEMORY for m in (upd_empty or {}).get("messages", []))
+        assert get_episodic_memory_attachment([], "E1") is None
+
+        mw_legacy = self._mw(bypass_user_context=False)
+        with patch("app.middleware.prompt.prompt_assembler.get_local_iso_date", return_value="2026-10-23"):
+            upd_legacy = mw_legacy.before_model({"messages": [HumanMessage(content="hi")]}, runtime=runtime)
+        assert not any(message_origin(m) == ORIGIN_EPISODIC_MEMORY for m in upd_legacy.get("messages", []))

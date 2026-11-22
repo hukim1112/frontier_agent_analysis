@@ -17,17 +17,17 @@ Claude Code 표준 5계층 × 16대 프롬프트 모듈 조립기
   ④ 시스템 컨텍스트: gitStatus 스냅샷을 시스템 프롬프트 맨 끝에 덧붙임    appendSystemContext
   ⑤ 사용자 컨텍스트: CLAUDE.md + 장기기억 동결 스냅샷(memorySnapshot) + 세션 시작 날짜를 대화 맨 앞 별도 메시지로 prependUserContext
   ⑥ 대화           : 뒤에 붙기만 함. 자정이 지나면 끝에 date_change 알림   getDateChangeAttachments
-  ⑦ 알림(attachment): 대화 끝에 붙는 <system-reminder> 메시지             utils/attachments.ts
+  ⑦ 알림(attachment): 대화 끝에 저장되는 <system-reminder> 메시지       utils/attachments.ts
        - skill_listing          : 번들 스킬 목록. 첫 턴에 전체, 이후 새 스킬만 (스킬 본문은 file_read 결과로)
        - mcp_instructions_delta : MCP 서버 지침. 새로 연결된 서버 지침 + 끊긴 서버 이름
-       - episodic_memory        : 현재 턴 질문으로 회상된 과거 에피소드 기억(EPISODIC MEMORY)
-     한 번 넣은 알림은 고치지 않고, "이미 알린 목록"은 대화에 남은 알림에서 다시 계산합니다.
+       - episodic_memory        : 현재 턴 질문으로 회상된 과거 에피소드 기억(EPISODIC MEMORY, 턴당 1회 영속 저장)
+     한 번 넣은 알림은 고치지 않고, "이미 알린 목록·여부"는 대화에 남은 알림에서 다시 계산합니다.
 
 통합 미들웨어: PromptAssemblerMiddleware (AgentMiddleware 상속)
 - merge_system=False: SystemMessage 2개 (Static cache_control: ephemeral + Dynamic)
 - merge_system=True : SystemMessage 1개 (단일 System Prompt로 결합 출력)
-- bypass_user_context=True: ④ git 스냅샷 + ⑤ 사용자 컨텍스트 메시지 주입
-- before_model: 세션 시작 날짜 고정 · 자정 date_change 알림 · ⑦ 스킬/MCP 알림을 state에 추가
+- bypass_user_context=True: ④ git 스냅샷 + ⑤ 사용자 컨텍스트 메시지 + ⑦-b 에피소드 기억 알림 주입
+- before_model: 세션 시작 날짜 고정 · 자정 date_change 알림 · ⑦ 스킬/MCP/에피소드 기억 알림을 state에 영속 저장
 - wrap_model_call: 세션당 1회 준비한 값(작업 폴더·git 스냅샷·정적 프롬프트)을 조합만 합니다
 ===============================================================================
 """
@@ -50,6 +50,7 @@ from app.utils.message_markers import (
     ORIGIN_SKILL_LISTING,
     ORIGIN_USER_CONTEXT,
     is_compaction_summary,
+    last_user_turn_start,
     message_origin,
     origin_kwargs,
 )
@@ -60,6 +61,7 @@ from app.utils.message_markers import (
 # =============================================================================
 
 MAX_STATUS_CHARS = 2000  # Claude Code MAX_STATUS_CHARS 상한선
+MAX_EPISODIC_MEMORY_CHARS = 4000  # state["messages"]에 영속 저장되므로 1회 회상 결과 상한선
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 MAX_CACHED_SESSIONS = 256  # 세션별 캐시 상한 (서버를 오래 띄워도 메모리가 계속 늘지 않도록)
 
@@ -615,31 +617,68 @@ def prepend_user_context(
     return messages[:insert_at] + [make_user_context_message(context)] + messages[insert_at:]
 
 
-def make_episodic_memory_message(episodic_context: str) -> HumanMessage:
-    """현재 턴 질문으로 회상된 에피소드 기억(EPISODIC MEMORY) 알림. 대화 끝에 붙으므로 앞부분 캐시를 깨지 않습니다.
+def make_episodic_memory_message(
+    episodic_context: str,
+    max_chars: int = MAX_EPISODIC_MEMORY_CHARS,
+) -> HumanMessage:
+    """현재 턴 질문으로 회상된 에피소드 기억(EPISODIC MEMORY) 알림.
 
-    Source: Claude Code attachments.ts (relevant_memories) + Hermes user message sidecar
+    - 턴당 1회 state["messages"] 끝에 영속 저장되므로 같은 턴 도구 루프와 다음 턴 모두 앞부분 캐시를 깨지 않습니다.
+    - max_chars를 넘기면 프리픽스 비대화를 막기 위해 잘라내고 session_recall 안내를 남깁니다.
+    Source: Claude Code attachments.ts + Hermes memory prefetch
     """
+    body = episodic_context.strip()
+    if max_chars > 0 and len(body) > max_chars:
+        body = (
+            body[:max_chars].rstrip()
+            + "\n... (truncated due to episodic memory budget; use session_recall for full details)"
+        )
     return HumanMessage(
         content=(
             "<system-reminder>\n"
-            f"# episodicMemory\n{episodic_context.strip()}\n"
+            f"# episodicMemory\n{body}\n"
             "</system-reminder>"
         ),
         additional_kwargs=origin_kwargs(ORIGIN_EPISODIC_MEMORY),
     )
 
 
+def has_episodic_memory_in_current_turn(messages: Iterable[Any]) -> bool:
+    """현재(마지막) 사용자 턴 구간에 이미 episodic_memory 알림이 저장되어 있는지 확인합니다."""
+    msg_list = list(messages)
+    if not msg_list:
+        return False
+    turn_start = last_user_turn_start(msg_list)
+    window = msg_list[turn_start:] if turn_start is not None else msg_list
+    return any(message_origin(m) == ORIGIN_EPISODIC_MEMORY for m in window)
+
+
+def get_episodic_memory_attachment(
+    messages: List[Any],
+    episodic_context: str = "",
+    max_chars: int = MAX_EPISODIC_MEMORY_CHARS,
+) -> Optional[HumanMessage]:
+    """현재 턴에 아직 주입되지 않은 에피소드 기억이 있으면 알림 메시지를 반환합니다 (이미 있으면 None).
+
+    - 마지막 사용자 턴 시작(last_user_turn_start) 이후 구간만 스캔(stateless scan)합니다.
+    - 같은 턴의 도구 루프 재호출이나 StopHook 재시도에서는 중복 추가하지 않고,
+      새 사용자 턴이 시작되면 그 턴의 검색 결과를 1회만 추가합니다.
+    """
+    if not messages or not episodic_context or not episodic_context.strip():
+        return None
+    if has_episodic_memory_in_current_turn(messages):
+        return None
+    return make_episodic_memory_message(episodic_context, max_chars=max_chars)
+
+
 def append_episodic_memory(
     messages: List[BaseMessage],
     episodic_context: str = "",
+    max_chars: int = MAX_EPISODIC_MEMORY_CHARS,
 ) -> List[BaseMessage]:
-    """현재 턴에 검색된 에피소드 기억이 있으면 메시지 리스트 맨 끝에 <system-reminder>로 덧붙입니다."""
-    if not messages or not episodic_context or not episodic_context.strip():
-        return messages
-    if any(message_origin(m) == ORIGIN_EPISODIC_MEMORY for m in messages):
-        return messages
-    return [*messages, make_episodic_memory_message(episodic_context)]
+    """현재 턴에 아직 주입되지 않은 에피소드 기억이 있으면 메시지 리스트 맨 끝에 <system-reminder>로 덧붙입니다."""
+    msg = get_episodic_memory_attachment(messages, episodic_context, max_chars=max_chars)
+    return [*messages, msg] if msg is not None else messages
 
 
 # =============================================================================
@@ -1142,7 +1181,7 @@ class PromptAssembler:
         if self.claude_code_modules:
             # Module [9]: Memory Usage Rules — 세션당 1회 고정 계산 (cache_break=False).
             # 실제 메모리 데이터(MEMORY.md / USER.md / PROCEDURAL MEMORY 스냅샷)는 ⑤ 사용자 컨텍스트(Message 3)에,
-            # 턴마다 바뀌는 EPISODIC MEMORY는 대화 끝 <system-reminder>에 붙입니다.
+            # 턴마다 바뀌는 EPISODIC MEMORY는 before_model이 턴당 1회 state 끝에 <system-reminder>로 저장합니다.
             memory_section = self._section(sid, "memory", get_memory_section)
             if memory_section:
                 parts.append(memory_section)
@@ -1338,8 +1377,8 @@ class PromptAssemblerMiddleware(AgentMiddleware):
     확장 기능:
     - bypass_user_context=True: git 스냅샷은 시스템 프롬프트 끝(④), CLAUDE.md와 세션 시작 날짜는
       대화 맨 앞 별도 메시지(⑤)로 주입
-    - before_model: 세션 시작 날짜 고정 · 자정 date_change 알림 · ⑦ 스킬 목록 / MCP 지침 알림을
-      state["messages"] 끝에 저장 · 압축이 일어나면 세션 섹션 캐시 초기화
+    - before_model: 세션 시작 날짜 고정 · 자정 date_change 알림 · ⑦ 스킬 목록 / MCP 지침 / 에피소드 기억 알림을
+      state["messages"] 끝에 영속 저장 · 압축이 일어나면 세션 섹션 캐시 초기화
     - 도구 목록을 이름순으로 정렬해 모델에 전달 (내장 → MCP)
     - mcp_delta_instructions(하위 호환): 문자열 MCP 지침. 서버 이름 'mcp'의 지침으로 한 번만 알립니다.
     """
@@ -1429,6 +1468,23 @@ class PromptAssemblerMiddleware(AgentMiddleware):
 
         # 3) ⑦ 스킬 목록 · MCP 지침 알림: 아직 알리지 않은 것만 대화 끝에 저장 (한 번 넣으면 고치지 않음)
         new_messages.extend(self.assembler.collect_attachments(messages))
+
+        # 4) ⑦-b 에피소드 기억 알림: 현재 턴 질문으로 회상된 EPISODIC MEMORY를 턴당 1회 state 끝에 영속 저장
+        #    (한 번 넣으면 고치지 않으므로 같은 턴 도구 루프 재호출과 다음 턴 모두 앞부분 캐시가 유지됩니다.)
+        if self.bypass_user_context and messages:
+            ctx = self._resolve_ids(runtime)["ctx"]
+            if ctx is not None:
+                _, episodic_context = split_recalled_memory(
+                    recalled=getattr(ctx, "recalled_memory", "") or "",
+                    memory_snapshot=getattr(ctx, "memory_snapshot", "") or "",
+                    episodic_context=getattr(ctx, "episodic_context", "") or "",
+                )
+                epi_msg = get_episodic_memory_attachment(
+                    messages + new_messages,
+                    episodic_context,
+                )
+                if epi_msg is not None:
+                    new_messages.append(epi_msg)
 
         if new_messages:
             update["messages"] = new_messages
@@ -1545,9 +1601,8 @@ class PromptAssemblerMiddleware(AgentMiddleware):
         result_messages = system_messages + filtered_msgs
 
         # ⑤ 사용자 컨텍스트: CLAUDE.md + 장기기억 동결 스냅샷(memorySnapshot) + 세션 시작 날짜를 대화 맨 앞 별도 메시지로
-        # ⑦-b 에피소드 기억: 현재 턴 질문으로 회상된 EPISODIC MEMORY는 대화 맨 끝 <system-reminder>로 부착
         if self.bypass_user_context:
-            memory_snapshot, episodic_context = split_recalled_memory(
+            memory_snapshot, _ = split_recalled_memory(
                 recalled=getattr(ctx, "recalled_memory", "") if ctx else "",
                 memory_snapshot=getattr(ctx, "memory_snapshot", "") if ctx else "",
                 episodic_context=getattr(ctx, "episodic_context", "") if ctx else "",
@@ -1558,9 +1613,8 @@ class PromptAssemblerMiddleware(AgentMiddleware):
                 current_date=session_date,
                 memory_snapshot=memory_snapshot,
             )
-            result_messages = append_episodic_memory(result_messages, episodic_context)
 
-        # ⑦ 스킬 목록 · MCP 지침 알림은 before_model이 state에 이미 저장했으므로 여기서는 손대지 않습니다.
+        # ⑦ 스킬 목록 · MCP 지침 · 에피소드 기억 알림은 before_model이 state에 이미 영속 저장했으므로 여기서는 손대지 않습니다.
         return result_messages
 
     def _override(self, request):

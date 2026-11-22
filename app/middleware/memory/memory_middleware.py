@@ -63,6 +63,7 @@ import logging
 import asyncio
 import threading
 import concurrent.futures
+import weakref
 from collections import OrderedDict
 from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
@@ -89,6 +90,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_USER_ID = "default"
 _memory_user_id_var: ContextVar[str] = ContextVar("_memory_user_id_var", default=_DEFAULT_USER_ID)
+_MEMORY_REGISTRY_LOCK = threading.RLock()
+_MEMORY_INSTANCES: "weakref.WeakSet[MemoryMiddleware]" = weakref.WeakSet()
 
 # ── Background Review Prompts ──
 
@@ -300,6 +303,36 @@ class MemoryMiddleware(AgentMiddleware):
         # AgentMiddleware.tools — LangChain create_agent()가 생성 시 한 번 읽어 에이전트 도구로 자동 주입합니다
         # (langchain/agents/factory.py의 middleware_tools 수집 → tools=와 합쳐 등록).
         self.tools = [self._memory_tool, self._session_recall_tool, *self._skill_tools]
+
+        with _MEMORY_REGISTRY_LOCK:
+            _MEMORY_INSTANCES.add(self)
+
+    @classmethod
+    async def aclose_all_instances(cls, review_timeout: float = 5.0) -> None:
+        """프로세스 내 살아있는 모든 MemoryMiddleware의 리뷰 큐와 DB 스토어를 안전하게 종료합니다."""
+        with _MEMORY_REGISTRY_LOCK:
+            instances = list(_MEMORY_INSTANCES)
+
+        closed_store_ids: set[int] = set()
+        for mw in instances:
+            try:
+                await asyncio.to_thread(mw.wait_for_reviews, review_timeout)
+            except Exception:
+                pass
+            try:
+                if hasattr(mw, "_review_queue"):
+                    mw._review_queue.shutdown()
+            except Exception:
+                pass
+            for store_attr in ("episodic_store", "transcript_store"):
+                store = getattr(mw, store_attr, None)
+                if store is not None and id(store) not in closed_store_ids:
+                    closed_store_ids.add(id(store))
+                    if hasattr(store, "close"):
+                        try:
+                            await store.close()
+                        except Exception:
+                            pass
 
     def get_tools(self) -> list:
         """메모리 도구 목록 반환 (create_agent 사용 시에는 self.tools를 통해 자동 등록됨).

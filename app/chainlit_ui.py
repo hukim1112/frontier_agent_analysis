@@ -117,11 +117,13 @@ async def on_chat_start():
 # ── 5. 기존 대화 복원 ────────────────────────────────────────
 @cl.on_chat_resume
 async def on_chat_resume(thread: ThreadDict):
-    """사이드바에서 기존 대화방 클릭 시 프로필 정보를 복원합니다."""
+    """사이드바에서 기존 대화방 클릭 시 프로필 정보와 완료된 과거 Job 표시 기록을 복원합니다."""
     tags = thread.get("tags") or []
     profile = thread.get("metadata", {}).get("chat_profile") or (tags[0] if tags else "chatbot")
     cl.user_session.set("chat_profile", profile)
     cl.user_session.set("always_allow_tools", set())  # 복원 시 always_allow 초기화
+    resume_tid = thread.get("id") or getattr(getattr(cl.context, "session", None), "thread_id", None)
+    await _seed_existing_terminal_jobs(resume_tid)
 
     await cl.Message(
         content=f"📂 **이전 대화방('{thread.get('name', 'Chat')}')이 성공적으로 복원되었습니다.**\n(에이전트: `{profile}`)\n이어서 지시사항을 입력해 주세요.",
@@ -402,11 +404,46 @@ async def _render_agent_response(raw_content: str, author: str = "Agent Assistan
 
 # ── 9. 세션 단위 백그라운드 Job 모니터링 ──────────────────────
 _active_monitors: set = set()  # 세션당 모니터 중복 방지 (thread_id 추적)
+_rendered_jobs_by_thread: Dict[str, set] = {}
+
+
+def _is_job_pending_monitor(job: dict) -> bool:
+    status = job.get("status", "")
+    wakeup_status = job.get("wakeup_status")
+    if status in ("SUBMITTED", "RUNNING"):
+        return True
+    if status in ("SUCCESS", "FAILED"):
+        if wakeup_status in ("PENDING", "RUNNING"):
+            return True
+        if (
+            wakeup_status is None
+            and status == "SUCCESS"
+            and job.get("callback_agent")
+            and not job.get("supervisor_response")
+        ):
+            return True
+    return False
+
+
+async def _seed_existing_terminal_jobs(thread_id: Optional[str]) -> None:
+    """세션의 이미 종료된 과거 Job ID를 _rendered_jobs_by_thread에 선등록해 복원/재시작 시 중복 재출력을 방지합니다."""
+    if not thread_id or thread_id in _rendered_jobs_by_thread:
+        return
+    rendered = _rendered_jobs_by_thread.setdefault(thread_id, set())
+    try:
+        existing_jobs = await api_client.get_session_jobs(thread_id)
+        for job in (existing_jobs or []):
+            jid = job.get("job_id")
+            if jid and not _is_job_pending_monitor(job):
+                rendered.add(jid)
+    except Exception:
+        pass
+
 
 async def _monitor_session_jobs(thread_id: str) -> None:
     """
     세션(thread)에 연관된 모든 백그라운드 Job을 주기적으로 조회하여,
-    새로 완료된 작업의 supervisor_response를 자동으로 Chainlit UI에 렌더링합니다.
+    새로 완료/실패/취소된 작업의 결과와 supervisor_response를 Chainlit UI에 렌더링합니다.
 
     개별 Job이 아닌 세션 전체를 감시하므로, Reactive Wakeup 내부에서
     연쇄적으로 생성된 Job도 자동 감지됩니다.
@@ -420,7 +457,7 @@ async def _monitor_session_jobs(thread_id: str) -> None:
     try:
         MAX_WAIT = 600  # 10분 타임아웃
         INTERVAL = 3    # 3초 간격
-        rendered_jobs: set = set()  # 이미 렌더링한 Job ID 추적
+        rendered_jobs = _rendered_jobs_by_thread.setdefault(thread_id, set())
 
         for _ in range(MAX_WAIT // INTERVAL):
             await asyncio.sleep(INTERVAL)
@@ -435,39 +472,62 @@ async def _monitor_session_jobs(thread_id: str) -> None:
                 job_id = job.get("job_id", "")
                 status = job.get("status", "")
                 agent_name = job.get("agent_name", "unknown")
+                wakeup_status = job.get("wakeup_status")
 
-                # 아직 진행 중인 Job이 있으면 계속 모니터링
-                if status in ("SUBMITTED", "RUNNING"):
+                # 아직 실행 중이거나 Reactive Wakeup 진행 중이면 대기
+                if _is_job_pending_monitor(job):
                     all_done = False
                     continue
 
                 # 이미 렌더링한 Job은 스킵
-                if job_id in rendered_jobs:
+                if not job_id or job_id in rendered_jobs:
                     continue
 
-                # SUCCESS인데 supervisor_response가 아직 없으면 대기 (reactive wakeup 진행 중)
-                if status == "SUCCESS" and not job.get("supervisor_response"):
-                    all_done = False
-                    continue
-
-                # 완료 알림
                 rendered_jobs.add(job_id)
-                status_emoji = "✅" if status == "SUCCESS" else "❌"
-                await cl.Message(
-                    content=f"{status_emoji} **백그라운드 작업 완료**: `{agent_name}` (Job: `{job_id}`)",
-                    author="System"
-                ).send()
-
-                # supervisor_response 렌더링
                 sup_response = job.get("supervisor_response")
-                if sup_response:
-                    await _render_agent_response(sup_response)
-                elif status == "FAILED":
-                    error_msg = job.get("error", "알 수 없는 오류")
+
+                if status == "CANCELLED":
+                    reason = (job.get("cancel_reason") or "").strip()
+                    reason_part = f" — 사유: {reason}" if reason else ""
                     await cl.Message(
-                        content=f"❌ **작업 실패 상세**: {error_msg}",
+                        content=f"🛑 **백그라운드 작업 취소됨**: `{agent_name}` (Job: `{job_id}`){reason_part}",
                         author="System"
                     ).send()
+                elif status == "SUCCESS":
+                    await cl.Message(
+                        content=f"✅ **백그라운드 작업 완료**: `{agent_name}` (Job: `{job_id}`)",
+                        author="System"
+                    ).send()
+                    if sup_response:
+                        await _render_agent_response(sup_response)
+                    elif wakeup_status == "FAILED":
+                        wakeup_err = job.get("wakeup_error") or "Supervisor 후속 호출 오류"
+                        await cl.Message(
+                            content=f"⚠️ **Supervisor 후속 처리 실패**: {wakeup_err}",
+                            author="System"
+                        ).send()
+                        if job.get("result"):
+                            await _render_agent_response(str(job["result"]), author=f"Sub-Agent ({agent_name})")
+                    elif job.get("result"):
+                        await _render_agent_response(str(job["result"]), author=f"Sub-Agent ({agent_name})")
+                else:
+                    await cl.Message(
+                        content=f"❌ **백그라운드 작업 실패**: `{agent_name}` (Job: `{job_id}`)",
+                        author="System"
+                    ).send()
+                    if sup_response:
+                        await _render_agent_response(sup_response)
+                    else:
+                        error_msg = job.get("error", "알 수 없는 오류")
+                        detail_lines = [f"❌ **작업 실패 상세**: {error_msg}"]
+                        if job.get("wakeup_error"):
+                            detail_lines.append(
+                                f"⚠️ **후속 알림 상태 ({wakeup_status or 'FAILED'})**: {job['wakeup_error']}"
+                            )
+                        await cl.Message(
+                            content="\n".join(detail_lines),
+                            author="System"
+                        ).send()
 
             # 모든 Job이 완료되었으면 모니터링 종료
             if all_done and jobs:
@@ -500,6 +560,9 @@ async def on_message(message: cl.Message):
     active_steps: Dict[str, cl.Step] = {}
 
     try:
+        # 0. 프로세스 재시작 등으로 미등록된 기존 종료 Job ID를 미리 시드 (중복 재출력 방지)
+        await _seed_existing_terminal_jobs(thread_id)
+
         # 1. 초기 스트림
         interrupt_event = await _process_sse_stream(
             api_client.stream(profile, message.content, thread_id, user_id=user_id),
@@ -523,15 +586,16 @@ async def on_message(message: cl.Message):
         if raw_content.strip():
             await _render_streamed_message(final_message, raw_content)
 
-        # 4. 세션에 활성 백그라운드 Job이 있으면 세션 모니터 시작
+        # 4. 세션에 활성 또는 미렌더링 백그라운드 Job이 있으면 세션 모니터 시작
         try:
             session_jobs = await api_client.get_session_jobs(thread_id)
-            has_active = any(
-                j.get("status") in ("SUBMITTED", "RUNNING")
-                or (j.get("status") == "SUCCESS" and not j.get("supervisor_response"))
+            rendered_set = _rendered_jobs_by_thread.get(thread_id, set())
+            has_work = any(
+                _is_job_pending_monitor(j)
+                or (j.get("job_id") and j.get("job_id") not in rendered_set)
                 for j in session_jobs
             )
-            if has_active:
+            if has_work:
                 asyncio.create_task(_monitor_session_jobs(thread_id))
         except Exception:
             pass  # 서버 미연결 등 예외 시 무시
