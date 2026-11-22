@@ -245,7 +245,8 @@ class AgentTracer(AgentMiddleware):
             
         # Execute tool
         response = handler(request)
-        
+        tool_status = "ERROR" if getattr(response, "status", None) == "error" else "SUCCESS"
+
         duration_ms = int((time.time() - start_time) * 1000)
         result_str = str(response)
         
@@ -256,7 +257,7 @@ class AgentTracer(AgentMiddleware):
             "arguments": tool_args,
             "result": result_str,
             "latency_ms": duration_ms,
-            "status": "SUCCESS"  # If handler doesn't throw, assume success
+            "status": tool_status
         }
         
         if session_id in self._active_runs:
@@ -264,7 +265,7 @@ class AgentTracer(AgentMiddleware):
             self._active_runs[session_id]["total_tool_calls"] += 1
             
         if self.verbose:
-            print(f"🔧 [AgentTracer] Tool Executed in {duration_ms}ms")
+            print(f"🔧 [AgentTracer] Tool {tool_status} in {duration_ms}ms")
             
         return response
 
@@ -337,7 +338,8 @@ class AgentTracer(AgentMiddleware):
             print(f"🔧 [AgentTracer (Async)] Tool Executing: {tool_name} with args: {tool_args}")
             
         response = await handler(request)
-        
+        tool_status = "ERROR" if getattr(response, "status", None) == "error" else "SUCCESS"
+
         duration_ms = int((time.time() - start_time) * 1000)
         result_str = str(response)
         
@@ -348,7 +350,7 @@ class AgentTracer(AgentMiddleware):
             "arguments": tool_args,
             "result": result_str,
             "latency_ms": duration_ms,
-            "status": "SUCCESS"
+            "status": tool_status
         }
         
         if session_id in self._active_runs:
@@ -356,7 +358,7 @@ class AgentTracer(AgentMiddleware):
             self._active_runs[session_id]["total_tool_calls"] += 1
             
         if self.verbose:
-            print(f"🔧 [AgentTracer (Async)] Tool Executed in {duration_ms}ms")
+            print(f"🔧 [AgentTracer (Async)] Tool {tool_status} in {duration_ms}ms")
             
         return response
 

@@ -90,13 +90,23 @@ class EvalRunner:
             # Perform evaluation
             failures = []
             
-            # 1. Verify expected tool calls
+            # 1. Verify expected / blocked tool calls
             expected_tools = criteria.get("tool_calls", [])
+            blocked_tools = criteria.get("blocked_tools", [])
             actual_tools = [ev["tool_name"] for ev in events if ev.get("type") == "tool_call"]
+            succeeded_tools = [
+                ev["tool_name"]
+                for ev in events
+                if ev.get("type") == "tool_call" and ev.get("status", "SUCCESS") == "SUCCESS"
+            ]
             
             for tool in expected_tools:
-                if tool not in actual_tools:
-                    failures.append(f"Missing expected tool call: '{tool}' (called: {actual_tools})")
+                if tool not in succeeded_tools:
+                    failures.append(f"Missing expected succeeded tool call: '{tool}' (succeeded: {succeeded_tools})")
+
+            for btool in blocked_tools:
+                if btool in succeeded_tools:
+                    failures.append(f"Blocked tool was executed with SUCCESS: '{btool}'")
 
             # 2. Verify response keywords
             expected_keywords = criteria.get("final_answer_contains", [])

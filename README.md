@@ -28,7 +28,7 @@
 ```text
 frontier_agent_analysis/
 ├── app/                              # 🧠 메인 애플리케이션 및 하네스 모듈
-│   ├── agents/                       #   ├── main_agent.py (22종 도구 + 9단계 미들웨어 오케스트레이터)
+│   ├── agents/                       #   ├── main_agent.py (23종 도구 + 9단계 미들웨어 오케스트레이터)
 │   │                                 #   └── chatbot.py, analyst.py, scraper.py
 │   ├── middleware/                   #   📁 체계화된 하네스 미들웨어 패키지
 │   │   ├── prompt/                   #   │   └── prompt_assembler.py (16-Module 5-Layer 조립기)
@@ -47,7 +47,7 @@ frontier_agent_analysis/
 │   └── streamlit_ui.py               #   └── Streamlit 보조 UI
 │
 ├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (필수 4종 + 참고 1종)
-│   ├── 01_react_vs_frontier_agents.ipynb    # Step 1: ReAct 루프, Runtime Context, Middleware & 관측성
+│   ├── 01_react_to_agent_harness.ipynb       # Step 1: ReAct 루프, Runtime Context, Middleware & 관측성
 │   ├── 02_claude_code_harness.ipynb         # Step 2: 5계층 프롬프트, 5대 압축 파이프라인, Amnesia Guard
 │   ├── 03_hermes_memory_architecture.ipynb  # Step 3: 계층형 메모리(transcript.db + episodic.db) 및 FTS5 인출
 │   ├── 04_hermes_procedural_memory.ipynb    # Step 4: Procedural Memory — 스킬 학습 루프, 전이 실험, Curator
@@ -115,7 +115,7 @@ chainlit run app/chainlit_ui.py --port 8080
 - **기본 로그인 계정**:
   - **ID**: `user`
   - **Password**: `1234`
-- 22종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
+- 23종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
 
 ### 2. 백엔드 FastAPI 서버 구동
 ```bash
