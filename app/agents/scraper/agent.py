@@ -17,11 +17,10 @@ Navigator(사이트 분석) + Coder(코드 생성/실행) 기능을 통합한 �
 import os
 import json
 from pathlib import Path
-import aiosqlite
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain.agents import create_agent
 
 from app.utils import init_chat_model
+from app.utils.database import get_shared_checkpointer
 from app.context import AgentContext
 from app.middleware.prompt import PromptAssembler, SkillPromptBuilder, create_prompt_assembler_middleware
 from app.middleware.observability import AgentLogTracer
@@ -65,18 +64,9 @@ async def create_agent_executor(checkpointer=None):
         temperature=model_cfg.get("temperature", 0.0),
     )
 
-    # 2. AsyncSqliteSaver 기반 체크포인터 (SQLite 영구 메모리)
-    db_dir = "app/database"
-    os.makedirs(db_dir, exist_ok=True)
-    checkpoints_path = os.path.join(db_dir, "checkpoints.db")
-
-    conn = None
+    # 2. 공유 SQLite 체크포인터 SSOT
     if checkpointer is None:
-        conn = await aiosqlite.connect(checkpoints_path, check_same_thread=False)
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
-        checkpointer = AsyncSqliteSaver(conn)
-        await checkpointer.setup()
+        checkpointer = await get_shared_checkpointer()
 
     # 3. 5-Layer Prompt Assembler (Scraper 내재화 skills/ 카탈로그 + L4 Session Workspace Root 동적 주입)
     #    skills/SKILL.md(플레이북 인덱스)는 Layer 2 카탈로그 상단에만 주입 (L5 중복 주입 안 함)

@@ -57,8 +57,11 @@ def test_tool_search_removed_and_nine_tools_exported():
     assert not hasattr(app_tools, "tool_search")
     assert "tool_search" not in app_tools.__all__
     assert all(getattr(app_tools, t.name) is t for t in ALL_COMMON_TOOLS)
-    if hasattr(app_tools, "tools_chatbot"):
-        assert [t.name for t in app_tools.tools_chatbot] == [t.name for t in ALL_COMMON_TOOLS]
+    for removed_bundle in ("tools_chatbot", "tools_supervisor", "tools_analyst", "tools_scraper"):
+        assert not hasattr(app_tools, removed_bundle)
+        assert removed_bundle not in app_tools.__all__
+    from app.agents.chatbot.tools import tools_chatbot
+    assert [t.name for t in tools_chatbot] == [t.name for t in ALL_COMMON_TOOLS]
     assert len(ALL_COMMON_TOOLS) == 9
 
 

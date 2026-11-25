@@ -28,23 +28,24 @@
 ```text
 frontier_agent_analysis/
 ├── app/                              # 🧠 메인 애플리케이션 및 하네스 모듈
-│   ├── agents/                       #   ├── main_agent.py (23종 도구 + 9단계 미들웨어 오케스트레이터)
-│   │                                 #   └── chatbot.py, analyst.py, scraper.py
+│   ├── agents/                       #   ├── main_agent/ (24종 내장 도구 + 12개 미들웨어 오케스트레이터, skills/ 포함)
+│   │                                 #   └── chatbot/, analyst/, scraper/ (패키지 구조: agent.py, prompt.py, tools.py)
 │   ├── middleware/                   #   📁 체계화된 하네스 미들웨어 패키지
 │   │   ├── prompt/                   #   │   └── prompt_assembler.py (16-Module 5-Layer 조립기)
 │   │   ├── compaction/               #   │   └── compactor.py (Claude Code 압축 파이프라인), amnesia_guard.py
-│   │   ├── error_control/            #   │   └── self_recovery.py, self_correction.py
-│   │   ├── guardrails.py             #   │   └── InputSafety & TopicAlignment (before_agent + jump_to end)
+│   │   ├── error_control/            #   │   └── self_recovery/, self_correction/ (하위 패키지)
+│   │   ├── guardrails/               #   │   └── guardrails.py (InputSafety & TopicAlignment), tool_guard.py
 │   │   ├── memory/                   #   │   └── transcript_store.py, episodic_store.py, review_queue.py, semantic_store.py, memory_middleware.py,
 │   │                                 #   │       procedural_store.py, skill_tools.py, skill_review.py
 │   │   ├── evaluator/                #   │   └── evaluator.py (LLM-as-a-Judge), eval_runner.py (노트북 시나리오 평가)
 │   │   └── observability/            #   │   └── agent_log_tracer.py, agent_tracer.py (노트북 실습용 트레이서), visualizer.py, viz.py
-│   ├── prompts/                      #   └── SUPERVISOR.py, CHATBOT.py, ANALYST.py, SCRAPER.py
-│   ├── tools/                        #   └── supervisor_tools.py, custom_tools.py, navigator.py, analyst.py
-│   ├── utils/                        #   └── context.py, database/, log_analyzer.py
+│   ├── prompts/                      #   └── AGENT.md, MCP.md, PROMPT.md, SKILL.md
+│   ├── tools/                        #   └── common.py, plan.py, supervisor_tools.py, custom_tools.py, navigator.py, analyst.py
+│   ├── utils/                        #   └── database/, log_analyzer.py, context.py (호환 별칭)
+│   ├── context.py                    #   └── AgentContext 런타임 컨텍스트 스키마
+│   ├── client.py                     #   └── FastAPI 스트리밍 클라이언트 헬퍼
 │   ├── server.py                     #   └── FastAPI 백엔드 서버
-│   ├── chainlit_ui.py                #   └── Chainlit 대화형 채팅 UI (포트 8080)
-│   └── streamlit_ui.py               #   └── Streamlit 보조 UI
+│   └── chainlit_ui.py                #   └── Chainlit 대화형 채팅 UI (포트 8080)
 │
 ├── notebooks/                        # 📗 수강생 단계별 실습 주피터 노트북 (필수 4종 + 참고 1종)
 │   ├── 01_react_to_agent_harness.ipynb       # Step 1: ReAct 루프, Runtime Context, Middleware & 관측성
@@ -58,17 +59,19 @@ frontier_agent_analysis/
 │   ├── guardrail.config              #   └── 입력 보안 및 주제 정렬 임계치
 │   ├── hitl.config                   #   └── 도구 실행 사용자 승인(HITL) 규칙
 │   ├── logging.config                #   └── 감사 로그 수집 설정
+│   ├── mcp.config                    #   └── 외부 MCP 서버 연결 설정
 │   ├── memory.config                 #   └── 시맨틱/에피소딕/원문(transcript) 메모리 활성화 설정
 │   └── model.config                  #   └── 기본 및 폴백 LLM 모델 지정
 │
 ├── scripts/                          # 🔄 데이터 마이그레이션 스크립트
 │   └── migrate_episodic_to_transcript.py # └── 구 episodic.db messages ➔ transcript.db 이관 스크립트
 │
-├── tests/                            # 🧪 검증 테스트 수트
+├── tests/                            # 🧪 검증 테스트 수트 (총 15개 테스트 모듈)
 │   ├── test_02_claude_code.py        #   └── Claude Code 기본 하네스 테스트
 │   ├── test_prompt_assembler_advanced.py # └── 16대 모듈, 바이패스 주입, MCP 델타 고급 테스트
 │   ├── test_compactor.py             #   └── 압축 파이프라인 단계별·그래프 통합 테스트
-│   └── test_harness_regressions.py   #   └── 원문/색인 분리, 유휴 큐, 가드레일 before_agent, Auto-Compact before_model E2E 회귀 테스트
+│   ├── test_harness_regressions.py   #   └── 원문/색인 분리, 유휴 큐, 가드레일 before_agent, Auto-Compact before_model E2E 회귀 테스트
+│   └── ...                           #   └── test_agent_inspector.py, test_procedural_memory.py, test_stop_hooks.py, test_tool_guard.py 등 11개 모듈 포함
 │
 ├── .devcontainer/                    # 🐳 GitHub Codespaces 원클릭 실행 환경
 │   └── devcontainer.json             #   └── Python 3.12, Playwright, noVNC, Chainlit 자동 바인딩
@@ -115,7 +118,7 @@ chainlit run app/chainlit_ui.py --port 8080
 - **기본 로그인 계정**:
   - **ID**: `user`
   - **Password**: `1234`
-- 23종 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
+- 24종 내장 도구 제어, 실시간 5계층 프롬프트 조립, 메모리 자동 인출 및 대화 트레이스를 인터랙티브하게 확인 가능합니다.
 
 ### 2. 백엔드 FastAPI 서버 구동
 ```bash

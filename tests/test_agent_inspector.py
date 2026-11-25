@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -166,6 +167,103 @@ class AgentInspectorTests(unittest.IsolatedAsyncioTestCase):
             # 재호출 idempotency 확인
             await MemoryMiddleware.aclose_all_instances(review_timeout=1.0)
             del mw
+
+    async def test_shared_checkpointer_recovers_after_close_agent_resources(self):
+        """close_agent_resources()가 공유 checkpointer 커넥션을 닫아도 get_shared_checkpointer()가 복구하는지 검증."""
+        from app.utils.database import close_shared_checkpointer, get_shared_checkpointer
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "shared_cp.db")
+            cp1 = await get_shared_checkpointer(db_path=db_path)
+            self.assertTrue(getattr(cp1.conn, "_running", False))
+
+            agent = create_agent(
+                model=_DummyChatModel(),
+                tools=[],
+                checkpointer=cp1,
+                context_schema=AgentContext,
+            )
+            await close_agent_resources(agent)
+            self.assertFalse(getattr(cp1.conn, "_running", True))
+
+            cp2 = await get_shared_checkpointer(db_path=db_path)
+            self.assertIsNot(cp2, cp1)
+            self.assertTrue(getattr(cp2.conn, "_running", False))
+            await close_shared_checkpointer()
+
+    async def test_shared_checkpointer_lock_serialization_with_close(self):
+        """get_shared_checkpointer()와 close_shared_checkpointer() 동시 호출 시 캐시와 커넥션 상태가 일관되게 직렬화되는지 검증."""
+        from app.utils.database import session_store
+        from app.utils.database.session_store import (
+            _is_conn_alive,
+            close_shared_checkpointer,
+            get_shared_checkpointer,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "race_cp.db")
+            abs_db = session_store._resolve_db_path(db_path)
+            loop_id = id(asyncio.get_running_loop())
+            try:
+                cp_raced, _ = await asyncio.gather(
+                    get_shared_checkpointer(db_path=db_path),
+                    close_shared_checkpointer(),
+                )
+                cached_conn = session_store._checkpointer_conn_by_key.get((loop_id, abs_db))
+                if cached_conn is not None:
+                    self.assertTrue(_is_conn_alive(cached_conn))
+                    self.assertIs(cp_raced.conn, cached_conn)
+                else:
+                    self.assertFalse(_is_conn_alive(cp_raced.conn))
+
+                _, cp_live = await asyncio.gather(
+                    close_shared_checkpointer(),
+                    get_shared_checkpointer(db_path=db_path),
+                )
+                self.assertTrue(_is_conn_alive(cp_live.conn))
+                self.assertIs(
+                    session_store._checkpointer_by_key.get((loop_id, abs_db)),
+                    cp_live,
+                )
+            finally:
+                await close_shared_checkpointer()
+                self.assertEqual(
+                    [k for k in session_store._checkpointer_conn_by_key if k[0] == loop_id],
+                    [],
+                )
+
+    async def test_checkpoints_db_path_patch_unifies_session_crud_and_checkpointer(self):
+        """CHECKPOINTS_DB_PATH만 패치해도 세션 CRUD와 공유 Checkpointer가 동일한 임시 DB 경로를 사용하는지 검증."""
+        from app.utils.database import session_store
+        from app.utils.database.session_store import (
+            close_shared_checkpointer,
+            create_session,
+            get_session,
+            get_shared_checkpointer,
+        )
+
+        orig_cp_path = session_store.CHECKPOINTS_DB_PATH
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_db = str(Path(tmpdir) / "patched_cp.db")
+            abs_temp_db = session_store._resolve_db_path(temp_db)
+            try:
+                session_store.CHECKPOINTS_DB_PATH = temp_db
+                created = await create_session("sess_patch_1", "chatbot", "Patched DB Session")
+                self.assertEqual(created["session_id"], "sess_patch_1")
+
+                fetched = await get_session("sess_patch_1")
+                self.assertIsNotNone(fetched)
+                self.assertEqual(fetched["title"], "Patched DB Session")
+
+                cp = await get_shared_checkpointer()
+                loop_id = id(asyncio.get_running_loop())
+                self.assertIn((loop_id, abs_temp_db), session_store._checkpointer_by_key)
+                self.assertIs(session_store._checkpointer_by_key[(loop_id, abs_temp_db)], cp)
+                self.assertTrue(Path(abs_temp_db).exists())
+            finally:
+                await close_shared_checkpointer()
+                session_store._initialized_db_paths.discard(abs_temp_db)
+                session_store.CHECKPOINTS_DB_PATH = orig_cp_path
 
 
 if __name__ == "__main__":

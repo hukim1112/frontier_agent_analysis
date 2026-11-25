@@ -16,6 +16,7 @@ import json
 import time
 import asyncio
 import threading
+import weakref
 import aiosqlite
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -26,15 +27,27 @@ BASE_DB_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "database",
 )
-CHECKPOINTS_DB_PATH = os.path.join(BASE_DB_DIR, "checkpoints.db")
-DB_PATH = CHECKPOINTS_DB_PATH
+_DEFAULT_DB_PATH = os.path.join(BASE_DB_DIR, "checkpoints.db")
+CHECKPOINTS_DB_PATH = _DEFAULT_DB_PATH
+DB_PATH = _DEFAULT_DB_PATH
 
 _init_lock = threading.Lock()
 _initialized_db_paths: set = set()
 
 
-def _connect_sync(db_path: str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=10.0)
+def _resolve_db_path(db_path: Optional[str] = None) -> str:
+    """명시 인자 > 패치된 CHECKPOINTS_DB_PATH > 패치된 DB_PATH > 기본값 순으로 DB 경로를 결정합니다."""
+    if db_path:
+        return os.path.abspath(db_path)
+    if CHECKPOINTS_DB_PATH != _DEFAULT_DB_PATH:
+        return os.path.abspath(CHECKPOINTS_DB_PATH)
+    if DB_PATH != _DEFAULT_DB_PATH:
+        return os.path.abspath(DB_PATH)
+    return os.path.abspath(_DEFAULT_DB_PATH)
+
+
+def _connect_sync(db_path: Optional[str] = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(_resolve_db_path(db_path), timeout=10.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
@@ -43,7 +56,7 @@ def _connect_sync(db_path: str = DB_PATH) -> sqlite3.Connection:
 
 def init_db(force: bool = False):
     """세션 메타데이터(`chat_sessions`) 및 실행 옵션(`session_options`) 테이블을 최초 1회 생성하고 WAL 모드를 활성화합니다."""
-    target_db = os.path.abspath(DB_PATH)
+    target_db = _resolve_db_path()
     if not force and target_db in _initialized_db_paths and os.path.exists(target_db):
         return
 
@@ -89,25 +102,71 @@ def init_db(force: bool = False):
 # =============================================================================
 _checkpointer_by_key: Dict[Tuple[int, str], AsyncSqliteSaver] = {}
 _checkpointer_conn_by_key: Dict[Tuple[int, str], aiosqlite.Connection] = {}
-_checkpointer_locks: Dict[int, asyncio.Lock] = {}
+_checkpointer_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _is_conn_alive(conn: Optional[aiosqlite.Connection]) -> bool:
+    """aiosqlite 커넥션이 아직 열려 실행 중인지 확인합니다."""
+    return conn is not None and bool(getattr(conn, "_running", False))
+
+
+def _get_loop_lock(loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
+    """이벤트 루프별 asyncio.Lock을 반환하며, 루프 GC 시 자동 해제됩니다."""
+    lock = _checkpointer_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _checkpointer_locks[loop] = lock
+    return lock
+
+
+def _is_entry_usable(cache_key: Tuple[int, str], loop: asyncio.AbstractEventLoop) -> bool:
+    """캐시된 checkpointer와 커넥션이 현재 이벤트 루프에서 재사용 가능한지 확인합니다."""
+    saver = _checkpointer_by_key.get(cache_key)
+    conn = _checkpointer_conn_by_key.get(cache_key)
+    if saver is None or not _is_conn_alive(conn):
+        return False
+    saver_loop = getattr(saver, "loop", None)
+    if saver_loop is not None and (saver_loop is not loop or saver_loop.is_closed()):
+        return False
+    return True
+
+
+def _prune_stale_entries(current_loop: asyncio.AbstractEventLoop) -> None:
+    """이미 닫힌 이전 이벤트 루프나 종료된 커넥션에 묶인 캐시 항목을 정리합니다."""
+    current_loop_id = id(current_loop)
+    for k in list(_checkpointer_by_key.keys()):
+        conn = _checkpointer_conn_by_key.get(k)
+        saver = _checkpointer_by_key.get(k)
+        saver_loop = getattr(saver, "loop", None)
+        if saver_loop is not None and saver_loop.is_closed():
+            stale = True
+        elif k[0] == current_loop_id:
+            stale = saver_loop is not None and saver_loop is not current_loop
+        else:
+            stale = not _is_conn_alive(conn)
+        if stale:
+            _checkpointer_by_key.pop(k, None)
+            _checkpointer_conn_by_key.pop(k, None)
 
 
 async def get_shared_checkpointer(db_path: Optional[str] = None) -> AsyncSqliteSaver:
     """현재 비동기 이벤트 루프에서 공유되는 단일 AsyncSqliteSaver 인스턴스를 반환합니다.
     에이전트마다 별도 커넥션을 열지 않고 WAL 모드가 활성화된 단일 커넥션을 공유합니다.
     """
-    target_path = os.path.abspath(db_path or CHECKPOINTS_DB_PATH)
+    target_path = _resolve_db_path(db_path)
     loop = asyncio.get_running_loop()
     loop_id = id(loop)
     cache_key = (loop_id, target_path)
 
-    if cache_key in _checkpointer_by_key:
-        return _checkpointer_by_key[cache_key]
-
-    lock = _checkpointer_locks.setdefault(loop_id, asyncio.Lock())
-    async with lock:
-        if cache_key in _checkpointer_by_key:
+    async with _get_loop_lock(loop):
+        _prune_stale_entries(loop)
+        if _is_entry_usable(cache_key, loop):
             return _checkpointer_by_key[cache_key]
+
+        _checkpointer_by_key.pop(cache_key, None)
+        _checkpointer_conn_by_key.pop(cache_key, None)
 
         os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
         conn = await aiosqlite.connect(target_path, check_same_thread=False)
@@ -128,19 +187,23 @@ async def close_shared_checkpointer() -> None:
     """현재 이벤트 루프에 생성된 공유 Checkpointer DB 커넥션을 안전하게 닫습니다."""
     try:
         loop = asyncio.get_running_loop()
-        loop_id = id(loop)
     except RuntimeError:
-        loop_id = None
+        for k in list(_checkpointer_conn_by_key.keys()):
+            _checkpointer_by_key.pop(k, None)
+            conn = _checkpointer_conn_by_key.pop(k, None)
+            if _is_conn_alive(conn):
+                await conn.close()
+        return
 
-    keys_to_close = [
-        k for k in list(_checkpointer_conn_by_key.keys())
-        if loop_id is None or k[0] == loop_id
-    ]
-    for k in keys_to_close:
-        _checkpointer_by_key.pop(k, None)
-        conn = _checkpointer_conn_by_key.pop(k, None)
-        if conn is not None:
-            await conn.close()
+    loop_id = id(loop)
+    async with _get_loop_lock(loop):
+        keys_to_close = [k for k in list(_checkpointer_conn_by_key.keys()) if k[0] == loop_id]
+        for k in keys_to_close:
+            _checkpointer_by_key.pop(k, None)
+            conn = _checkpointer_conn_by_key.pop(k, None)
+            if _is_conn_alive(conn):
+                await conn.close()
+        _prune_stale_entries(loop)
 
 
 # =============================================================================
@@ -149,7 +212,7 @@ async def close_shared_checkpointer() -> None:
 
 async def _connect_async() -> aiosqlite.Connection:
     init_db()
-    conn = await aiosqlite.connect(DB_PATH, timeout=10.0)
+    conn = await aiosqlite.connect(_resolve_db_path(), timeout=10.0)
     await conn.execute("PRAGMA journal_mode=WAL;")
     await conn.execute("PRAGMA synchronous=NORMAL;")
     await conn.execute("PRAGMA busy_timeout=5000;")

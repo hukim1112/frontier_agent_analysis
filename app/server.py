@@ -20,13 +20,76 @@ dotenv_path = os.path.join(project_root, ".env")
 if os.path.exists(dotenv_path):
     print(f"Loading .env from: {dotenv_path}")
     load_dotenv(dotenv_path)
-
-    # LangSmith Project Setting (Server Specific)
-    os.environ["LANGSMITH_TRACING"] = "true"
-    os.environ["LANGSMITH_PROJECT"] = "llmops-agent-server"
-    print(f"📈 LangSmith Tracing Enabled. Project: {os.environ['LANGSMITH_PROJECT']}")
 else:
     print("Warning: .env file not found.")
+
+# LangSmith Tracing 상태 확인 (.env 및 실행 환경 변수를 덮어쓰지 않고 LangSmith SDK 규칙 그대로 판별)
+def _inspect_langsmith_status() -> tuple[bool, str, str, bool]:
+    """실제 LangSmith SDK(langsmith.utils)와 동일한 우선순위로 트레이싱 활성화 여부를 판별합니다."""
+    try:
+        from langsmith.utils import get_env_var, get_tracer_project, tracing_is_enabled
+
+        # load_dotenv() 직후 호출되므로 lru_cache를 비워 최신 환경변수를 반영
+        if hasattr(get_env_var, "cache_clear"):
+            get_env_var.cache_clear()
+        if hasattr(get_tracer_project, "cache_clear"):
+            get_tracer_project.cache_clear()
+
+        enabled = bool(tracing_is_enabled())
+        project = get_tracer_project() or "default"
+        api_key = (get_env_var("API_KEY") or "").strip()
+    except ImportError:
+        def _env_first(*keys: str, default: str = "") -> str:
+            for key in keys:
+                val = os.environ.get(key)
+                if val is not None and val.strip() != "":
+                    return val
+            return default
+
+        tracing_val = _env_first(
+            "LANGSMITH_TRACING_V2",
+            "LANGCHAIN_TRACING_V2",
+            "LANGSMITH_TRACING",
+            "LANGCHAIN_TRACING",
+        )
+        enabled = tracing_val == "true"
+        project = _env_first(
+            "HOSTED_LANGSERVE_PROJECT_NAME",
+            "LANGSMITH_PROJECT",
+            "LANGCHAIN_PROJECT",
+            "LANGSMITH_SESSION",
+            "LANGCHAIN_SESSION",
+            default="default",
+        )
+        api_key = _env_first("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY").strip()
+
+    # LANGSMITH_TRACING=true로 설정했지만 *_TRACING_V2=false가 우선해 꺼진 흔한 실수 감지
+    v2_val = os.environ.get("LANGSMITH_TRACING_V2")
+    if v2_val is None or v2_val.strip() == "":
+        v2_val = os.environ.get("LANGCHAIN_TRACING_V2")
+    v1_val = os.environ.get("LANGSMITH_TRACING")
+    if v1_val is None or v1_val.strip() == "":
+        v1_val = os.environ.get("LANGCHAIN_TRACING")
+    overridden_by_v2 = (
+        not enabled
+        and v1_val == "true"
+        and v2_val is not None
+        and v2_val.strip() != ""
+        and v2_val != "true"
+    )
+    return enabled, project, api_key, overridden_by_v2
+
+
+_ls_enabled, _ls_project, _ls_api_key, _ls_v2_override = _inspect_langsmith_status()
+if _ls_enabled:
+    if not _ls_api_key or _ls_api_key in ("your_langchain_api_key_here", "your-langsmith-key"):
+        print(f"⚠️ LangSmith Tracing is enabled (Project: {_ls_project}), but LANGCHAIN_API_KEY/LANGSMITH_API_KEY is missing or placeholder.")
+    else:
+        print(f"📈 LangSmith Tracing Enabled. Project: {_ls_project}")
+elif _ls_v2_override:
+    print("ℹ️ LangSmith Tracing Disabled (LANGCHAIN_TRACING_V2/LANGSMITH_TRACING_V2 takes precedence over LANGSMITH_TRACING; set LANGCHAIN_TRACING_V2=true in .env to enable).")
+else:
+    print("ℹ️ LangSmith Tracing Disabled (set LANGCHAIN_TRACING_V2=true in .env to enable).")
 
 import logging
 import json

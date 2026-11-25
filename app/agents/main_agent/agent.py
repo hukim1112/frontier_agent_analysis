@@ -1,11 +1,9 @@
 """
-app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (Instructor 완성본)
-
-교육생이 Mission 00~07을 순서대로 완수하면 이 파일과 동일한 결과가 됩니다.
+app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (Claude Code + Hermes 통합 하네스)
 
 패키지 구조:
   app/agents/main_agent/
-   ├── agent.py       (에이전트 조립 및 9단계 미들웨어 파이프라인)
+   ├── agent.py       (에이전트 조립 및 12개 미들웨어 파이프라인)
    ├── prompt.py      (SUPERVISOR_SYSTEM_PROMPT — PromptAssembler의 Layer 1)
    ├── tools.py       (계획 5종 + 오케스트레이션 4종 + 공통 8종 = 17종 도구 바인딩)
    └── skills/        (에이전트 내재화 스킬 — 대화 속 skill_listing 알림으로 노출)
@@ -33,7 +31,7 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
    - ToolErrorHandlerMiddleware : 도구 예외 시 ToolMessage(Observation)로 변환
    - ModelCallLimitMiddleware   : 무한 루프 차단 (run_limit=50)
    - StopHooksMiddleware        : 생성된 Python 코드블록 AST 구문 검증 및 자가 교정 루프
-5. 도구: tools_supervisor(17종) + memory_tools(2종) + skill_tools(2종) + custom_tools(2종) = 총 23종
+5. 도구: tools_supervisor(17종) + memory_tools(2종) + skill_tools(2종) + custom_tools(2종) + snip(1종, compaction.config snip.enabled=true 시 자동 등록) = 총 24종
    + MCP 도구 (configs/mcp.config, 예: mcp__wikipedia__search / mcp__wikipedia__readArticle)
 
 [미들웨어 파이프라인 실행 순서]
@@ -43,33 +41,33 @@ app/agents/main_agent/agent.py — 메인 오케스트레이터 에이전트 (In
      [3] TopicAlignmentGuardrail   ← before_agent: 오프토픽 질문 차단 & 대안 안내 (jump_to="end")
      [4] MemoryMiddleware          ← before_agent(원문 기록 & L2/L3 메모리 인출) + wrap_model/tool(원문 기록 & 도구 필터링) + after_agent(유휴 리뷰 예약)
      [5] PromptAssemblerMiddleware ← wrap_model_call: 5계층 시스템 프롬프트 조립
-     [6] CompactorMiddleware       ← before_model(AutoCompactor state 교체) + wrap_model_call(Snip/Micro/Collapse + 413 Reactive)
-     [7] HumanInTheLoopMiddleware  ← 도구 실행 직전 사용자 승인 요청
-     [8] ModelFallbackMiddleware   ← 모델 호출 실패 시 백업 모델로 재시도
-     [9] ToolErrorHandlerMiddleware← 도구 실행 오류 시 에러 메시지로 변환
-    [10] ModelCallLimitMiddleware  ← 무한 루프 방지 (최대 호출 횟수 제한)
-    [11] StopHooksMiddleware       ← after_model: 코드 구문 에러 시 jump_to="model" 자가 교정
+     [6] AmnesiaGuardMiddleware    ← wrap_tool_call(읽은 파일 스냅샷 추적) + 압축 직후 핵심 파일·계획 복원
+     [7] CompactorMiddleware       ← before_model(AutoCompactor state 교체) + wrap_model_call(Snip/Micro/Collapse + 413 Reactive)
+     [8] HumanInTheLoopMiddleware  ← 도구 실행 직전 사용자 승인 요청
+     [9] ModelFallbackMiddleware   ← 모델 호출 실패 시 백업 모델로 재시도
+    [10] ToolErrorHandlerMiddleware← 도구 실행 오류 시 에러 메시지로 변환
+    [11] ModelCallLimitMiddleware  ← 무한 루프 방지 (최대 호출 횟수 제한)
+    [12] StopHooksMiddleware       ← after_model: 코드 구문 에러 시 jump_to="model" 자가 교정
                                   → LLM 모델 호출
 """
 
 import os
 import json
 from pathlib import Path
-import aiosqlite
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 
 from app.utils import init_chat_model
+from app.utils.database import get_shared_checkpointer
 from app.context import AgentContext
 
 from .prompt import SUPERVISOR_SYSTEM_PROMPT
 from .tools import tools_supervisor
 
-# Mission 01: 커스텀 도구 (roll_dice, convert_currency)
+# 커스텀 도구 (roll_dice, convert_currency)
 from app.tools.custom_tools import roll_dice, convert_currency
 
-# Mission 03: 계층형 메모리 + 5계층 프롬프트 조립기
+# 계층형 메모리 + 프롬프트 조립기
 from app.middleware.memory import (
     SemanticMemoryStore,
     ProceduralMemoryStore,
@@ -84,7 +82,7 @@ from app.middleware.prompt import (
     create_prompt_assembler_middleware,
 )
 
-# Mission 02: Self-Recovery & Self-Correction 미들웨어
+# Self-Recovery & Self-Correction 미들웨어
 from app.middleware.error_control.self_recovery import (
     ModelFallbackMiddleware,
     ToolErrorHandlerMiddleware,
@@ -98,10 +96,10 @@ from app.middleware.compaction import (
     create_compactor_middleware,
 )
 
-# Mission 06: 입력 보안 & 주제 정렬 가드레일
+# 입력 보안 & 주제 정렬 가드레일
 from app.middleware.guardrails import InputSafetyGuardrail, TopicAlignmentGuardrail
 
-# Mission 07: 비동기 감사 로깅 (AgentLogTracer)
+# 비동기 감사 로깅 (AgentLogTracer)
 from app.middleware.observability import AgentLogTracer
 
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
@@ -136,20 +134,11 @@ async def create_agent_executor(checkpointer=None):
         temperature=model_cfg.get("temperature", 0.0)
     )
 
-    # 3. L1 단기 기억 (SQLite 기반 세션 체크포인터)
-    db_dir = "app/database"
-    os.makedirs(db_dir, exist_ok=True)
-    checkpoints_path = os.path.join(db_dir, "checkpoints.db")
-
-    conn = None
+    # 3. L1 단기 기억 (공유 SQLite 체크포인터 SSOT)
     if checkpointer is None:
-        conn = await aiosqlite.connect(checkpoints_path, check_same_thread=False)
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
-        checkpointer = AsyncSqliteSaver(conn)
-        await checkpointer.setup()
+        checkpointer = await get_shared_checkpointer()
 
-    # 4. 도구 바인딩 (Supervisor 17종 + Custom 2종 = 19종 / Memory 2종 + Skill 2종은 memory_mw가 create_agent에 자동 등록 → 총 23종)
+    # 4. 도구 바인딩 (Supervisor 17종 + Custom 2종 = 19종 / Memory 2종 + Skill 2종 + Compactor snip 1종은 미들웨어가 자동 등록 → 총 24종)
     #    ※ 도구 정의는 create_agent(tools=...)를 거쳐 API tools 필드로만 전달합니다 (시스템 프롬프트에는 넣지 않음).
     active_tools = list(tools_supervisor) + [roll_dice, convert_currency]
 
@@ -188,7 +177,7 @@ async def create_agent_executor(checkpointer=None):
         procedural_store.load_from_disk()
 
     # 4-3. L2 원문 저장소(TranscriptStore) + 요약 색인(EpisodicStore) 초기화
-    transcript_db_path = tr_cfg.get("db_path", os.path.join(db_dir, "transcript.db"))
+    transcript_db_path = tr_cfg.get("db_path", "./app/database/transcript.db")
     os.makedirs(os.path.dirname(transcript_db_path) or ".", exist_ok=True)
     transcript_store = TranscriptStore(
         db_path=transcript_db_path,
@@ -196,7 +185,7 @@ async def create_agent_executor(checkpointer=None):
     )
     await transcript_store.setup()
 
-    episodic_db_path = epi_cfg.get("db_path", os.path.join(db_dir, "episodic.db"))
+    episodic_db_path = epi_cfg.get("db_path", "./app/database/episodic.db")
     os.makedirs(os.path.dirname(episodic_db_path) or ".", exist_ok=True)
     episodic_store = EpisodicStore(
         db_path=episodic_db_path,
@@ -267,7 +256,7 @@ async def create_agent_executor(checkpointer=None):
     # 미들웨어는 리스트 순서대로 요청을 감싸는 러시안 인형 구조입니다.
     # 리스트 앞쪽 = 바깥 껍데기(먼저 실행), 뒤쪽 = LLM에 가까운 내부.
     #
-    #   요청 → [Log] → [Guard] → [Memory] → [Prompt] → [HITL] → [SelfRecovery] → LLM
+    #   요청 → [Log] → [Guard] → [Memory] → [Prompt] → [AmnesiaGuard] → [Compactor] → [HITL] → [SelfRecovery] → [StopHooks] → LLM
     # ─────────────────────────────────────────────────────────────────
     middleware = []
 
