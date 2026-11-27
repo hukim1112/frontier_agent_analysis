@@ -1,14 +1,14 @@
 ---
-name: pdf_processing
-description: Extract text, metadata, and convert PDF pages to images using specialized python scripts.
+name: pdf-processing
+description: Extract text and metadata (title, author, page count) from PDF files, or render PDF pages to PNG images, by running the bundled Python scripts with bash_command.
 ---
 
 # PDF Processing Skill
 
-This skill provides tools to extract text, metadata, and convert PDF pages to images.
+This skill provides scripts to extract text, metadata, and convert PDF pages to PNG images.
 
 ## Available Scripts
-All scripts are written in Python and expect the PDF file path as an argument.
+All scripts are located in `skills/pdf_processing/scripts/` and should be executed with `bash_command` using Python 3 relative to the workspace root.
 
 ---
 

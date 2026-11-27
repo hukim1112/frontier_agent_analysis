@@ -848,7 +848,8 @@ def bash_command(command: str, timeout_seconds: int = 30, max_stdout_length: int
     """Executes a shell command on the local system and returns its exit code, duration, stdout, and stderr.
 
     Usage:
-    - Prefer dedicated tools over shell equivalents: use file_read (not cat/head/tail), file_edit (not sed/awk), file_writer (not echo >/cat <<EOF), grep_search (not grep/rg), and glob_search (not find/ls).
+    - Prefer dedicated tools over shell equivalents: use file_read (not cat/head/tail), file_edit (not sed/awk), file_writer (not echo >/cat <<EOF), grep_search (not grep/rg), and glob_search for finding files by wildcard pattern.
+    - Use bash_command when you need hierarchical directory trees or detailed listings (`find . -maxdepth 3 -not -path '*/.git*'`, `tree`, `ls -la`) — always bound depth and exclude noise directories (`.git`, `node_modules`, `__pycache__`, `.venv`) to protect context.
     - Each invocation runs in an isolated subshell: working directory changes (`cd`) and environment exports (`export`) do NOT persist across calls; chain dependent commands with `&&`.
     - NEVER run interactive commands waiting for stdin or long-lived foreground servers.
     - Increase `timeout_seconds` (up to 600) for legitimate heavy builds or test suites.
@@ -1269,8 +1270,9 @@ def glob_search(pattern: str, search_path: str = ".", head_limit: int = 100) -> 
     """Finds file paths matching a glob wildcard pattern sorted by most recently modified.
 
     Usage:
-    - Always use glob_search instead of running `find` or `ls` via bash_command.
-    - Supports recursive patterns (`**/*.py`) and dotfiles (`.gitignore`, `.github/...`), while automatically excluding VCS, cache, and virtual environment directories.
+    - Prefer glob_search over shell `find` when locating files by name or wildcard pattern (e.g. `**/*.py`, `app/**/*.md`).
+    - Supports recursive patterns (`**/*.py`), dotfiles (`.gitignore`, `.github/...`), and trailing-slash directory listing (`*/`, `*/*/` — useful in read-only planning mode), while automatically excluding VCS, cache, and virtual environment directories.
+    - For full hierarchical directory trees or detailed metadata (`ls -la`, `tree`, `find -maxdepth`), use bash_command instead.
     """
     if not pattern or not pattern.strip():
         raise ToolException("Glob Error: 'pattern' cannot be empty.")

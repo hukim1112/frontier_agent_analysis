@@ -478,7 +478,6 @@ class OutputSchemaRepairGuardrail(AgentMiddleware):
                 return repaired_cleaned
             except Exception as retry_err:
                 parse_error = retry_err
-                current_content = normalize_content(str(retry_err))
 
         logger.error("🛑 [OutputSchemaRepairGuardrail] 자가 교정 한계 도달. 최종 정제 텍스트를 반환합니다.")
         return heuristic_text
@@ -524,13 +523,11 @@ class OutputSchemaRepairGuardrail(AgentMiddleware):
     def wrap_model_call(self, request: Any, handler: Any) -> Any:
         response = handler(request)
 
-        raw_content = ""
-        if hasattr(response, "result") and response.result:
-            raw_content = response.result[-1].content
-        elif hasattr(response, "content"):
-            raw_content = response.content
+        target_msg = response.result[-1] if hasattr(response, "result") and response.result else response
+        if getattr(target_msg, "tool_calls", None):
+            return response
 
-        raw_content = normalize_content(raw_content)
+        raw_content = normalize_content(getattr(target_msg, "content", ""))
         repaired = self.repair(raw_content)
 
         if hasattr(response, "result") and response.result:
@@ -542,13 +539,11 @@ class OutputSchemaRepairGuardrail(AgentMiddleware):
     async def awrap_model_call(self, request: Any, handler: Any) -> Any:
         response = await handler(request)
 
-        raw_content = ""
-        if hasattr(response, "result") and response.result:
-            raw_content = response.result[-1].content
-        elif hasattr(response, "content"):
-            raw_content = response.content
+        target_msg = response.result[-1] if hasattr(response, "result") and response.result else response
+        if getattr(target_msg, "tool_calls", None):
+            return response
 
-        raw_content = normalize_content(raw_content)
+        raw_content = normalize_content(getattr(target_msg, "content", ""))
         repaired = await self.arepair(raw_content)
 
         if hasattr(response, "result") and response.result:

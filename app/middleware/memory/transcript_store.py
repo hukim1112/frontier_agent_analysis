@@ -47,7 +47,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from app.utils.message_utils import normalize_content
 from app.utils.message_markers import (
-    ORIGIN_STOP_HOOK,
+    INTERNAL_FEEDBACK_ORIGINS,
     TRANSCRIPT_SKIP_KEY,
     is_compaction_artifact,
     message_origin,
@@ -122,7 +122,7 @@ def classify_message(msg: Any) -> Optional[str]:
         return None
     content = normalize_content(getattr(msg, "content", "") or "")
     if isinstance(msg, HumanMessage):
-        return "internal" if message_origin(msg) == ORIGIN_STOP_HOOK else "user"
+        return "internal" if message_origin(msg) in INTERNAL_FEEDBACK_ORIGINS else "user"
     if isinstance(msg, AIMessage):
         if kwargs.get(GUARDRAIL_BLOCKED_KEY) or content.startswith(_BLOCKED_PREFIXES):
             return "blocked"
@@ -323,7 +323,7 @@ class TranscriptStore:
                     "tool": "tool_result"}.get(role)
             if kind is None:
                 return None
-            if kind == "user" and message_origin(msg) == ORIGIN_STOP_HOOK:
+            if kind == "user" and message_origin(msg) in INTERNAL_FEEDBACK_ORIGINS:
                 kind = "internal"
             return {
                 "message_uid": self._uid_for(msg, session_id, ordinal),

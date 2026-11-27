@@ -10,6 +10,7 @@
    - compaction_summary : AutoCompactor가 만든 이전 대화 요약
    - amnesia_restore    : AmnesiaGuard가 만든 작업 맥락(파일·계획) 복원 블록
    - stop_hook_feedback : StopHooks가 넣은 코드 검증 실패 피드백
+   - evaluator_feedback : EvaluatorHarness가 넣은 답변 검증 실패 피드백
    아래 출처는 Compactor가 모델 입력 사본에만 넣고 state에는 저장하지 않습니다.
    - context_collapse   : ContextCollapse가 접은 이전 턴 요약
    - snip_boundary      : Snip으로 제거된 구간 표시
@@ -35,6 +36,11 @@ ORIGIN_KEY = "harness_origin"
 ORIGIN_COMPACTION_SUMMARY = "compaction_summary"
 ORIGIN_AMNESIA_RESTORE = "amnesia_restore"
 ORIGIN_STOP_HOOK = "stop_hook_feedback"
+ORIGIN_EVALUATOR_FEEDBACK = "evaluator_feedback"
+INTERNAL_FEEDBACK_ORIGINS = frozenset({
+    ORIGIN_STOP_HOOK,
+    ORIGIN_EVALUATOR_FEEDBACK,
+})
 COMPACTION_ORIGINS = frozenset({ORIGIN_COMPACTION_SUMMARY, ORIGIN_AMNESIA_RESTORE})
 ORIGIN_CONTEXT_COLLAPSE = "context_collapse"
 ORIGIN_SNIP_BOUNDARY = "snip_boundary"
@@ -60,6 +66,7 @@ TRANSCRIPT_SKIP_KEY = "transcript_skip"
 COMPACTION_SUMMARY_HEADER = "[Compaction Summary: Previous Conversation]"
 AMNESIA_RESTORE_HEADER = "[Compaction Amnesia Guard: Restoring Recent Work Context]"
 STOP_HOOK_TAG = "[stop_hook_blocking]"
+EVALUATOR_FEEDBACK_TAG = "[evaluator_feedback]"
 CONTEXT_COLLAPSE_HEADER = "[Context Collapse: Earlier Turn Summarized]"
 SNIP_BOUNDARY_HEADER = "[Snip Boundary]"
 CONTEXT_EFFICIENCY_HEADER = "[Context Efficiency Reminder]"
@@ -117,8 +124,11 @@ def message_origin(msg: Any) -> Optional[str]:
         return ORIGIN_COMPACTION_SUMMARY
     if text.startswith(AMNESIA_RESTORE_HEADER):
         return ORIGIN_AMNESIA_RESTORE
-    if STOP_HOOK_TAG in text[:60]:
+    prefix = text[:80]
+    if STOP_HOOK_TAG in prefix:
         return ORIGIN_STOP_HOOK
+    if EVALUATOR_FEEDBACK_TAG in prefix:
+        return ORIGIN_EVALUATOR_FEEDBACK
     # 이전 버전의 표식 키 (머리말이 바뀐 경우 대비)
     if kwargs.get("compaction_summary"):
         return ORIGIN_COMPACTION_SUMMARY
@@ -145,6 +155,10 @@ def is_attachment(msg: Any) -> bool:
 
 def is_stop_hook_feedback(msg: Any) -> bool:
     return _is_human(msg) and message_origin(msg) == ORIGIN_STOP_HOOK
+
+
+def is_evaluator_feedback(msg: Any) -> bool:
+    return _is_human(msg) and message_origin(msg) == ORIGIN_EVALUATOR_FEEDBACK
 
 
 def is_user_turn_start(msg: Any) -> bool:

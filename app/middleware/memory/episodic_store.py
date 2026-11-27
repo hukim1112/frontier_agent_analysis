@@ -33,7 +33,7 @@ from typing import List, Dict, Any, Optional
 from langchain_core.messages import BaseMessage
 from app.utils.message_utils import normalize_content
 from app.utils.message_markers import (
-    ORIGIN_STOP_HOOK,
+    INTERNAL_FEEDBACK_ORIGINS,
     TRANSCRIPT_SKIP_KEY,
     is_compaction_artifact,
     message_origin,
@@ -159,7 +159,7 @@ def _records_from_messages(messages: List[Any]) -> List[Dict[str, Any]]:
                                      "tool": "tool_result"}.get(role)
             if kind is None:
                 continue
-            if kind == "user" and message_origin(m) == ORIGIN_STOP_HOOK:
+            if kind == "user" and message_origin(m) in INTERNAL_FEEDBACK_ORIGINS:
                 kind = "internal"
             records.append({"kind": kind, "content": normalize_content(m.get("content", "") or ""),
                             "tool_calls": m.get("tool_calls") or [],
